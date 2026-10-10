@@ -7,6 +7,7 @@ import {
   mkdir,
   mkdtemp,
   open,
+  readFile,
   rename,
   rm,
   symlink,
@@ -1433,6 +1434,25 @@ test('syncs and identity-checks the recovery claim directory before returning', 
 
   const movedClaim = await open(join(movedDir, SESSION_ID), 'r');
   await movedClaim.close();
+});
+
+test('cleans a claim it created when publication fails before ownership returns', async t => {
+  const fx = await fixture(t);
+  const claimPath = join(`${fx.storePath}.recovery-claims`, SESSION_ID);
+  let syncCalls = 0;
+
+  await assert.rejects(
+    claimSessionOnce(fx.storePath, SESSION_ID, {
+      syncDirectory: async handle => {
+        await handle.sync();
+        syncCalls += 1;
+        if (syncCalls === 1) throw new Error('claim publication failed');
+      },
+    }),
+    /claim publication failed/,
+  );
+  await assert.rejects(readFile(claimPath), { code: 'ENOENT' });
+  assert.equal(syncCalls, 2);
 });
 
 test('releases only the recovery claim inode it acquired', async t => {

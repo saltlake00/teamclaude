@@ -286,18 +286,21 @@ export async function claimSessionOnce(
   const { handle: directoryHandle, info: directoryInfo } =
     await openPrivateDirectory(claimDir);
   let handle;
+  let claimInfo;
+  let claimPath;
   try {
+    claimPath = join(claimDir, sessionId);
     handle = await open(
-      join(claimDir, sessionId),
+      claimPath,
       constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | NOFOLLOW,
       0o600,
     );
+    claimInfo = await handle.stat();
     await handle.writeFile(`${Date.now()}\n`);
     await handle.sync();
     await syncDirectory(directoryHandle);
     let currentDirectory;
     let currentClaim;
-    let claimInfo;
     try {
       [currentDirectory, currentClaim, claimInfo] = await Promise.all([
         lstat(claimDir),
@@ -316,6 +319,24 @@ export async function claimSessionOnce(
     return { dev: claimInfo.dev, ino: claimInfo.ino };
   } catch (err) {
     if (err.code === 'EEXIST') return false;
+    // If publication or identity validation fails after this actor created the
+    // file, remove only that exact inode from the original private directory.
+    // A later recovery must not be blocked forever by a half-written claim.
+    if (handle && claimInfo && claimPath) {
+      try {
+        const [currentDirectory, currentClaim] = await Promise.all([
+          lstat(claimDir),
+          lstat(claimPath),
+        ]);
+        if (ownedPrivate(currentDirectory, 'isDirectory')
+            && sameIdentity(currentDirectory, directoryInfo)
+            && ownedPrivate(currentClaim, 'isFile')
+            && sameIdentity(currentClaim, claimInfo)) {
+          await unlink(claimPath);
+          await syncDirectory(directoryHandle);
+        }
+      } catch {}
+    }
     throw err;
   } finally {
     await handle?.close();
@@ -509,7 +530,7 @@ async function withSessionLeaseLock(leaseDir, sessionId, action, retries = 0) {
     try {
       return await action();
     } finally {
-      await new Promise((resolve, reject) => mutex.close(error => error ? reject(error) : resolve()));
+      await new Promise(resolve => mutex.close(() => resolve())).catch(() => {});
     }
   }
 }
