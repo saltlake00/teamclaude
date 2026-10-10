@@ -546,6 +546,7 @@ async function monitorChild({
   const exited = (exitPromise || childExit(child)).then(result => ({ type: 'exit', result }));
   let currentPath = transcriptPath;
   let currentSessionId = sessionId;
+  const sessionWasKnownAtLaunch = Boolean(sessionId);
   let currentOffset = offset;
   let pending = '';
   let unresolvedEvent = null;
@@ -563,9 +564,16 @@ async function monitorChild({
           currentPath = null;
           return unresolvedEvent;
         }
+        // An exact session ID means the matching transcript was absent before
+        // this launch. Filesystem birthtime has coarse/independent clock
+        // resolution on some runners, so it can appear older than the launch
+        // even when the file was created by this child. ID-less discovery still
+        // uses the birthtime/snapshot safeguards because it can find an older
+        // transcript with an unknown session owner.
         const createdForLaunch = transcriptKnownAbsent
-          && Number.isFinite(discovered?.birthtimeMs)
-          && discovered.birthtimeMs >= launchStartedAtMs;
+          && (sessionWasKnownAtLaunch
+            || (Number.isFinite(discovered?.birthtimeMs)
+              && discovered.birthtimeMs >= launchStartedAtMs));
         const priorSize = transcriptSizesBeforeLaunch?.get(currentPath);
         currentOffset = Number.isFinite(priorSize)
           ? ((discovered?.size ?? priorSize) < priorSize ? 0 : priorSize)
