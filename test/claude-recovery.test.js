@@ -1034,6 +1034,64 @@ test('Fable usage-credit rotation failure never restarts Claude on the same acco
   assert.deepEqual(callEnvs, [{ ROUTE: 'account-a' }]);
 });
 
+test('Fable usage-credit recovery preserves Claude when the rescuer owns the lease', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-usage-credits-lease-owner-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  await mkdir(cwd);
+  let rotations = 0;
+  let codexCalls = 0;
+  let kills = 0;
+  let leaseAttempts = 0;
+
+  const result = await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: {},
+    config: {
+      autoResumeClaude: true,
+      claudeAutoResumeMaxRetries: 1,
+      claudeAutoResumeBackoffMs: 0,
+      codexFallbackOnExhaustion: true,
+    },
+    cwd,
+    transcriptRoot,
+    handoffRoot: join(root, 'handoffs'),
+    pollIntervalMs: 5,
+    claimRecoveryLease: async () => {
+      leaseAttempts += 1;
+      return false;
+    },
+    recoverLimit: async () => {
+      rotations += 1;
+      return { rotated: false, reason: 'rotation-unavailable' };
+    },
+    fetchStatus: async () => statusWithQuota(0.5),
+    spawnClaude(args) {
+      const child = fakeChild(() => { kills += 1; });
+      const sessionId = args[args.indexOf('--session-id') + 1];
+      setTimeout(async () => {
+        const dir = join(transcriptRoot, 'project');
+        await mkdir(dir, { recursive: true });
+        await writeFile(join(dir, `${sessionId}.jsonl`), `${usageCreditsRecord(cwd)}\n`);
+      }, 10);
+      setTimeout(() => child.finish(9), 80);
+      return child;
+    },
+    launchCodex: async () => {
+      codexCalls += 1;
+      return { status: 0, signal: null };
+    },
+    log() {},
+  });
+
+  assert.equal(result.status, 9);
+  assert.equal(rotations, 0);
+  assert.equal(codexCalls, 0);
+  assert.equal(kills, 0);
+  assert.ok(leaseAttempts >= 1);
+});
+
 test('UUID rotation requires different UUIDs plus exact previous and current recovery markers', async t => {
   const scenarios = [
     {
@@ -2899,6 +2957,71 @@ test('overloaded terminal error with exhausted general quota hands off once', as
 
   assert.equal(result.status, 0);
   assert.equal(codexCalls, 1);
+});
+
+test('Codex handoff preserves Claude when the rescuer already owns the recovery lease', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-codex-lease-owner-'));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  await mkdir(cwd);
+  let codexCalls = 0;
+  let permanentClaims = 0;
+  let leaseAttempts = 0;
+  let killed = false;
+  let childRef = null;
+
+  const result = await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: {},
+    config: {
+      autoResumeClaude: true,
+      claudeAutoResumeMaxRetries: 1,
+      claudeAutoResumeBackoffMs: 0,
+      codexFallbackOnExhaustion: true,
+      switchThreshold: 0.98,
+    },
+    cwd,
+    transcriptRoot,
+    handoffRoot: join(root, 'handoffs'),
+    pollIntervalMs: 5,
+    claimRecoveryLease: async () => {
+      leaseAttempts += 1;
+      // The cmux rescuer acquired the lease first; the launcher must defer.
+      return false;
+    },
+    claimRecoveryOnce: async () => {
+      permanentClaims += 1;
+      return { dev: 1, ino: 1 };
+    },
+    fetchStatus: async () => statusWithQuota(0.98),
+    spawnClaude(args) {
+      const child = fakeChild(signal => { killed = signal; });
+      childRef = child;
+      const sessionId = args[args.indexOf('--session-id') + 1];
+      setTimeout(async () => {
+        const dir = join(transcriptRoot, 'project');
+        await mkdir(dir, { recursive: true });
+        await writeFile(
+          join(dir, `${sessionId}.jsonl`),
+          `${JSON.stringify({ type: 'user', cwd, message: { role: 'user', content: '작업을 이어서 완료해' } })}\n${overloadedRecord(cwd)}\n`,
+        );
+      }, 10);
+      setTimeout(() => child.finish(9), 160);
+      return child;
+    },
+    launchCodex: async () => {
+      codexCalls += 1;
+      return { status: 0, signal: null };
+    },
+    log() {},
+  });
+
+  assert.equal(result.status, 9);
+  assert.equal(codexCalls, 0);
+  assert.equal(permanentClaims, 0);
+  assert.ok(leaseAttempts >= 1);
+  assert.equal(killed, false);
+  assert.equal(childRef?.signalCode, null);
 });
 
 test('unknown or partial quota never triggers a Codex handoff', async () => {

@@ -815,6 +815,12 @@ export async function runClaudeWithRecovery({
     return fleetRecoveryReleasePromise;
   };
   const protectCodexHandoff = async handoffSessionId => {
+    // Codex handoff must own the transient lease as well as the permanent
+    // replay claim. A cmux rescuer may already be holding the lease after it
+    // observed the same failed Claude child; without this check the launcher
+    // could hand the session to Codex while the rescuer later released its
+    // claim and re-launched Claude on the next scan.
+    if (!(await acquireFleetRecoveryClaim(handoffSessionId))) return false;
     if (typeof claimRecoveryOnce !== 'function') return true;
     try {
       const claim = await claimRecoveryOnce(handoffSessionId);
@@ -1161,6 +1167,14 @@ export async function runClaudeWithRecovery({
         && sessionId
         && retries < maxRetries
         && typeof recoverLimit === 'function') {
+      // The cmux rescuer also treats this transcript as recoverable. Claim
+      // the transient lease before stopping the child so a rescuer cannot
+      // launch Claude while account rotation is still deciding whether this
+      // launcher will resume or hand off to Codex.
+      if (!(await acquireFleetRecoveryClaim(sessionId))) {
+        log(`[TeamClaude] Another recovery path already owns session ${sessionId}; preserving it without a duplicate resume.`);
+        return await preserveChild(child);
+      }
       await stopChild(child);
       usageChildStopped = true;
       if (typeof waitForConnectionRecovery === 'function') {

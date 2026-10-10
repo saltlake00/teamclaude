@@ -1695,6 +1695,152 @@ test('releases a permanent claim when a pre-launch verification throws', async t
   assert.equal(attempted.has(SESSION_ID), false);
 });
 
+test('releases the permanent claim before the transient lease on retry', async t => {
+  const fx = await fixture(t);
+  const attempted = new Set();
+  const order = [];
+  let claimReleased = false;
+  let leaseReleased = false;
+
+  const result = await rescueCmuxSessionsOnce({
+    storePath: fx.storePath,
+    transcriptRoot: fx.transcriptRoot,
+    nodePath: '/usr/local/bin/node',
+    scriptPath: '/opt/teamclaude/src/index.js',
+    attempted,
+    inspectProcess: async () => processInfo(fx, {
+      processRole: 'legacy-native',
+      legacyEnvironmentValid: true,
+      nativeExecutableTrusted: true,
+      launchArgv: null,
+      command: `${fx.executablePath} --resume ${SESSION_ID}`,
+    }),
+    claimLease: async () => ({ dev: 1, ino: 1 }),
+    releaseLease: async () => {
+      order.push('lease');
+      assert.equal(claimReleased, true);
+      leaseReleased = true;
+      return true;
+    },
+    claimRecovery: async () => ({ dev: 2, ino: 2 }),
+    releaseRecovery: async () => {
+      order.push('claim');
+      assert.equal(leaseReleased, false);
+      claimReleased = true;
+      return true;
+    },
+    stopProcess: async () => {
+      throw new Error('transient pre-launch verification failure');
+    },
+    launchRecoveryWorkspace: async () => {
+      throw new Error('launch must not be reached');
+    },
+  });
+
+  assert.deepEqual(result, { scanned: 1, candidates: 1, rescued: 0, failed: 1 });
+  assert.deepEqual(order, ['claim', 'lease']);
+  assert.equal(attempted.has(SESSION_ID), false);
+});
+
+test('retries a failed permanent-claim release before releasing its lease', async t => {
+  const fx = await fixture(t);
+  const attempted = new Set();
+  const pendingLeases = new Map();
+  const pendingClaims = new Map();
+  let claimReleases = 0;
+  let leaseReleases = 0;
+  let stopped = false;
+
+  const options = {
+    storePath: fx.storePath,
+    transcriptRoot: fx.transcriptRoot,
+    nodePath: '/usr/local/bin/node',
+    scriptPath: '/opt/teamclaude/src/index.js',
+    attempted,
+    pendingLeases,
+    pendingClaims,
+    inspectProcess: async () => processInfo(fx, {
+      processRole: 'legacy-native',
+      legacyEnvironmentValid: true,
+      nativeExecutableTrusted: true,
+      launchArgv: null,
+      command: `${fx.executablePath} --resume ${SESSION_ID}`,
+    }),
+    claimLease: async () => ({ dev: 1, ino: 1, nonce: 'lease' }),
+    releaseLease: async () => {
+      leaseReleases += 1;
+      assert.equal(claimReleases, 2);
+      return true;
+    },
+    claimRecovery: async () => ({ dev: 2, ino: 2 }),
+    releaseRecovery: async () => {
+      claimReleases += 1;
+      if (claimReleases === 1) throw new Error('temporary claim-store failure');
+      return true;
+    },
+    stopProcess: async () => {
+      if (!stopped) throw new Error('pre-launch verification failure');
+      return true;
+    },
+    launchRecoveryWorkspace: async () => {},
+  };
+
+  const first = await rescueCmuxSessionsOnce(options);
+  assert.deepEqual(first, { scanned: 1, candidates: 1, rescued: 0, failed: 1 });
+  assert.equal(claimReleases, 1);
+  assert.equal(leaseReleases, 0);
+  assert.equal(pendingClaims.has(SESSION_ID), true);
+  assert.equal(pendingLeases.has(SESSION_ID), true);
+
+  await writeFile(fx.transcriptPath, `${loginExpiredRecord(fx.cwd)}\n${assistantRecord(fx.cwd)}\n`);
+  stopped = true;
+  const second = await rescueCmuxSessionsOnce(options);
+  assert.deepEqual(second, { scanned: 1, candidates: 0, rescued: 0, failed: 0 });
+  assert.equal(claimReleases, 2);
+  assert.equal(leaseReleases, 1);
+  assert.equal(pendingClaims.has(SESSION_ID), false);
+  assert.equal(pendingLeases.has(SESSION_ID), false);
+});
+
+test('treats a definitive missing permanent claim as releasable before its lease', async t => {
+  const fx = await fixture(t);
+  const attempted = new Set();
+  const pendingClaims = new Map();
+  let leaseReleases = 0;
+
+  const result = await rescueCmuxSessionsOnce({
+    storePath: fx.storePath,
+    transcriptRoot: fx.transcriptRoot,
+    nodePath: '/usr/local/bin/node',
+    scriptPath: '/opt/teamclaude/src/index.js',
+    attempted,
+    pendingClaims,
+    inspectProcess: async () => processInfo(fx, {
+      processRole: 'legacy-native',
+      legacyEnvironmentValid: true,
+      nativeExecutableTrusted: true,
+      launchArgv: null,
+      command: `${fx.executablePath} --resume ${SESSION_ID}`,
+    }),
+    claimLease: async () => ({ dev: 1, ino: 1, nonce: 'lease' }),
+    releaseLease: async () => {
+      leaseReleases += 1;
+      return true;
+    },
+    claimRecovery: async () => ({ dev: 2, ino: 2 }),
+    releaseRecovery: async () => false,
+    stopProcess: async () => {
+      throw new Error('pre-launch verification failure');
+    },
+    launchRecoveryWorkspace: async () => {},
+  });
+
+  assert.deepEqual(result, { scanned: 1, candidates: 1, rescued: 0, failed: 1 });
+  assert.equal(leaseReleases, 1);
+  assert.equal(pendingClaims.has(SESSION_ID), false);
+  assert.equal(attempted.has(SESSION_ID), false);
+});
+
 test('does not replay a claimed session after the supervisor restarts', async t => {
   const fx = await fixture(t);
   let launches = 0;

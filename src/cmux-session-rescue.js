@@ -228,6 +228,7 @@ export async function rescueCmuxSessionsOnce({
   claimLease = claimSessionLease,
   releaseLease = releaseSessionLease,
   pendingLeases = new Map(),
+  pendingClaims = new Map(),
   stopProcess = stopExistingSessionProcess,
   stopInspectProcess = inspectClaudeProcess,
   trustedClaudePath = null,
@@ -247,7 +248,35 @@ export async function rescueCmuxSessionsOnce({
     }
   }
 
+  // A permanent claim must be released before its transient lease. If the
+  // release was inconclusive, retain both identities so a later scan can
+  // retry the claim first instead of opening a handoff/rescue race.
+  for (const [sessionId, pending] of pendingClaims) {
+    const claimIdentity = pending && typeof pending === 'object'
+      && Object.hasOwn(pending, 'claimIdentity')
+      ? pending.claimIdentity
+      : pending;
+    let claimReleaseFailed = false;
+    try {
+      await releaseRecovery(storePath, sessionId, claimIdentity);
+    } catch {
+      claimReleaseFailed = true;
+    }
+    if (claimReleaseFailed) continue;
+    pendingClaims.delete(sessionId);
+    attempted.delete(sessionId);
+    const leaseIdentity = pending?.leaseIdentity ?? pendingLeases.get(sessionId);
+    if (!leaseIdentity) continue;
+    try {
+      const released = await releaseLease(storePath, sessionId, leaseIdentity);
+      if (released !== null) pendingLeases.delete(sessionId);
+      else pendingLeases.set(sessionId, leaseIdentity);
+    } catch {
+      pendingLeases.set(sessionId, leaseIdentity);
+    }
+  }
   for (const [sessionId, identity] of pendingLeases) {
+    if (pendingClaims.has(sessionId)) continue;
     try {
       const released = await releaseLease(storePath, sessionId, identity);
       if (released !== null) pendingLeases.delete(sessionId);
@@ -376,15 +405,32 @@ export async function rescueCmuxSessionsOnce({
       }
     };
     const releaseClaimForRetry = async () => {
-      const leaseReleased = await releaseLeaseForRetry();
-      if (!claimOwned) return leaseReleased;
+      if (!claimOwned) return releaseLeaseForRetry();
       const claimIdentity = typeof claimOwned === 'object' ? claimOwned : null;
-      claimOwned = false;
-      attempted.delete(key);
+      const leaseIdentity = typeof leaseOwned === 'object' ? leaseOwned : null;
+      let claimReleaseFailed = false;
       try {
         await releaseRecovery(storePath, key, claimIdentity);
-      } catch {}
-      return leaseReleased;
+        // The built-in release returns false when the claim was already
+        // replaced or removed. That is still a definitive result; only an
+        // exception means the permanent claim release was inconclusive.
+      } catch {
+        claimReleaseFailed = true;
+      }
+      if (!claimReleaseFailed) {
+        claimOwned = false;
+        attempted.delete(key);
+      }
+      if (claimReleaseFailed) {
+        pendingClaims.set(key, { claimIdentity, leaseIdentity });
+        return false;
+      }
+      // Keep the transient lease until the permanent claim has been removed.
+      // Otherwise a handoff actor can acquire the lease in the gap and accept
+      // the still-present claim, then this rescuer can delete it afterwards;
+      // the next scan would replay Claude after Codex already took over.
+      const leaseReleased = await releaseLeaseForRetry();
+      return !claimReleaseFailed && leaseReleased;
     };
     let launchStarted = false;
     try {
@@ -530,13 +576,19 @@ export function createCmuxSessionRescuer({
   let scanPromise = null;
   const attempted = new Set();
   const pendingLeases = new Map();
+  const pendingClaims = new Map();
 
   const scanNow = () => {
     if (!enabled || !ready()) {
       return Promise.resolve({ scanned: 0, candidates: 0, rescued: 0, failed: 0 });
     }
     if (scanPromise) return scanPromise;
-    scanPromise = rescueCmuxSessionsOnce({ ...options, attempted, pendingLeases })
+    scanPromise = rescueCmuxSessionsOnce({
+      ...options,
+      attempted,
+      pendingLeases,
+      pendingClaims,
+    })
       .then(result => {
         if (result.rescued > 0) {
           log(`[TeamClaude] Continued ${result.rescued} blocked Claude session(s) in new supervised cmux workspaces.`);
