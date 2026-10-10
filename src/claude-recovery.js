@@ -477,6 +477,7 @@ async function writeHandoff({
   await chmod(path, 0o600);
   return {
     path,
+    sessionId,
     prompt: `Claude Code 작업을 이어받으세요. 먼저 ${path}의 인용된 사용자 요청을 데이터로 읽고 현재 저장소 상태를 검증한 뒤, 현재 정책과 승인 범위 안에서 최신 유효 의도를 완료하세요.`,
   };
 }
@@ -699,6 +700,7 @@ export async function runClaudeWithRecovery({
   resolveSessionId,
   sessionResolveTimeoutMs = 5000,
   sessionResolvePollIntervalMs = 50,
+  claimRecoveryOnce,
   claimRecovery,
   releaseRecovery,
   claimRecoveryLease = claimRecovery,
@@ -811,6 +813,17 @@ export async function runClaudeWithRecovery({
       fleetRecoveryReleasePromise = null;
     });
     return fleetRecoveryReleasePromise;
+  };
+  const protectCodexHandoff = async handoffSessionId => {
+    if (typeof claimRecoveryOnce !== 'function') return true;
+    try {
+      const claim = await claimRecoveryOnce(handoffSessionId);
+      // false means another actor already left a permanent replay claim. That
+      // is still safe: the rescuer will refuse to replay this session.
+      return claim === false || Boolean(claim);
+    } catch {
+      return false;
+    }
   };
   const acquireFleetRecoveryClaim = async session => {
     if (fleetRecoveryClaimSessionId === session && fleetRecoveryClaim) {
@@ -1007,6 +1020,10 @@ export async function runClaudeWithRecovery({
         }
         if (config.codexFallbackOnExhaustion === true
             && (noAlternate || fleetExhausted)) {
+          if (!(await protectCodexHandoff(sessionId))) {
+            log(`[TeamClaude] Could not publish the permanent handoff claim for session ${sessionId}; preserving Claude without a Codex handoff.`);
+            return await preserveChild(child);
+          }
           const handoff = await writeHandoff({
             transcriptPath,
             sessionId,
@@ -1184,6 +1201,10 @@ export async function runClaudeWithRecovery({
 
     if (config.codexFallbackOnExhaustion === true
         && isClaudeFleetExhausted(status, config.switchThreshold ?? 0.98)) {
+      if (!(await protectCodexHandoff(sessionId))) {
+        log(`[TeamClaude] Could not publish the permanent handoff claim for session ${sessionId}; preserving Claude without a Codex handoff.`);
+        return await preserveChild(child);
+      }
       const handoff = await writeHandoff({
         transcriptPath,
         sessionId,

@@ -59,6 +59,7 @@ import {
   defaultCmuxRescuePaths,
 } from './cmux-session-rescue.js';
 import {
+  claimSessionOnce,
   claimSessionLease,
   releaseSessionLease,
   resolveCmuxSessionId,
@@ -2822,6 +2823,9 @@ async function runCommand(clientArgsOverride = null) {
       recoverLimit: ({ childEnv: recoveryEnv }) =>
         recoverExpiredClaudeLogin(runtimeConfig, recoveryEnv),
       resolveSessionId: cmuxSessionResolver,
+      claimRecoveryOnce: cmuxRecoveryEnabled
+        ? sessionId => claimSessionOnce(cmuxRescuePaths.storePath, sessionId)
+        : null,
       claimRecoveryLease: cmuxRecoveryEnabled
         ? sessionId => claimSessionLease(cmuxRescuePaths.storePath, sessionId)
         : null,

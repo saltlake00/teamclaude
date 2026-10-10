@@ -565,6 +565,7 @@ test('Login expired falls back to Codex when no Claude account remains', async t
   let recoveries = 0;
   let spawns = 0;
   let kills = 0;
+  let handoffClaimedSessionId = null;
 
   const result = await runClaudeWithRecovery({
     claudeArgs: [],
@@ -580,6 +581,10 @@ test('Login expired falls back to Codex when no Claude account remains', async t
     transcriptRoot,
     handoffRoot,
     pollIntervalMs: 5,
+    claimRecoveryOnce: async sessionId => {
+      handoffClaimedSessionId = sessionId;
+      return { dev: 1, ino: 1 };
+    },
     fetchStatus: async () => ({ accounts: [] }),
     recoverLoginExpired: async () => {
       recoveries += 1;
@@ -617,6 +622,7 @@ test('Login expired falls back to Codex when no Claude account remains', async t
   assert.equal(result.status, 0);
   assert.equal(recoveries, 1);
   assert.equal(spawns, 1);
+  assert.equal(handoffClaimedSessionId, codexCall.sessionId);
   assert.equal(kills, 0);
   assert.ok(codexCall?.path);
   const handoff = await readFile(codexCall.path, 'utf8');
@@ -2758,6 +2764,7 @@ test('exhausted general Claude fleet creates one sanitized handoff and launches 
   const slackCredential = ['xoxb', '123456789012', 'abcdefghijklmnop'].join('-');
   let codexCall = null;
   let spawnCount = 0;
+  let handoffClaimedSessionId = null;
 
   const result = await runClaudeWithRecovery({
     claudeArgs: [],
@@ -2773,6 +2780,10 @@ test('exhausted general Claude fleet creates one sanitized handoff and launches 
     transcriptRoot,
     handoffRoot,
     pollIntervalMs: 5,
+    claimRecoveryOnce: async sessionId => {
+      handoffClaimedSessionId = sessionId;
+      return { dev: 1, ino: 1 };
+    },
     fetchStatus: async () => statusWithQuota(0.98),
     spawnClaude(args) {
       spawnCount += 1;
@@ -2826,6 +2837,7 @@ test('exhausted general Claude fleet creates one sanitized handoff and launches 
 
   assert.equal(result.status, 0);
   assert.equal(spawnCount, 1);
+  assert.equal(handoffClaimedSessionId, codexCall.sessionId);
   assert.ok(codexCall?.path);
   const handoff = await readFile(codexCall.path, 'utf8');
   assert.match(handoff, /마지막 작업을 계속 완료해/);
