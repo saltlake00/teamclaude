@@ -399,7 +399,7 @@ teamcodex priority <name> <n|auto>  # pin explicit order (lower = preferred); "a
 
 In the TUI, `↑`/`↓` select an account, `e` toggles enable/disable, and `o` grabs the selected account into order mode: `↑`/`↓` move its rank, `a` resets the WHOLE order back to `auto`, `c` clears just that account's rank, `Enter`/`Esc` done. Ranked accounts render as `#1 #2 …` and are preferred first; everything unranked stays on the automatic ordering — so you can pin a few accounts and let the rest rotate.
 
-CLI changes made while the server is running are picked up with **R** (reload) in the TUI or `teamcodex restart`.
+Account changes made with the CLI while the server is running (`import`/`login`/`remove`/`disable`/`enable`/`priority`) are applied live — the worker reloads without a restart, so in-flight requests are not cut. **R** in the TUI forces the same reload. Do not use `teamcodex restart` to apply them: a restart ends every in-flight request.
 
 ### Run Claude Code through the proxy
 

@@ -143,23 +143,23 @@ AI 编程订阅的会话限额和每周限额按账户分别计算。某个账�
 npm install -g teamcodex
 
 # 添加 Claude 账户——会打开浏览器 OAuth
-teamclaude login
-teamclaude login
+teamcodex login
+teamcodex login
 
 # 启动 Claude 代理
-teamclaude server
+teamcodex server
 
 # 在另一个终端中运行 Claude Code
-teamclaude run
+teamcodex run
 ```
 
 > [!IMPORTANT]
-> 即使代理正在运行，普通的 `claude` 命令也不会自动使用代理。若要启用账户自动切换，请始终通过 `teamclaude run` 启动。
-> `teamclaude run` 会在代理缺失时自动启动后台 supervisor。即使 proxy worker 异常退出，public listener 仍会保持，并自动启动新的 worker。
+> 即使代理正在运行，普通的 `claude` 命令也不会自动使用代理。若要启用账户自动切换，请始终通过 `teamcodex run` 启动。
+> `teamcodex run` 会在代理缺失时自动启动后台 supervisor。即使 proxy worker 异常退出，public listener 仍会保持，并自动启动新的 worker。
 > `launchModel` fallback 仅在所有按通用限额仍可用的账户，其模型级窗口都具有有效测量且已达到上限时应用。只要存在未测量或已过期的窗口，就不会提前 downgrade。
 
 Claude Code 本地 OAuth 与 TeamClaude 账户池 OAuth 是两个独立的认证层。
-`teamclaude login --name <name>` 只修复账户池中的账户，无法刷新 Claude Code
+`teamcodex login --name <name>` 只修复账户池中的账户，无法刷新 Claude Code
 本地会话。可用以下命令检查并修复本地认证：
 
 ```bash
@@ -178,7 +178,7 @@ Claude，并通过 sanitized handoff 交给 Codex 继续。这是 provider hando
 
 ```bash
 claude /login
-teamclaude import
+teamcodex import
 ```
 
 ## Codex 多账户配置
@@ -244,33 +244,33 @@ model:
 ### OAuth 登录
 
 ```bash
-teamclaude login
+teamcodex login
 ```
 
 ### 从 Claude Code 导入
 
 ```bash
-teamclaude import
-teamclaude import --name work
+teamcodex import
+teamcodex import --name work
 ```
 
 ### API key 账户
 
 ```bash
-teamclaude api --name production
+teamcodex api --name production
 ```
 
 ## 服务器与仪表盘
 
 ```bash
-teamclaude server
-teamclaude status
-teamclaude accounts
-teamclaude stop
-teamclaude restart
+teamcodex server
+teamcodex status
+teamcodex accounts
+teamcodex stop
+teamcodex restart
 ```
 
-在 TTY 中运行 `teamclaude server` 或 `teamcodex codex server` 时，
+在 TTY 中运行 `teamcodex server` 或 `teamcodex codex server` 时，
 会打开全屏仪表盘。
 
 | 按键 | 操作 |
