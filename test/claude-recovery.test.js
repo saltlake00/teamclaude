@@ -3,9 +3,11 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import {
   appendFile,
+  link,
   mkdtemp,
   mkdir,
   readFile,
+  rename,
   rm,
   stat,
   writeFile,
@@ -18,6 +20,7 @@ import {
   classifyClaudeApiErrorRecord,
   isClaudeFleetExhausted,
   runClaudeWithRecovery,
+  transcriptHasConversationAfter,
 } from '../src/claude-recovery.js';
 
 function fakeChild(onKill = null) {
@@ -4213,4 +4216,114 @@ test('fleet exhaustion does not duplicate a manual resume that advances the tran
   assert.equal(result.status, null);
   assert.equal(spawns, 1);
   assert.equal(waits, 1);
+});
+
+test('transcript activity scan is chunked and bounded after the recorded offset', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-transcript-scan-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, 's.jsonl');
+  const errorLine = fleetExhaustedRecord(root);
+  const userLine = JSON.stringify({ type: 'user', cwd: root, message: { role: 'user', content: 'continue' } });
+  const head = `${userLine}\n`;
+
+  // Only API error records after the offset: no conversation activity.
+  await writeFile(path, head + `${errorLine}\n`.repeat(3000));
+  assert.equal(await transcriptHasConversationAfter(path, head.length), false);
+
+  // A real record straddling the 1 MiB chunk boundary is still parsed whole.
+  const pad = JSON.stringify({ type: 'assistant', isApiErrorMessage: true, message: { content: 'x'.repeat(1024 * 1024 - 200) } });
+  await writeFile(path, `${head}${pad}\n${userLine}\n`);
+  assert.equal(await transcriptHasConversationAfter(path, head.length), true);
+
+  // A final record without a trailing newline counts.
+  await writeFile(path, `${head}${errorLine}\n${userLine}`);
+  assert.equal(await transcriptHasConversationAfter(path, head.length), true);
+
+  // A line larger than the per-line cap counts as activity without being buffered whole.
+  await writeFile(path, head + 'y'.repeat(17 * 1024 * 1024));
+  assert.equal(await transcriptHasConversationAfter(path, head.length), true);
+
+  // Content before the offset is never considered.
+  await writeFile(path, `${head}${errorLine}\n`);
+  assert.equal(await transcriptHasConversationAfter(path, head.length), false);
+});
+
+test('transcript activity scan keeps reading records appended while it scans', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-transcript-append-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, 's.jsonl');
+  const userLine = JSON.stringify({ type: 'user', cwd: root, message: { role: 'user', content: 'continue' } });
+  const head = `${userLine}\n`;
+  // Several MiB of API-error records keep the scan busy across many reads.
+  await writeFile(path, head + `${fleetExhaustedRecord(root)}\n`.repeat(20000));
+  const scan = transcriptHasConversationAfter(path, head.length);
+  await appendFile(path, `${userLine}\n`);
+  assert.equal(await scan, true, 'a conversation record appended after the scan began is seen');
+});
+
+test('transcript activity scan sees a record appended right as it starts at the offset', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-transcript-start-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, 's.jsonl');
+  const userLine = JSON.stringify({ type: 'user', cwd: root, message: { role: 'user', content: 'continue' } });
+  const head = `${userLine}\n`;
+  await writeFile(path, head);
+  const scan = transcriptHasConversationAfter(path, head.length);
+  await appendFile(path, `${userLine}\n`);
+  assert.equal(await scan, true);
+});
+
+// When the scan cannot give a trustworthy answer the session must be preserved
+// (treated as active), never resumed blind: a truncated, rotated or unreadable
+// transcript all count as activity.
+test('transcript activity scan fails closed on truncation, rotation and unreadable files', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-transcript-closed-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, 's.jsonl');
+  const errorLine = `${fleetExhaustedRecord(root)}\n`;
+  await writeFile(path, errorLine.repeat(10));
+  const offset = errorLine.length * 10;
+  const original = await stat(path);
+  const identity = { dev: original.dev, ino: original.ino };
+
+  // Unchanged file with only error records: no activity (the normal resume path).
+  assert.equal(await transcriptHasConversationAfter(path, offset, identity), false);
+
+  // Truncated below the recorded offset.
+  await writeFile(path, errorLine);
+  assert.equal(await transcriptHasConversationAfter(path, offset), true, 'truncated');
+
+  // Rotated: same path, different file, even if it is long enough. The old
+  // file is kept under another name so its inode cannot be reused (Linux can
+  // hand a just-freed inode straight to the next file).
+  await rename(path, `${path}.old`);
+  await writeFile(`${path}.new`, errorLine.repeat(20));
+  await rename(`${path}.new`, path);
+  assert.notEqual((await stat(path)).ino, identity.ino);
+  assert.equal(await transcriptHasConversationAfter(path, offset, identity), true, 'rotated');
+
+  // Unreadable (missing) transcript.
+  await rm(path);
+  assert.equal(await transcriptHasConversationAfter(path, offset, identity), true, 'missing');
+});
+
+test('transcript activity scan fails closed when the file rotates or shrinks mid-scan', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-transcript-race-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, 's.jsonl');
+  const errorLine = `${fleetExhaustedRecord(root)}\n`;
+  const body = errorLine.repeat(20000);
+
+  // Rotation while the scan is reading the old inode.
+  await writeFile(path, body);
+  let scan = transcriptHasConversationAfter(path, 0);
+  await rename(path, `${path}.old`);
+  await writeFile(path, errorLine);
+  assert.equal(await scan, true, 'rotated mid-scan');
+
+  // Truncation below the recorded offset, whenever it lands during the scan.
+  await writeFile(path, body);
+  scan = transcriptHasConversationAfter(path, errorLine.length * 10000);
+  await writeFile(path, errorLine);
+  assert.equal(await scan, true, 'shrunk mid-scan');
 });

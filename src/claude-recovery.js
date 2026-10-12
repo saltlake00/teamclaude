@@ -531,6 +531,9 @@ async function stopChild(child) {
   }
 }
 
+const TRANSCRIPT_SCAN_CHUNK_BYTES = 1024 * 1024;
+const TRANSCRIPT_MAX_LINE_BYTES = 16 * 1024 * 1024;
+
 async function monitorChild({
   child,
   exitPromise = null,
@@ -549,6 +552,7 @@ async function monitorChild({
   let currentSessionId = sessionId;
   const sessionWasKnownAtLaunch = Boolean(sessionId);
   let currentOffset = offset;
+  let currentIdentity = null;
   let pending = '';
   let unresolvedEvent = null;
   const failureSettleMs = Number.isFinite(pollIntervalMs)
@@ -605,6 +609,7 @@ async function monitorChild({
       }
     }
     currentOffset = info.size;
+    currentIdentity = { dev: info.dev, ino: info.ino };
     const lines = (pending + chunk.toString('utf8')).split('\n');
     pending = final ? '' : lines.pop();
     for (const line of lines) {
@@ -630,6 +635,7 @@ async function monitorChild({
       transcriptPath: currentPath,
       sessionId: currentSessionId,
       offset: currentOffset,
+      identity: currentIdentity,
     };
   }
 
@@ -663,23 +669,69 @@ async function monitorChild({
   }
 }
 
-async function transcriptHasConversationAfter(path, offset) {
-  if (typeof path !== 'string' || !Number.isFinite(offset) || offset < 0) return false;
-  const info = await stat(path).catch(() => null);
-  if (!info || info.size <= offset) return false;
+// Scan what was appended after `offset` in bounded chunks: a session can keep
+// writing for days while parked, so the tail must never be read in one buffer.
+// A line too large to hold is a real conversation record (API error records are
+// small), so it counts as activity — the safe side against a duplicate resume.
+//
+// Anything that prevents a trustworthy answer counts as activity too, so the
+// caller preserves the session instead of resuming it blind: an unreadable
+// transcript, one that shrank below the recorded offset (truncated/rewritten),
+// or a different file than the one the offset was taken from (rotated).
+export async function transcriptHasConversationAfter(path, offset, expectedIdentity = null) {
+  if (typeof path !== 'string' || !Number.isFinite(offset) || offset < 0) return true;
+  // No size shortcut before opening: a record appended between a size check
+  // and the read would be missed. The read loop below re-checks at EOF.
   const handle = await open(path, 'r').catch(() => null);
-  if (!handle) return false;
+  if (!handle) return true;
+  const opened = await handle.stat().catch(() => null);
+  if (!opened || opened.size < offset
+      || (expectedIdentity
+        && (opened.dev !== expectedIdentity.dev || opened.ino !== expectedIdentity.ino))) {
+    await handle.close();
+    return true;
+  }
+  const isConversationLine = line => {
+    if (line.length === 0) return false;
+    try {
+      return isConversationRecord(JSON.parse(line.toString('utf8')));
+    } catch {
+      return false;
+    }
+  };
   try {
-    const buffer = Buffer.alloc(info.size - offset);
-    await handle.read(buffer, 0, buffer.length, offset);
-    return buffer.toString('utf8').split('\n').some(line => {
-      if (!line) return false;
-      try {
-        return isConversationRecord(JSON.parse(line));
-      } catch {
-        return false;
+    let pending = Buffer.alloc(0);
+    let position = offset;
+    const chunk = Buffer.alloc(TRANSCRIPT_SCAN_CHUNK_BYTES);
+    // Read to the live end of file rather than the size seen at the start:
+    // Claude may append a record while the scan runs, and missing it would
+    // resume a turn that already continued. Stop only when a re-stat at EOF
+    // shows nothing new.
+    for (;;) {
+      const { bytesRead } = await handle.read(chunk, 0, chunk.length, position);
+      if (bytesRead === 0) {
+        // At EOF the path must still name the file being read and must not
+        // have shrunk: a rotation or truncation during the scan means records
+        // may live elsewhere, so the answer is "active" (preserve the session).
+        const [now, atPath] = await Promise.all([
+          handle.stat().catch(() => null),
+          stat(path).catch(() => null),
+        ]);
+        if (!now || !atPath || now.size < position
+            || atPath.dev !== opened.dev || atPath.ino !== opened.ino) return true;
+        if (now.size === position) break;
+        continue;
       }
-    });
+      position += bytesRead;
+      let data = Buffer.concat([pending, chunk.subarray(0, bytesRead)]);
+      for (let newline = data.indexOf(10); newline !== -1; newline = data.indexOf(10)) {
+        if (isConversationLine(data.subarray(0, newline))) return true;
+        data = data.subarray(newline + 1);
+      }
+      if (data.length > TRANSCRIPT_MAX_LINE_BYTES) return true;
+      pending = Buffer.from(data);
+    }
+    return isConversationLine(pending);
   } finally {
     await handle.close();
   }
@@ -1249,7 +1301,7 @@ export async function runClaudeWithRecovery({
       }
       await stopChild(child);
       await wait(waitMs);
-      if (await transcriptHasConversationAfter(transcriptPath, outcome.offset)) {
+      if (await transcriptHasConversationAfter(transcriptPath, outcome.offset, outcome.identity)) {
         await releaseFleetRecoveryClaim();
         log(`[TeamClaude] Session ${sessionId} advanced while waiting; preserving the existing transcript without a duplicate resume.`);
         return await childExit(child);
