@@ -72,12 +72,24 @@ function accountGeneralQuotaBlocked(account, threshold) {
   return false;
 }
 
-export function isClaudeFleetExhausted(status, threshold = 0.98) {
+function accountModelQuotaBlocked(account, threshold) {
+  const windows = account?.quota?.modelWeekly;
+  if (!windows || typeof windows !== 'object') return false;
+  return Object.values(windows).some(win => freshBlocked(win?.utilization, win?.reset, threshold));
+}
+
+// With `includeModelWindows`, an account that still has general quota but whose
+// model-scoped weekly window (e.g. the Fable tier) is full also counts as
+// exhausted. Callers pass it only when the proxy itself reported that every
+// account is exhausted for the session's request (a fleet-exhaustion error),
+// so a model-only shortage can hand off instead of resuming into it again.
+export function isClaudeFleetExhausted(status, threshold = 0.98, { includeModelWindows = false } = {}) {
   const accounts = Array.isArray(status?.accounts)
     ? status.accounts.filter(account => account?.enabled !== false)
     : [];
   return accounts.length > 0
-    && accounts.every(account => accountGeneralQuotaBlocked(account, threshold));
+    && accounts.every(account => accountGeneralQuotaBlocked(account, threshold)
+      || (includeModelWindows && accountModelQuotaBlocked(account, threshold)));
 }
 
 function textBlocks(content) {
@@ -992,7 +1004,9 @@ export async function runClaudeWithRecovery({
     } catch {}
 
     if (config.codexFallbackOnExhaustion === true
-        && isClaudeFleetExhausted(status, config.switchThreshold ?? 0.98)) {
+        && isClaudeFleetExhausted(status, config.switchThreshold ?? 0.98, {
+          includeModelWindows: outcome.event.kind === 'fleet_exhausted',
+        })) {
       const handoff = await writeHandoff({
         transcriptPath,
         sessionId,

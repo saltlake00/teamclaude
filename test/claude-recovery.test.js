@@ -2912,6 +2912,64 @@ test('unknown or partial quota never triggers a Codex handoff', async () => {
   }, 0.98), false);
 });
 
+test('model-scoped windows count only when the proxy reported fleet exhaustion', () => {
+  const reset = new Date(Date.now() + 3600_000).getTime();
+  const status = { accounts: [{ enabled: true, quota: {
+    unified5h: 0.2, unified5hReset: reset, unified7d: 0.3, unified7dReset: reset,
+    modelWeekly: { '7d_oi': { utilization: 1, reset } },
+  } }] };
+  assert.equal(isClaudeFleetExhausted(status, 0.98), false, 'general quota remains');
+  assert.equal(isClaudeFleetExhausted(status, 0.98, { includeModelWindows: true }), true, 'the Fable tier is full');
+  const expired = structuredClone(status);
+  expired.accounts[0].quota.modelWeekly['7d_oi'].reset = Date.now() - 1000;
+  assert.equal(isClaudeFleetExhausted(expired, 0.98, { includeModelWindows: true }), false, 'an expired window is not blocking');
+});
+
+// A Fable-only shortage across the fleet arrives as a fleet-exhaustion error
+// while general quota remains; with Codex fallback on it must hand off rather
+// than resume into the same exhausted tier.
+test('fleet exhaustion with only the model tier full hands off when Codex fallback is on', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-fleet-model-'));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  const handoffRoot = join(root, 'handoffs');
+  await mkdir(cwd);
+  const calls = [];
+  let codexCalls = 0;
+  const reset = new Date(Date.now() + 3600_000).getTime();
+
+  await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: {},
+    config: { autoResumeClaude: true, codexFallbackOnExhaustion: true },
+    cwd,
+    transcriptRoot,
+    handoffRoot,
+    pollIntervalMs: 5,
+    fetchStatus: async () => ({ accounts: [{ enabled: true, quota: {
+      unified5h: 0.2, unified5hReset: reset, unified7d: 0.3, unified7dReset: reset,
+      modelWeekly: { '7d_oi': { utilization: 1, reset } },
+    } }] }),
+    wait: async () => { throw new Error('must not wait to resume into an exhausted tier'); },
+    spawnClaude(args) {
+      const child = fakeChild();
+      calls.push([...args]);
+      const sessionId = args[args.indexOf('--session-id') + 1];
+      setTimeout(async () => {
+        const dir = join(transcriptRoot, 'project');
+        await mkdir(dir, { recursive: true });
+        await writeFile(join(dir, `${sessionId}.jsonl`), `${fleetExhaustedRecord(cwd, 3600)}\n`);
+      }, 10);
+      return child;
+    },
+    launchCodex: async () => { codexCalls += 1; return { status: 0, signal: null }; },
+    log() {},
+  });
+
+  assert.equal(codexCalls, 1);
+  assert.equal(calls.length, 1);
+});
+
 test('ambiguous Claude session selectors never monitor or recover another session', async t => {
   const selectors = [
     ['--resume', 'named-session'],
