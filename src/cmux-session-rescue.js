@@ -2,7 +2,7 @@ import { execFile } from 'node:child_process';
 import { constants } from 'node:fs';
 import { access } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { promisify } from 'node:util';
 import {
   buildResumeCommand,
@@ -14,6 +14,7 @@ import {
   releaseSessionLease,
   releaseSessionClaim,
   resolveTrustedClaudePath,
+  sessionClaimExists,
   sameClaudeProcess,
   unresolvedRecoverableApiErrorState,
   validSession,
@@ -27,13 +28,23 @@ const CMUX_BINARY_CANDIDATES = [
   '/Applications/cmux.app/Contents/Resources/bin/cmux',
 ];
 
-async function resolveCmuxBinary() {
-  for (const candidate of CMUX_BINARY_CANDIDATES) {
-    if (await access(candidate, constants.X_OK).then(() => true, () => false)) {
-      return candidate;
+// The rescue loop runs from background contexts with a minimal PATH, and a
+// PATH lookup would let any earlier `cmux` on PATH receive surface commands.
+// So only known absolute install locations are probed; a non-standard install
+// names its binary explicitly with TEAMCLAUDE_CMUX_BIN (absolute, executable).
+export async function resolveCmuxBinary(env = process.env) {
+  const isExecutable = path => access(path, constants.X_OK).then(() => true, () => false);
+  const override = env.TEAMCLAUDE_CMUX_BIN;
+  if (override !== undefined && override !== '') {
+    if (!isAbsolute(override) || !(await isExecutable(override))) {
+      throw new Error('TEAMCLAUDE_CMUX_BIN must be an absolute path to an executable cmux.');
     }
+    return override;
   }
-  throw new Error('Unable to resolve the cmux executable.');
+  for (const candidate of CMUX_BINARY_CANDIDATES) {
+    if (await isExecutable(candidate)) return candidate;
+  }
+  throw new Error('Unable to resolve the cmux executable (set TEAMCLAUDE_CMUX_BIN for a non-standard install).');
 }
 
 function sessions(store) {
@@ -71,6 +82,17 @@ async function defaultResolveRecoveryWindow({ workspaceId, surfaceId }) {
   return windowId;
 }
 
+// Marks a launch failure that provably ran nothing (no cmux binary, no target
+// window, or the process could not be spawned). Only such failures release the
+// recovery claim for a retry; a timeout or a cmux error after spawning is
+// ambiguous (the workspace may exist) and keeps the claim so the event is never
+// launched twice.
+function notLaunched(error) {
+  const wrapped = error instanceof Error ? error : new Error(String(error));
+  wrapped.recoveryNotLaunched = true;
+  return wrapped;
+}
+
 async function defaultLaunchRecoveryWorkspace({
   workspaceId,
   surfaceId,
@@ -79,26 +101,37 @@ async function defaultLaunchRecoveryWorkspace({
   sessionId,
   command,
 }) {
-  const cmuxBinary = await resolveCmuxBinary();
-  const resolvedWindowId = windowId || await defaultResolveRecoveryWindow({
-    workspaceId,
-    surfaceId,
-  });
-  await execFileAsync(cmuxBinary, [
-    'new-workspace',
-    '--window',
-    resolvedWindowId,
-    '--name',
-    `Recovered Claude ${sessionId.slice(0, 8)}`,
-    '--cwd',
-    cwd,
-    '--command',
-    command,
-    '--focus',
-    'false',
-  ], {
-    timeout: 5000,
-  });
+  let cmuxBinary;
+  let resolvedWindowId;
+  try {
+    cmuxBinary = await resolveCmuxBinary();
+    resolvedWindowId = windowId || await defaultResolveRecoveryWindow({
+      workspaceId,
+      surfaceId,
+    });
+  } catch (error) {
+    throw notLaunched(error);
+  }
+  try {
+    await execFileAsync(cmuxBinary, [
+      'new-workspace',
+      '--window',
+      resolvedWindowId,
+      '--name',
+      `Recovered Claude ${sessionId.slice(0, 8)}`,
+      '--cwd',
+      cwd,
+      '--command',
+      command,
+      '--focus',
+      'false',
+    ], {
+      timeout: 5000,
+    });
+  } catch (error) {
+    if (error?.code === 'ENOENT' || error?.code === 'EACCES') throw notLaunched(error);
+    throw error;
+  }
 }
 
 async function defaultReadStore(path) {
@@ -154,7 +187,20 @@ export async function stopExistingSessionProcess(
   const stopOrder = [...pids].sort((left, right) => (
     left === parentPid ? -1 : right === parentPid ? 1 : 0
   ));
+  // Stopping the launcher can let the child exit and its PID be reused, so
+  // each PID is re-verified right before it is signalled. The identity carries
+  // the process start time, so a reused PID never matches; an inspection
+  // failure skips the signal (fail closed).
+  const stillExpected = async pid => {
+    try {
+      const current = await inspectProcess(pid);
+      return current?.alive === true && current.processIdentity === expected.get(pid);
+    } catch {
+      return false;
+    }
+  };
   for (const pid of stopOrder) {
+    if (!await stillExpected(pid)) continue;
     try {
       process.kill(pid, 'SIGTERM');
     } catch {}
@@ -183,6 +229,25 @@ export async function stopExistingSessionProcess(
     }
   }
   return stopped;
+}
+
+// A permanent replay claim covers one recoverable error EVENT, not the whole
+// session: a session that is rescued and later exhausts the fleet again records
+// a new error and must be rescuable again, while the same event is never
+// launched twice (even across supervisor restarts). The event is the record's
+// uuid, or its timestamp when it has no uuid; a record with neither keeps the
+// conservative per-session key. The transient lease stays per session.
+function recoveryClaimKey(sessionId, state) {
+  if (typeof state?.eventId === 'string' && state.eventId) return `${sessionId}@${state.eventId}`;
+  return Number.isSafeInteger(state?.eventTimestampMs) && state.eventTimestampMs > 0
+    ? `${sessionId}@${state.eventTimestampMs}`
+    : sessionId;
+}
+
+function claimSession(claimKey, pending) {
+  if (typeof pending?.sessionId === 'string') return pending.sessionId;
+  const at = claimKey.indexOf('@');
+  return at === -1 ? claimKey : claimKey.slice(0, at);
 }
 
 function fleetRetryStillActive(state, now = Date.now()) {
@@ -227,6 +292,7 @@ export async function rescueCmuxSessionsOnce({
   releaseRecovery = releaseSessionClaim,
   claimLease = claimSessionLease,
   releaseLease = releaseSessionLease,
+  sessionClaimed = sessionClaimExists,
   pendingLeases = new Map(),
   pendingClaims = new Map(),
   stopProcess = stopExistingSessionProcess,
@@ -250,21 +316,23 @@ export async function rescueCmuxSessionsOnce({
 
   // A permanent claim must be released before its transient lease. If the
   // release was inconclusive, retain both identities so a later scan can
-  // retry the claim first instead of opening a handoff/rescue race.
-  for (const [sessionId, pending] of pendingClaims) {
+  // retry the claim first instead of opening a handoff/rescue race. Claims are
+  // keyed per error event; the lease they guard is keyed per session.
+  for (const [claimKey, pending] of pendingClaims) {
+    const sessionId = claimSession(claimKey, pending);
     const claimIdentity = pending && typeof pending === 'object'
       && Object.hasOwn(pending, 'claimIdentity')
       ? pending.claimIdentity
       : pending;
     let claimReleaseFailed = false;
     try {
-      await releaseRecovery(storePath, sessionId, claimIdentity);
+      await releaseRecovery(storePath, claimKey, claimIdentity);
     } catch {
       claimReleaseFailed = true;
     }
     if (claimReleaseFailed) continue;
-    pendingClaims.delete(sessionId);
-    attempted.delete(sessionId);
+    pendingClaims.delete(claimKey);
+    attempted.delete(claimKey);
     const leaseIdentity = pending?.leaseIdentity ?? pendingLeases.get(sessionId);
     if (!leaseIdentity) continue;
     try {
@@ -275,8 +343,11 @@ export async function rescueCmuxSessionsOnce({
       pendingLeases.set(sessionId, leaseIdentity);
     }
   }
+  const sessionsWithPendingClaims = new Set(
+    [...pendingClaims].map(([claimKey, pending]) => claimSession(claimKey, pending)),
+  );
   for (const [sessionId, identity] of pendingLeases) {
-    if (pendingClaims.has(sessionId)) continue;
+    if (sessionsWithPendingClaims.has(sessionId)) continue;
     try {
       const released = await releaseLease(storePath, sessionId, identity);
       if (released !== null) pendingLeases.delete(sessionId);
@@ -297,8 +368,10 @@ export async function rescueCmuxSessionsOnce({
     if (!initialState) continue;
     candidates += 1;
     if (fleetRetryStillActive(initialState)) continue;
-    const key = session.sessionId;
-    if (attempted.has(key) || pendingLeases.has(key)) continue;
+    // The claim key names this error event; the lease names the session.
+    const key = recoveryClaimKey(session.sessionId, initialState);
+    const leaseKey = session.sessionId;
+    if (attempted.has(key) || pendingLeases.has(leaseKey)) continue;
 
     let freshStore;
     try {
@@ -316,7 +389,8 @@ export async function rescueCmuxSessionsOnce({
       transcriptRoot,
       fresh.sessionId,
     );
-    if (!freshState || fleetRetryStillActive(freshState)) continue;
+    if (!freshState || fleetRetryStillActive(freshState)
+        || recoveryClaimKey(session.sessionId, freshState) !== key) continue;
 
     const first = await inspectProcess(fresh.pid, fresh.sessionId);
     const firstGone = processGone(first, fresh.pid);
@@ -350,7 +424,8 @@ export async function rescueCmuxSessionsOnce({
       transcriptRoot,
       final.sessionId,
     );
-    if (!finalState || fleetRetryStillActive(finalState)) continue;
+    if (!finalState || fleetRetryStillActive(finalState)
+        || recoveryClaimKey(session.sessionId, finalState) !== key) continue;
     const finalInfo = await inspectProcess(final.pid, final.sessionId);
     const finalGone = processGone(finalInfo, final.pid);
     if (finalGone !== secondGone) continue;
@@ -389,18 +464,18 @@ export async function rescueCmuxSessionsOnce({
       if (!leaseOwned) return true;
       const leaseIdentity = typeof leaseOwned === 'object' ? leaseOwned : null;
       try {
-        const released = await releaseLease(storePath, key, leaseIdentity);
+        const released = await releaseLease(storePath, leaseKey, leaseIdentity);
         if (released !== null) {
           leaseOwned = false;
-          pendingLeases.delete(key);
+          pendingLeases.delete(leaseKey);
         } else {
-          pendingLeases.set(key, leaseIdentity);
+          pendingLeases.set(leaseKey, leaseIdentity);
         }
         return released !== null;
       } catch {
         // Keep the identity marked as owned when release is inconclusive. A
         // later scan must not clear attempted and race this actor's lease.
-        pendingLeases.set(key, leaseIdentity);
+        pendingLeases.set(leaseKey, leaseIdentity);
         return false;
       }
     };
@@ -422,7 +497,7 @@ export async function rescueCmuxSessionsOnce({
         attempted.delete(key);
       }
       if (claimReleaseFailed) {
-        pendingClaims.set(key, { claimIdentity, leaseIdentity });
+        pendingClaims.set(key, { claimIdentity, leaseIdentity, sessionId: leaseKey });
         return false;
       }
       // Keep the transient lease until the permanent claim has been removed.
@@ -434,7 +509,7 @@ export async function rescueCmuxSessionsOnce({
     };
     let launchStarted = false;
     try {
-      const lease = await claimLease(storePath, key);
+      const lease = await claimLease(storePath, leaseKey);
       if (!lease) {
         // Another actor owns the transient lease. Do not poison this
         // rescuer's attempted set; a later scan may retry after that actor
@@ -442,7 +517,23 @@ export async function rescueCmuxSessionsOnce({
         continue;
       }
       leaseOwned = lease;
-      pendingLeases.set(key, lease);
+      pendingLeases.set(leaseKey, lease);
+      if (key !== leaseKey) {
+        // An event-keyed claim cannot collide with the launcher's permanent
+        // session-level Codex-handoff claim, so honour that claim explicitly
+        // (under the lease the launcher also holds while writing it).
+        let handedOff;
+        try {
+          handedOff = await sessionClaimed(storePath, leaseKey);
+        } catch {
+          handedOff = null;
+        }
+        if (handedOff !== false) {
+          await releaseLeaseForRetry();
+          if (handedOff === true) attempted.add(key);
+          continue;
+        }
+      }
       const claim = await claimRecovery(storePath, key);
       if (!claim) {
         await releaseLeaseForRetry();
@@ -458,7 +549,7 @@ export async function rescueCmuxSessionsOnce({
         await releaseClaimForRetry();
         continue;
       }
-      const claimed = sessions(claimedStore).find(item => item?.sessionId === key);
+      const claimed = sessions(claimedStore).find(item => item?.sessionId === session.sessionId);
       if (!claimed
           || !sameRegistrySession(claimed, final)
           || !validSession(claimedStore, claimed)) {
@@ -470,7 +561,8 @@ export async function rescueCmuxSessionsOnce({
         transcriptRoot,
         claimed.sessionId,
       );
-      if (!claimedState || fleetRetryStillActive(claimedState)) {
+      if (!claimedState || fleetRetryStillActive(claimedState)
+          || recoveryClaimKey(session.sessionId, claimedState) !== key) {
         await releaseClaimForRetry();
         continue;
       }
@@ -521,7 +613,8 @@ export async function rescueCmuxSessionsOnce({
         transcriptRoot,
         final.sessionId,
       );
-      if (!afterStopState || fleetRetryStillActive(afterStopState)) {
+      if (!afterStopState || fleetRetryStillActive(afterStopState)
+          || recoveryClaimKey(session.sessionId, afterStopState) !== key) {
         await releaseClaimForRetry();
         continue;
       }
@@ -550,11 +643,12 @@ export async function rescueCmuxSessionsOnce({
       rescued += 1;
       await releaseLeaseForRetry();
       claimOwned = false;
-    } catch {
+    } catch (error) {
       // Keep the permanent replay claim when workspace launch is ambiguous;
-      // before launch there is no replay ambiguity, so release both claims
-      // and allow a later scan to retry the stopped session.
-      if (launchStarted) {
+      // before launch, or when the launch provably ran nothing (no cmux
+      // binary/window, spawn ENOENT/EACCES), there is no replay ambiguity, so
+      // release both claims and allow a later scan to retry the session.
+      if (launchStarted && error?.recoveryNotLaunched !== true) {
         await releaseLeaseForRetry();
       } else {
         await releaseClaimForRetry();

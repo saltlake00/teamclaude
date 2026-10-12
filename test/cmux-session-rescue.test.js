@@ -11,6 +11,7 @@ import {
   rename,
   rm,
   symlink,
+  utimes,
   writeFile,
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -18,6 +19,7 @@ import { join } from 'node:path';
 import {
   createCmuxSessionRescuer,
   rescueCmuxSessionsOnce,
+  resolveCmuxBinary,
   resolveRecoveryWindowId,
   stopExistingSessionProcess,
 } from '../src/cmux-session-rescue.js';
@@ -31,6 +33,7 @@ import {
   releaseSessionClaim,
   releaseSessionLease,
   sameClaudeProcess,
+  unresolvedRecoverableApiErrorState,
 } from '../src/cmux-session-guards.js';
 
 const SESSION_ID = '11111111-1111-4111-8111-111111111111';
@@ -634,7 +637,7 @@ test('does not adopt a legacy native child that still has a TeamClaude superviso
   };
   const child = {
     alive: true,
-    command: `/Users/sangrok/.local/share/claude/versions/2.1.289 --resume ${SESSION_ID}`,
+    command: `/Users/example/.local/share/claude/versions/2.1.289 --resume ${SESSION_ID}`,
     legacyEnvironmentValid: true,
     nativeExecutableTrusted: true,
     supervised: false,
@@ -663,7 +666,7 @@ function supervisorProcessInfo(pid) {
 }
 
 function selectorlessChildInfo(pid, parentPid, version = '2.1.289') {
-  const executablePath = `/Users/sangrok/.local/share/claude/versions/${version}`;
+  const executablePath = `/Users/example/.local/share/claude/versions/${version}`;
   return {
     alive: true,
     pid,
@@ -1947,4 +1950,584 @@ test('rejects process identity or active mapping changes before workspace launch
     });
     assert.equal(launches, 0);
   });
+});
+
+// A fleet-exhaustion record without a usable timestamp must still yield a
+// bounded retry deadline: the transcript's modification time stands in, so
+// automatic recovery is never parked forever.
+test('a fleet-exhaustion record without a timestamp falls back to the transcript mtime', async t => {
+  const fx = await fixture(t);
+  const record = JSON.parse(fleetExhaustedRecord(fx.cwd, 60));
+  delete record.timestamp;
+  await writeFile(fx.transcriptPath, `${JSON.stringify(record)}\n`);
+  const past = new Date(Date.now() - 3600_000);
+  await utimes(fx.transcriptPath, past, past);
+  const state = await unresolvedRecoverableApiErrorState(fx.transcriptPath, fx.transcriptRoot, SESSION_ID);
+  assert.equal(state.kind, 'fleet_exhausted');
+  assert.ok(Number.isFinite(state.timestampMs), 'a deadline anchor exists');
+  assert.ok(Math.abs(state.timestampMs - past.getTime()) < 2000, 'anchored at the transcript mtime');
+  assert.equal(state.eventTimestampMs, null, 'the record itself carries no event timestamp');
+});
+
+test('malformed fleet-exhaustion timestamps fall back to the transcript mtime', async t => {
+  const fx = await fixture(t);
+  const past = new Date(Date.now() - 3600_000);
+  for (const timestamp of [-1, 1791600000000.5, Number.MAX_VALUE, 0, 'not a date']) {
+    const record = JSON.parse(fleetExhaustedRecord(fx.cwd, 60));
+    record.timestamp = timestamp;
+    await writeFile(fx.transcriptPath, `${JSON.stringify(record)}\n`);
+    await utimes(fx.transcriptPath, past, past);
+    const state = await unresolvedRecoverableApiErrorState(fx.transcriptPath, fx.transcriptRoot, SESSION_ID);
+    assert.ok(Math.abs(state.timestampMs - past.getTime()) < 2000, `timestamp ${timestamp}`);
+    assert.equal(state.eventTimestampMs, null, `no event timestamp for ${timestamp}`);
+  }
+});
+
+test('the unresolved-error state exposes the record event identity', async t => {
+  const fx = await fixture(t);
+  const at = Date.now() - 5000;
+  const record = JSON.parse(fleetExhaustedRecord(fx.cwd, 60, new Date(at).toISOString()));
+  await writeFile(fx.transcriptPath, `${JSON.stringify({ ...record, uuid: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' })}\n`);
+  let state = await unresolvedRecoverableApiErrorState(fx.transcriptPath, fx.transcriptRoot, SESSION_ID);
+  assert.equal(state.eventTimestampMs, at);
+  assert.equal(state.timestampMs, at);
+  assert.equal(state.eventId, 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa');
+  await writeFile(fx.transcriptPath, `${JSON.stringify({ ...record, uuid: 'not-a-uuid' })}\n`);
+  state = await unresolvedRecoverableApiErrorState(fx.transcriptPath, fx.transcriptRoot, SESSION_ID);
+  assert.equal(state.eventId, null, 'only a valid uuid identifies the event');
+});
+
+// The unresolved-error scan reads a bounded tail; an error record that straddles
+// the start of that window must still be read whole, not dropped as a partial
+// line (non-conversation records after it do not resolve it).
+test('an error record straddling the tail window is still seen as unresolved', async t => {
+  const fx = await fixture(t);
+  const error = fleetExhaustedRecord(fx.cwd, 60);
+  const filler = `${JSON.stringify({ type: 'system', subtype: 'note', content: 'x'.repeat(200) })}\n`;
+  // Put the error record so it begins before the last 256 KiB and ends inside it.
+  const fillerCount = Math.floor((256 * 1024 - Math.floor(error.length / 2)) / filler.length);
+  await writeFile(fx.transcriptPath, `${error}\n${filler.repeat(fillerCount)}`);
+  const state = await unresolvedRecoverableApiErrorState(fx.transcriptPath, fx.transcriptRoot, SESSION_ID);
+  assert.equal(state?.kind, 'fleet_exhausted');
+});
+
+// The look-back is bounded: a final record far larger than the window is a
+// conversation record, so an older error before it counts as resolved instead
+// of the scan reading back through megabytes on every rescue pass.
+test('a huge final record resolves an older error without unbounded look-back', async t => {
+  const fx = await fixture(t);
+  const huge = `${JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: 'z'.repeat(8 * 1024 * 1024) } })}\n`;
+  await writeFile(fx.transcriptPath, `${fleetExhaustedRecord(fx.cwd, 60)}\n${huge}`);
+  const started = Date.now();
+  const state = await unresolvedRecoverableApiErrorState(fx.transcriptPath, fx.transcriptRoot, SESSION_ID);
+  assert.equal(state, null, 'the error is resolved by the conversation record after it');
+  assert.ok(Date.now() - started < 1000, 'bounded work');
+});
+
+// A claim covers one recoverable error event: the same event is never
+// launched twice (even with a fresh in-memory attempt set, as after a
+// supervisor restart), but a NEW fleet exhaustion in the same session is
+// rescued again instead of being blocked forever by the first claim.
+test('recovery claims are per error event: a later exhaustion of the same session is rescued again', async t => {
+  const fx = await fixture(t);
+  fx.session.pid = 999999;
+  const firstErrorAt = Date.now() - 5000;
+  fx.session.startedAt = firstErrorAt / 1000 + 1;
+  await writeFile(fx.storePath, JSON.stringify(fx.store));
+  await writeFile(fx.transcriptPath, `${fleetExhaustedRecord(fx.cwd, 1, new Date(firstErrorAt).toISOString())}\n`);
+  let launches = 0;
+  const run = () => rescueCmuxSessionsOnce({
+    storePath: fx.storePath,
+    transcriptRoot: fx.transcriptRoot,
+    nodePath: '/usr/local/bin/node',
+    scriptPath: '/opt/teamclaude/src/index.js',
+    trustedClaudePath: fx.executablePath,
+    inspectProcess: async () => ({ alive: false }),
+    stopProcess: async () => true,
+    launchRecoveryWorkspace: async () => { launches += 1; },
+  });
+
+  assert.equal((await run()).rescued, 1, 'first event rescued');
+  assert.equal((await run()).rescued, 0, 'the same event is not launched twice');
+  assert.equal(launches, 1);
+
+  const secondErrorAt = Date.now() - 3000;
+  await writeFile(fx.transcriptPath, `${fleetExhaustedRecord(fx.cwd, 1, new Date(secondErrorAt).toISOString())}\n`);
+  assert.equal((await run()).rescued, 1, 'a new exhaustion event is rescued again');
+  assert.equal(launches, 2);
+
+  // Two distinct error records written in the same millisecond are still two
+  // events: the record uuid tells them apart.
+  const sameAt = new Date(Date.now() - 2000).toISOString();
+  const withUuid = uuid => JSON.stringify({ ...JSON.parse(fleetExhaustedRecord(fx.cwd, 1, sameAt)), uuid });
+  await writeFile(fx.transcriptPath, `${withUuid('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')}\n`);
+  assert.equal((await run()).rescued, 1, 'first same-millisecond event');
+  await writeFile(fx.transcriptPath, `${withUuid('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb')}\n`);
+  assert.equal((await run()).rescued, 1, 'second same-millisecond event with another uuid');
+  assert.equal((await run()).rescued, 0, 'and that event is not launched twice');
+  assert.equal(launches, 4);
+});
+
+// A permanent session-level claim (the Codex handoff written by the launcher,
+// or a claim left by an earlier per-session rescuer) blocks every later event
+// of that session: Codex owns it, so Claude must never be replayed.
+test('a session-level handoff claim blocks rescuing any later error event', async t => {
+  const fx = await fixture(t);
+  fx.session.pid = 999999;
+  const errorAt = Date.now() - 5000;
+  fx.session.startedAt = errorAt / 1000 + 1;
+  await writeFile(fx.storePath, JSON.stringify(fx.store));
+  const record = JSON.parse(fleetExhaustedRecord(fx.cwd, 1, new Date(errorAt).toISOString()));
+  await writeFile(fx.transcriptPath, `${JSON.stringify({ ...record, uuid: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc' })}\n`);
+  assert.ok(await claimSessionOnce(fx.storePath, SESSION_ID));
+  let launches = 0;
+  const result = await rescueCmuxSessionsOnce({
+    storePath: fx.storePath,
+    transcriptRoot: fx.transcriptRoot,
+    nodePath: '/usr/local/bin/node',
+    scriptPath: '/opt/teamclaude/src/index.js',
+    trustedClaudePath: fx.executablePath,
+    inspectProcess: async () => ({ alive: false }),
+    stopProcess: async () => true,
+    launchRecoveryWorkspace: async () => { launches += 1; },
+  });
+  assert.equal(result.rescued, 0);
+  assert.equal(launches, 0);
+});
+
+// Every recheck stage must confirm the SAME error event: if the transcript
+// moves on to another event while the rescue is being verified, this pass
+// must not launch under the first event's claim.
+test('a rescue whose error event changes during verification does not launch', async t => {
+  const fx = await fixture(t);
+  fx.session.pid = 999999;
+  const firstAt = Date.now() - 5000;
+  fx.session.startedAt = firstAt / 1000 + 1;
+  await writeFile(fx.storePath, JSON.stringify(fx.store));
+  await writeFile(fx.transcriptPath, `${fleetExhaustedRecord(fx.cwd, 1, new Date(firstAt).toISOString())}\n`);
+  let reads = 0;
+  let launches = 0;
+  await rescueCmuxSessionsOnce({
+    storePath: fx.storePath,
+    transcriptRoot: fx.transcriptRoot,
+    nodePath: '/usr/local/bin/node',
+    scriptPath: '/opt/teamclaude/src/index.js',
+    trustedClaudePath: fx.executablePath,
+    readStore: async path => {
+      reads += 1;
+      // The fourth read happens after the claim; a new error lands just then.
+      if (reads === 4) {
+        await writeFile(fx.transcriptPath, `${fleetExhaustedRecord(fx.cwd, 1, new Date(Date.now() - 4000).toISOString())}\n`);
+      }
+      return readPrivateJson(path);
+    },
+    inspectProcess: async () => ({ alive: false }),
+    stopProcess: async () => true,
+    launchRecoveryWorkspace: async () => { launches += 1; },
+  });
+  assert.ok(reads >= 4, 'the post-claim registry read happened');
+  assert.equal(launches, 0);
+});
+
+test('event-keyed recovery claims accept only a uuid or positive millisecond event', async t => {
+  const fx = await fixture(t);
+  for (const key of [`${SESSION_ID}@1791600000000`, `${SESSION_ID}@aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa`]) {
+    const claim = await claimSessionOnce(fx.storePath, key);
+    assert.ok(claim, key);
+    assert.equal(await claimSessionOnce(fx.storePath, key), false, `${key} is claimed once`);
+    assert.equal(await releaseSessionClaim(fx.storePath, key, claim), true);
+  }
+  for (const key of [`${SESSION_ID}@`, `${SESSION_ID}@0`, `${SESSION_ID}@-1`, `${SESSION_ID}@../x`, `not-a-session@1`]) {
+    await assert.rejects(claimSessionOnce(fx.storePath, key), /Invalid recovery/, key);
+  }
+});
+
+// A launch that provably ran nothing (e.g. cmux not installed yet) releases
+// the claim and lease so the same event is retried once cmux is available; an
+// ambiguous failure keeps the claim (covered by the no-replay tests).
+test('a launch that ran nothing is retried on a later pass', async t => {
+  const fx = await fixture(t);
+  fx.session.pid = 999999;
+  const errorAt = Date.now() - 5000;
+  fx.session.startedAt = errorAt / 1000 + 1;
+  await writeFile(fx.storePath, JSON.stringify(fx.store));
+  await writeFile(fx.transcriptPath, `${fleetExhaustedRecord(fx.cwd, 1, new Date(errorAt).toISOString())}\n`);
+  let attempts = 0;
+  const attempted = new Set();
+  const run = () => rescueCmuxSessionsOnce({
+    storePath: fx.storePath,
+    transcriptRoot: fx.transcriptRoot,
+    nodePath: '/usr/local/bin/node',
+    scriptPath: '/opt/teamclaude/src/index.js',
+    trustedClaudePath: fx.executablePath,
+    attempted,
+    inspectProcess: async () => ({ alive: false }),
+    stopProcess: async () => true,
+    launchRecoveryWorkspace: async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        const error = new Error('Unable to resolve the cmux executable.');
+        error.recoveryNotLaunched = true;
+        throw error;
+      }
+    },
+  });
+  assert.deepEqual(await run(), { scanned: 1, candidates: 1, rescued: 0, failed: 1 });
+  assert.deepEqual(await run(), { scanned: 1, candidates: 1, rescued: 1, failed: 0 });
+  assert.equal(attempts, 2);
+});
+
+test('an ambiguous launch failure keeps the event claim', async t => {
+  const fx = await fixture(t);
+  fx.session.pid = 999999;
+  const errorAt = Date.now() - 5000;
+  fx.session.startedAt = errorAt / 1000 + 1;
+  await writeFile(fx.storePath, JSON.stringify(fx.store));
+  await writeFile(fx.transcriptPath, `${fleetExhaustedRecord(fx.cwd, 1, new Date(errorAt).toISOString())}\n`);
+  let attempts = 0;
+  const run = () => rescueCmuxSessionsOnce({
+    storePath: fx.storePath,
+    transcriptRoot: fx.transcriptRoot,
+    nodePath: '/usr/local/bin/node',
+    scriptPath: '/opt/teamclaude/src/index.js',
+    trustedClaudePath: fx.executablePath,
+    attempted: new Set(),
+    inspectProcess: async () => ({ alive: false }),
+    stopProcess: async () => true,
+    launchRecoveryWorkspace: async () => {
+      attempts += 1;
+      const error = new Error('cmux timed out');
+      error.code = 'ETIMEDOUT';
+      throw error;
+    },
+  });
+  assert.equal((await run()).failed, 1);
+  assert.equal((await run()).failed, 0, 'the claimed event is not relaunched');
+  assert.equal(attempts, 1);
+});
+
+test('a claim swapped in between the check and the removal is restored, not deleted', async t => {
+  const fx = await fixture(t);
+  const claimDir = `${fx.storePath}.recovery-claims`;
+  const claimPath = join(claimDir, SESSION_ID);
+  const claim = await claimSessionOnce(fx.storePath, SESSION_ID);
+  const released = await releaseSessionClaim(fx.storePath, SESSION_ID, claim, {
+    afterCheck: async () => {
+      await rename(claimPath, `${claimPath}.old`);
+      await writeFile(claimPath, 'another recovery\n', { mode: 0o600 });
+    },
+  });
+  assert.equal(released, false);
+  assert.equal(await readFile(claimPath, 'utf8'), 'another recovery\n', 'the other claim survives');
+  const { readdir } = await import('node:fs/promises');
+  assert.deepEqual((await readdir(claimDir)).filter(name => name.includes('releasing')), [],
+    'no detached claim is left behind');
+});
+
+// A legacy native process without launch-argv metadata is judged on its ps
+// command alone; it must never throw out of the rescue loop.
+test('legacy native process without launch argv is matched by command and never throws', async t => {
+  const fx = await fixture(t);
+  const native = join(fx.root, 'native-claude');
+  await writeFile(native, '#!/bin/sh\n', { mode: 0o755 });
+  fx.session.launchCommand.executablePath = native;
+  const base = {
+    processRole: 'legacy-native',
+    environmentValid: false,
+    legacyEnvironmentValid: true,
+    executablePath: native,
+    launchArgv: null,
+    nativeExecutableTrusted: true,
+  };
+  for (const command of [
+    `${native} --resume ${SESSION_ID}`,
+    `${native} --session-id ${SESSION_ID}`,
+    `${native} --settings '{}'`,
+  ]) {
+    assert.equal(await sameClaudeProcess(fx.session, processInfo(fx, { ...base, command }), fx.executablePath), true, command);
+  }
+  const other = '00000000-0000-4000-8000-000000000000';
+  assert.equal(
+    await sameClaudeProcess(fx.session, processInfo(fx, { ...base, command: `${native} --resume ${other}` }), fx.executablePath),
+    false,
+  );
+});
+
+// A fleet-exhausted session is parked and later relaunched with --resume, so
+// its process can start hours or days after the registry entry. That window is
+// only safe because identity is still pinned by the exact session selector,
+// the surface, and the expected process identity.
+test('a later relaunch is adopted only while selector, surface and identity still match', async t => {
+  const fx = await fixture(t);
+  const later = fx.session.startedAt + 3 * 24 * 60 * 60;
+  const relaunched = processInfo(fx, { processStartedAt: later });
+  assert.equal(await sameClaudeProcess(fx.session, relaunched, fx.executablePath), true, 'resumed days later');
+
+  const other = '00000000-0000-4000-8000-000000000000';
+  const wrongSelector = processInfo(fx, {
+    processStartedAt: later,
+    command: relaunched.command.replace(SESSION_ID, other),
+    launchArgv: relaunched.launchArgv.map(a => a.replace(SESSION_ID, other)),
+  });
+  assert.equal(await sameClaudeProcess(fx.session, wrongSelector, fx.executablePath), false, 'another session');
+  assert.equal(
+    await sameClaudeProcess(fx.session, { ...relaunched, surfaceId: 'other-surface' }, fx.executablePath),
+    false,
+    'another surface',
+  );
+  assert.equal(
+    await sameClaudeProcess(fx.session, relaunched, fx.executablePath, 'expected-identity-that-differs'),
+    false,
+    'a pinned process identity that differs',
+  );
+  assert.equal(
+    await sameClaudeProcess(fx.session, processInfo(fx, { processStartedAt: fx.session.startedAt + 8 * 24 * 60 * 60 }), fx.executablePath),
+    false,
+    'beyond the 7-day window',
+  );
+});
+
+// The supervisor is recognised by its run entry point wherever it is
+// installed, not by one fixed package directory name.
+test('supervisor detection follows the run entry point across install paths', async () => {
+  const supervisorPid = 54321;
+  const childPid = 54322;
+  const child = {
+    alive: true,
+    command: `/Users/example/.local/share/claude/versions/2.1.289 --resume ${SESSION_ID}`,
+    legacyEnvironmentValid: true,
+    nativeExecutableTrusted: true,
+    supervised: false,
+    surfaceId: SURFACE_ID,
+    parentPid: supervisorPid,
+    teamClaudeBin: '/tmp/teamclaude',
+  };
+  const adopted = async command => (await inspectClaudeProcessTree(childPid, SESSION_ID, {
+    inspectProcess: async pid => pid === childPid ? child : {
+      alive: true,
+      command,
+      environmentValid: true,
+      launchArgv: ['/tmp/teamclaude'],
+      teamClaudeBin: '/tmp/teamclaude',
+      supervised: false,
+      surfaceId: SURFACE_ID,
+    },
+  })).alive;
+  for (const command of [
+    '/usr/bin/node /tmp/teamcodex/src/index.js run -- x',
+    '/usr/bin/node /opt/teamclaude/src/index.js run -- x',
+    '/usr/bin/node /srv/checkout/src/teamclaude.js run',
+    '/opt/homebrew/bin/node /usr/local/lib/node_modules/@karpeleslab/teamclaude/src/index.js run',
+  ]) {
+    assert.equal(await adopted(command), false, `a supervised child is not a legacy native: ${command}`);
+  }
+  for (const command of [
+    '/usr/bin/node /opt/teamclaude/src/index.js status',
+    '/usr/bin/node /srv/other/index.js run',
+    '/usr/bin/node /srv/checkout/src/index.jsx run',
+  ]) {
+    assert.equal(await adopted(command), true, `not a supervisor: ${command}`);
+  }
+});
+
+test('a process whose cwd could not be read is never treated as the session process', async t => {
+  const fx = await fixture(t);
+  assert.equal(await sameClaudeProcess(fx.session, processInfo(fx, { cwd: null }), fx.executablePath), false);
+});
+
+// Only the kernel's view of the cwd counts. When lsof cannot report it, the
+// PWD / launch-cwd values in the (caller-controlled) environment must not stand
+// in, so the identity check fails closed.
+test('process inspection never takes the cwd from the environment', async t => {
+  const binDir = await mkdtemp(join(tmpdir(), 'teamclaude-no-lsof-'));
+  t.after(() => rm(binDir, { recursive: true, force: true }));
+  await symlink('/bin/ps', join(binDir, 'ps'));
+  // A non-platform binary, so `ps eww` shows its (forged) environment.
+  const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], {
+    env: { PWD: '/Users/example/forged', CMUX_AGENT_LAUNCH_CWD: '/Users/example/forged' },
+    stdio: 'ignore',
+  });
+  t.after(() => child.kill('SIGKILL'));
+  await once(child, 'spawn');
+  const originalPath = process.env.PATH;
+  process.env.PATH = binDir;
+  let info;
+  try {
+    info = await inspectClaudeProcess(child.pid);
+  } finally {
+    process.env.PATH = originalPath;
+  }
+  assert.equal(info.alive, true);
+  assert.equal(info.cwd, null, 'no lsof: the cwd is unknown, not PWD');
+});
+
+// The ps fallback must consider every direct child of the supervisor, not
+// only the first few: the session's child may sit anywhere in the table.
+test('the ps fallback finds the session child beyond the first 64 direct children', async () => {
+  const supervisorPid = 54401;
+  const target = { ...selectorlessChildInfo(54401 + 70, supervisorPid) };
+  target.command = `${target.command} --resume ${SESSION_ID}`;
+  target.launchArgv = [...target.launchArgv, '--resume', SESSION_ID];
+  const other = '00000000-0000-4000-8000-000000000000';
+  const table = [];
+  for (let i = 1; i < 70; i += 1) {
+    table.push({ pid: supervisorPid + i, ppid: supervisorPid, command: `/usr/bin/sleep --resume ${other}` });
+  }
+  table.push({ pid: target.pid, ppid: supervisorPid, command: target.command });
+  const result = await inspectClaudeProcessTree(supervisorPid, SESSION_ID, {
+    inspectProcess: async pid => (pid === supervisorPid ? supervisorProcessInfo(supervisorPid)
+      : pid === target.pid ? target : { alive: false }),
+    listDirectChildren: async () => { throw new Error('ps -p argument list too long'); },
+    listProcessTable: async () => table,
+  });
+  assert.equal(result.pid, target.pid);
+});
+
+// The ps fallback adopts only DIRECT children: a matching grandchild behind a
+// shell or wrapper was not launched by this supervisor.
+test('the ps fallback never adopts a grandchild of the supervisor', async () => {
+  const supervisorPid = 54501;
+  const wrapper = { pid: 54502, ppid: supervisorPid, command: '/bin/sh -c claude' };
+  const grandchild = { ...selectorlessChildInfo(54503, wrapper.pid) };
+  grandchild.command = `${grandchild.command} --resume ${SESSION_ID}`;
+  grandchild.launchArgv = [...grandchild.launchArgv, '--resume', SESSION_ID];
+  let inspectedGrandchild = false;
+  const result = await inspectClaudeProcessTree(supervisorPid, SESSION_ID, {
+    inspectProcess: async pid => {
+      if (pid === supervisorPid) return supervisorProcessInfo(supervisorPid);
+      if (pid === grandchild.pid) {
+        inspectedGrandchild = true;
+        return grandchild;
+      }
+      return { alive: false };
+    },
+    listDirectChildren: async () => { throw new Error('pgrep failed'); },
+    listProcessTable: async () => [
+      wrapper,
+      { pid: grandchild.pid, ppid: wrapper.pid, command: grandchild.command },
+    ],
+  });
+  assert.equal(result.alive, false);
+  assert.equal(inspectedGrandchild, false);
+});
+
+// A selectorless child is only the session's process when it is the sole
+// Claude child of the supervisor. A sibling that names ANOTHER session makes
+// the selectorless one ambiguous, entered either from the supervisor or from
+// the registry's child PID.
+test('fails closed when a selectorless child has a sibling naming another session', async () => {
+  const supervisorPid = 54341;
+  const other = '00000000-0000-4000-8000-000000000000';
+  const selectorless = selectorlessChildInfo(54342, supervisorPid, '2.1.289');
+  const foreign = {
+    ...selectorlessChildInfo(54343, supervisorPid, '2.1.290'),
+    command: `${selectorlessChildInfo(54343, supervisorPid, '2.1.290').command} --resume ${other}`,
+  };
+  const processes = new Map([
+    [supervisorPid, supervisorProcessInfo(supervisorPid)],
+    [selectorless.pid, selectorless],
+    [foreign.pid, foreign],
+  ]);
+  const options = {
+    inspectProcess: async pid => processes.get(pid) || { alive: false },
+    listDirectChildren: async () => [
+      { pid: selectorless.pid, command: selectorless.command },
+      { pid: foreign.pid, command: foreign.command },
+    ],
+  };
+  for (const entryPid of [supervisorPid, selectorless.pid]) {
+    const result = await inspectClaudeProcessTree(entryPid, SESSION_ID, options);
+    assert.equal(result.alive, false, `entered from ${entryPid}`);
+  }
+  // Without the foreign sibling the selectorless child is still adopted.
+  const alone = await inspectClaudeProcessTree(supervisorPid, SESSION_ID, {
+    ...options,
+    listDirectChildren: async () => [{ pid: selectorless.pid, command: selectorless.command }],
+  });
+  assert.equal(alone.pid, selectorless.pid);
+});
+
+// Between the identity check and the signal, a process may exit and its PID be
+// reused. Each PID is re-verified right before SIGTERM, and a PID whose
+// identity no longer matches is never signalled.
+test('stop re-verifies each PID immediately before signalling it', async t => {
+  const childPid = 70001;
+  const parentPid = 70002;
+  const info = {
+    pid: childPid,
+    processIdentity: 'child-identity',
+    launcherProcessIdentity: 'parent-identity',
+    surfaceId: SURFACE_ID,
+  };
+  let reused = false;
+  const inspectProcess = async pid => {
+    if (pid === parentPid) return { alive: true, processIdentity: 'parent-identity', surfaceId: SURFACE_ID };
+    return reused
+      ? { alive: true, processIdentity: 'unrelated-process', parentPid: 1 }
+      : { alive: true, processIdentity: 'child-identity', parentPid };
+  };
+  const signalled = [];
+  t.mock.method(process, 'kill', (pid, signal) => {
+    if (signal === 0 || signal === undefined) {
+      const error = new Error('ESRCH');
+      error.code = 'ESRCH';
+      throw error;
+    }
+    signalled.push([pid, signal]);
+    // Killing the launcher lets the child exit and its PID be reused.
+    if (pid === parentPid) reused = true;
+    return true;
+  });
+
+  await stopExistingSessionProcess(info, parentPid, { inspectProcess });
+  assert.deepEqual(signalled, [[parentPid, 'SIGTERM']], 'the reused child PID was not signalled');
+});
+
+test('stop sends nothing when a PID changes identity or cannot be re-inspected before signalling', async t => {
+  const childPid = 70011;
+  const parentPid = 70012;
+  const info = { pid: childPid, processIdentity: 'c', launcherProcessIdentity: 'p', surfaceId: SURFACE_ID };
+  const signalled = [];
+  t.mock.method(process, 'kill', (pid, signal) => {
+    if (signal === 0 || signal === undefined) {
+      const error = new Error('ESRCH');
+      error.code = 'ESRCH';
+      throw error;
+    }
+    signalled.push([pid, signal]);
+    return true;
+  });
+  for (const failure of ['reused', 'throws']) {
+    signalled.length = 0;
+    let checks = 0;
+    const inspectProcess = async pid => {
+      checks += 1;
+      // The first two inspections are the initial verification of both PIDs.
+      if (checks > 2) {
+        if (failure === 'throws') throw new Error('ps failed');
+        return { alive: true, processIdentity: 'other', parentPid: 1, surfaceId: SURFACE_ID };
+      }
+      return pid === parentPid
+        ? { alive: true, processIdentity: 'p', surfaceId: SURFACE_ID }
+        : { alive: true, processIdentity: 'c', parentPid };
+    };
+    await stopExistingSessionProcess(info, parentPid, { inspectProcess });
+    assert.deepEqual(signalled, [], failure);
+  }
+});
+
+test('cmux binary resolution never consults PATH and honours only an absolute override', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-cmux-bin-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const bin = join(dir, 'cmux');
+  await writeFile(bin, '#!/bin/sh\n', { mode: 0o755 });
+  const plain = join(dir, 'not-executable');
+  await writeFile(plain, '', { mode: 0o644 });
+
+  assert.equal(await resolveCmuxBinary({ TEAMCLAUDE_CMUX_BIN: bin }), bin);
+  await assert.rejects(resolveCmuxBinary({ TEAMCLAUDE_CMUX_BIN: 'cmux' }), /absolute/);
+  await assert.rejects(resolveCmuxBinary({ TEAMCLAUDE_CMUX_BIN: plain }), /absolute path to an executable/);
+  // A cmux on PATH alone is never picked up.
+  const result = await resolveCmuxBinary({ PATH: dir }).catch(err => err);
+  assert.notEqual(result, bin);
 });

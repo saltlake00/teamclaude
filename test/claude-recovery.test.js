@@ -3,9 +3,11 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import {
   appendFile,
+  link,
   mkdtemp,
   mkdir,
   readFile,
+  rename,
   rm,
   stat,
   writeFile,
@@ -18,6 +20,7 @@ import {
   classifyClaudeApiErrorRecord,
   isClaudeFleetExhausted,
   runClaudeWithRecovery,
+  transcriptHasConversationAfter,
 } from '../src/claude-recovery.js';
 
 function fakeChild(onKill = null) {
@@ -4213,4 +4216,313 @@ test('fleet exhaustion does not duplicate a manual resume that advances the tran
   assert.equal(result.status, null);
   assert.equal(spawns, 1);
   assert.equal(waits, 1);
+});
+
+test('transcript activity scan is chunked and bounded after the recorded offset', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-transcript-scan-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, 's.jsonl');
+  const errorLine = fleetExhaustedRecord(root);
+  const userLine = JSON.stringify({ type: 'user', cwd: root, message: { role: 'user', content: 'continue' } });
+  const head = `${userLine}\n`;
+
+  // Only API error records after the offset: no conversation activity.
+  await writeFile(path, head + `${errorLine}\n`.repeat(3000));
+  assert.equal(await transcriptHasConversationAfter(path, head.length), false);
+
+  // A real record straddling the 1 MiB chunk boundary is still parsed whole.
+  const pad = JSON.stringify({ type: 'assistant', isApiErrorMessage: true, message: { content: 'x'.repeat(1024 * 1024 - 200) } });
+  await writeFile(path, `${head}${pad}\n${userLine}\n`);
+  assert.equal(await transcriptHasConversationAfter(path, head.length), true);
+
+  // A final record without a trailing newline counts.
+  await writeFile(path, `${head}${errorLine}\n${userLine}`);
+  assert.equal(await transcriptHasConversationAfter(path, head.length), true);
+
+  // A line larger than the per-line cap counts as activity without being buffered whole.
+  await writeFile(path, head + 'y'.repeat(17 * 1024 * 1024));
+  assert.equal(await transcriptHasConversationAfter(path, head.length), true);
+
+  // Content before the offset is never considered.
+  await writeFile(path, `${head}${errorLine}\n`);
+  assert.equal(await transcriptHasConversationAfter(path, head.length), false);
+});
+
+test('transcript activity scan keeps reading records appended while it scans', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-transcript-append-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, 's.jsonl');
+  const userLine = JSON.stringify({ type: 'user', cwd: root, message: { role: 'user', content: 'continue' } });
+  const head = `${userLine}\n`;
+  // Several MiB of API-error records keep the scan busy across many reads.
+  await writeFile(path, head + `${fleetExhaustedRecord(root)}\n`.repeat(20000));
+  const scan = transcriptHasConversationAfter(path, head.length);
+  await appendFile(path, `${userLine}\n`);
+  assert.equal(await scan, true, 'a conversation record appended after the scan began is seen');
+});
+
+test('transcript activity scan sees a record appended right as it starts at the offset', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-transcript-start-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, 's.jsonl');
+  const userLine = JSON.stringify({ type: 'user', cwd: root, message: { role: 'user', content: 'continue' } });
+  const head = `${userLine}\n`;
+  await writeFile(path, head);
+  const scan = transcriptHasConversationAfter(path, head.length);
+  await appendFile(path, `${userLine}\n`);
+  assert.equal(await scan, true);
+});
+
+// When the scan cannot give a trustworthy answer the session must be preserved
+// (treated as active), never resumed blind: a truncated, rotated or unreadable
+// transcript all count as activity.
+test('transcript activity scan fails closed on truncation, rotation and unreadable files', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-transcript-closed-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, 's.jsonl');
+  const errorLine = `${fleetExhaustedRecord(root)}\n`;
+  await writeFile(path, errorLine.repeat(10));
+  const offset = errorLine.length * 10;
+  const original = await stat(path);
+  const identity = { dev: original.dev, ino: original.ino };
+
+  // Unchanged file with only error records: no activity (the normal resume path).
+  assert.equal(await transcriptHasConversationAfter(path, offset, identity), false);
+
+  // Truncated below the recorded offset.
+  await writeFile(path, errorLine);
+  assert.equal(await transcriptHasConversationAfter(path, offset), true, 'truncated');
+
+  // Rotated: same path, different file, even if it is long enough. The old
+  // file is kept under another name so its inode cannot be reused (Linux can
+  // hand a just-freed inode straight to the next file).
+  await rename(path, `${path}.old`);
+  await writeFile(`${path}.new`, errorLine.repeat(20));
+  await rename(`${path}.new`, path);
+  assert.notEqual((await stat(path)).ino, identity.ino);
+  assert.equal(await transcriptHasConversationAfter(path, offset, identity), true, 'rotated');
+
+  // Unreadable (missing) transcript.
+  await rm(path);
+  assert.equal(await transcriptHasConversationAfter(path, offset, identity), true, 'missing');
+});
+
+test('transcript activity scan fails closed when the file rotates or shrinks mid-scan', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-transcript-race-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, 's.jsonl');
+  const errorLine = `${fleetExhaustedRecord(root)}\n`;
+  const body = errorLine.repeat(20000);
+
+  // Rotation while the scan is reading the old inode.
+  await writeFile(path, body);
+  let scan = transcriptHasConversationAfter(path, 0);
+  await rename(path, `${path}.old`);
+  await writeFile(path, errorLine);
+  assert.equal(await scan, true, 'rotated mid-scan');
+
+  // Truncation below the recorded offset, whenever it lands during the scan.
+  await writeFile(path, body);
+  scan = transcriptHasConversationAfter(path, errorLine.length * 10000);
+  await writeFile(path, errorLine);
+  assert.equal(await scan, true, 'shrunk mid-scan');
+});
+
+// A burst of output between two polls is scanned in bounded chunks: an error
+// written after several MiB of tool output is still found, and an oversized
+// record after an error counts as conversation activity (no resume).
+test('the live monitor scans a multi-MiB burst in chunks', async () => {
+  const run = async lines => {
+    const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-burst-'));
+    const cwd = join(root, 'project');
+    const transcriptRoot = join(root, 'transcripts');
+    await mkdir(cwd);
+    const calls = [];
+    await runClaudeWithRecovery({
+      claudeArgs: [],
+      childEnv: {},
+      config: { autoResumeClaude: true, codexFallbackOnExhaustion: false },
+      cwd,
+      transcriptRoot,
+      pollIntervalMs: 5,
+      fetchStatus: async () => statusWithQuota(0.5),
+      wait: async () => {},
+      spawnClaude(args) {
+        const child = fakeChild();
+        calls.push([...args]);
+        if (calls.length === 1) {
+          const sessionId = args[args.indexOf('--session-id') + 1];
+          setTimeout(async () => {
+            const dir = join(transcriptRoot, 'project');
+            await mkdir(dir, { recursive: true });
+            await writeFile(join(dir, `${sessionId}.jsonl`), lines(cwd));
+            setTimeout(() => child.finish(0), 400);
+          }, 10);
+        } else {
+          setTimeout(() => child.finish(0), 10);
+        }
+        return child;
+      },
+      launchCodex: async () => { throw new Error('unexpected Codex handoff'); },
+      log() {},
+    });
+    await rm(root, { recursive: true, force: true });
+    return calls.length;
+  };
+  const note = `${JSON.stringify({ type: 'system', subtype: 'note', content: 'x'.repeat(4096) })}\n`;
+  assert.equal(await run(cwd => `${note.repeat(1500)}${fleetExhaustedRecord(cwd, 3)}\n`), 2,
+    'an error after ~6 MiB of output is detected and resumed');
+  const huge = `${JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: 'y'.repeat(17 * 1024 * 1024) } })}\n`;
+  assert.equal(await run(cwd => `${fleetExhaustedRecord(cwd, 3)}\n${huge}`), 1,
+    'an oversized record after the error resolves it');
+});
+
+// The live transcript monitor must notice that the path now names another
+// file (rotation) and read the new file from its start, not continue at the
+// old file's offset and miss an error written early in the new one.
+test('a transcript rotated while the session runs is rescanned from the start', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-rotated-'));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  await mkdir(cwd);
+  const calls = [];
+
+  await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: {},
+    config: {
+      autoResumeClaude: true,
+      claudeAutoResumeMaxRetries: 1,
+      claudeAutoResumeBackoffMs: 0,
+      codexFallbackOnExhaustion: false,
+    },
+    cwd,
+    transcriptRoot,
+    pollIntervalMs: 5,
+    fetchStatus: async () => statusWithQuota(0.5),
+    wait: async () => {},
+    spawnClaude(args) {
+      const child = fakeChild();
+      calls.push([...args]);
+      if (calls.length === 1) {
+        const sessionId = args[args.indexOf('--session-id') + 1];
+        const dir = join(transcriptRoot, 'project');
+        const path = join(dir, `${sessionId}.jsonl`);
+        const normal = `${normalAssistantRecord(cwd)}\n`;
+        setTimeout(async () => {
+          await mkdir(dir, { recursive: true });
+          await writeFile(path, normal.repeat(20));
+          // Let the monitor consume the first file, then rotate it.
+          setTimeout(async () => {
+            // Atomic swap (no window where the path is missing); the old file
+            // stays linked so its inode cannot be reused. The error is early
+            // in the new file (before the old offset) and only
+            // non-conversation records follow, so it stays unresolved.
+            const note = `${JSON.stringify({ type: 'system', subtype: 'note', content: 'x'.repeat(200) })}\n`;
+            await link(path, `${path}.old`);
+            await writeFile(`${path}.new`, `${fleetExhaustedRecord(cwd, 3)}\n${note.repeat(40)}`);
+            await rename(`${path}.new`, path);
+          }, 60);
+          setTimeout(() => child.finish(0), 400);
+        }, 10);
+      } else {
+        setTimeout(() => child.finish(0), 10);
+      }
+      return child;
+    },
+    launchCodex: async () => { throw new Error('unexpected Codex handoff'); },
+    log() {},
+  });
+
+  assert.equal(calls.length, 2, 'the error early in the rotated file triggered the fleet resume');
+  await rm(root, { recursive: true, force: true });
+});
+
+test('model-scoped windows count only for the session model when the proxy reported fleet exhaustion', () => {
+  const reset = new Date(Date.now() + 3600_000).getTime();
+  const account = modelWeekly => ({ enabled: true, quota: {
+    unified5h: 0.2, unified5hReset: reset, unified7d: 0.3, unified7dReset: reset, modelWeekly,
+  } });
+  const fableFull = { accounts: [account({ '7d_oi': { utilization: 1, reset } })] };
+  assert.equal(isClaudeFleetExhausted(fableFull, 0.98), false, 'general quota remains');
+  assert.equal(isClaudeFleetExhausted(fableFull, 0.98, { modelLabel: '7d_oi' }), true, 'the session model tier is full');
+  assert.equal(isClaudeFleetExhausted(fableFull, 0.98, { modelLabel: '7d_xx' }), false, 'another model tier');
+  assert.equal(isClaudeFleetExhausted(fableFull, 0.98, { modelLabel: null }), false, 'unknown session model');
+  const expired = { accounts: [account({ '7d_oi': { utilization: 1, reset: Date.now() - 1000 } })] };
+  assert.equal(isClaudeFleetExhausted(expired, 0.98, { modelLabel: '7d_oi' }), false, 'an expired window is not blocking');
+  const mixed = { accounts: [account({ '7d_oi': { utilization: 1, reset } }), account({})] };
+  assert.equal(isClaudeFleetExhausted(mixed, 0.98, { modelLabel: '7d_oi' }), false, 'an account with that tier free');
+});
+
+async function runFleetModelHandoff({ claudeArgs = [], childEnv }) {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-fleet-model-'));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  const handoffRoot = join(root, 'handoffs');
+  await mkdir(cwd);
+  const calls = [];
+  let codexCalls = 0;
+  const reset = new Date(Date.now() + 3600_000).getTime();
+  try {
+    await runClaudeWithRecovery({
+      claudeArgs,
+      childEnv,
+      config: { autoResumeClaude: true, codexFallbackOnExhaustion: true },
+      cwd,
+      transcriptRoot,
+      handoffRoot,
+      pollIntervalMs: 5,
+      fetchStatus: async () => ({ accounts: [{ enabled: true, quota: {
+        unified5h: 0.2, unified5hReset: reset, unified7d: 0.3, unified7dReset: reset,
+        modelWeekly: { '7d_oi': { utilization: 1, reset } },
+      } }] }),
+      wait: async () => {},
+      spawnClaude(args) {
+        const child = fakeChild();
+        calls.push([...args]);
+        if (calls.length === 1) {
+          const sessionId = args[args.indexOf('--session-id') + 1];
+          setTimeout(async () => {
+            const dir = join(transcriptRoot, 'project');
+            await mkdir(dir, { recursive: true });
+            await writeFile(join(dir, `${sessionId}.jsonl`), `${fleetExhaustedRecord(cwd, 3600)}\n`);
+          }, 10);
+        } else {
+          setTimeout(() => child.finish(0), 10);
+        }
+        return child;
+      },
+      launchCodex: async () => { codexCalls += 1; return { status: 0, signal: null }; },
+      log() {},
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+  return { codexCalls, calls: calls.length };
+}
+
+// A Fable-only shortage across the fleet arrives as a fleet-exhaustion error
+// while general quota remains; with Codex fallback on it must hand off rather
+// than resume into the same exhausted tier. The session model comes from an
+// explicit --model argument first, then ANTHROPIC_MODEL.
+test('fleet exhaustion with only the session model tier full hands off when Codex fallback is on', async () => {
+  for (const [claudeArgs, childEnv] of [
+    [[], { ANTHROPIC_MODEL: 'claude-fable-5' }],
+    [['--model', 'claude-fable-5'], {}],
+    [['--model=claude-fable-5'], { ANTHROPIC_MODEL: 'claude-opus-4-8' }],
+  ]) {
+    assert.deepEqual(await runFleetModelHandoff({ claudeArgs, childEnv }), { codexCalls: 1, calls: 1 },
+      JSON.stringify({ claudeArgs, childEnv }));
+  }
+});
+
+test('a session on another model is not handed off for a Fable-only shortage', async () => {
+  for (const [claudeArgs, childEnv] of [
+    [[], { ANTHROPIC_MODEL: 'claude-opus-4-8' }],
+    [['--model', 'claude-opus-4-8'], { ANTHROPIC_MODEL: 'claude-fable-5' }],
+    [[], {}],
+  ]) {
+    assert.deepEqual(await runFleetModelHandoff({ claudeArgs, childEnv }), { codexCalls: 0, calls: 2 },
+      `the session waits and resumes instead: ${JSON.stringify({ claudeArgs, childEnv })}`);
+  }
 });
