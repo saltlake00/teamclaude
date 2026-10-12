@@ -73,17 +73,28 @@ struct TeamClaudeServerControlTests {
         precondition(teamClaudeSyncPlan(serverReachable: false, accountConfigDrift: 0) == .checkLiveness)
         precondition(teamClaudeSyncPlan(serverReachable: false, accountConfigDrift: 2) == .checkLiveness)
 
-        // MARK: ps 출력 파싱 (LC_TIME=C, lstart 24자)
-        let psLine = "30821 Sun Oct 11 05:00:46 2026     /opt/node /opt/pkg/src/teamclaude.js server\n"
-        let parsedWorker = parseTeamClaudePsIdentity(pid: 30823, output: psLine)
-        precondition(parsedWorker == TeamClaudeProcessIdentity(
-            pid: 30823,
-            ppid: 30821,
-            startedAt: "Sun Oct 11 05:00:46 2026",
-            command: "/opt/node /opt/pkg/src/teamclaude.js server"
-        ))
-        precondition(parseTeamClaudePsIdentity(pid: 1, output: "") == nil)
-        precondition(parseTeamClaudePsIdentity(pid: 1, output: "abc") == nil)
+        // MARK: sysctl 기반 프로세스 식별(ps 서브프로세스 없이 프록시 기록과 같은 형식으로)
+        let seoul = TimeZone(identifier: "Asia/Seoul")!
+        // 2026-10-10T20:00:46Z = 서울 2026-10-11 05:00:46 (일요일)
+        precondition(teamClaudeLstartString(epochSeconds: 1_791_662_446, timeZone: seoul) == "Sun Oct 11 05:00:46 2026")
+        // 한 자리 날짜는 ps lstart(%c, %e)처럼 공백으로 채운다.
+        precondition(teamClaudeLstartString(epochSeconds: 1_791_158_400, timeZone: TimeZone(identifier: "UTC")!)
+            == "Mon Oct  5 00:00:00 2026")
+        var procArgs: [UInt8] = []
+        var argc = Int32(3).littleEndian
+        withUnsafeBytes(of: &argc) { procArgs.append(contentsOf: $0) }
+        procArgs.append(contentsOf: Array("/opt/node".utf8) + [0, 0, 0, 0])
+        for arg in ["/opt/node", "/opt/pkg/src/teamclaude.js", "server"] {
+            procArgs.append(contentsOf: Array(arg.utf8) + [0])
+        }
+        procArgs.append(contentsOf: Array("PATH=/usr/bin".utf8) + [0])
+        precondition(parseTeamClaudeProcArgs(procArgs) == ["/opt/node", "/opt/pkg/src/teamclaude.js", "server"])
+        precondition(parseTeamClaudeProcArgs([1, 0]) == nil)
+        var tooMany = Int32(5).littleEndian
+        var truncated: [UInt8] = []
+        withUnsafeBytes(of: &tooMany) { truncated.append(contentsOf: $0) }
+        truncated.append(contentsOf: Array("/opt/node".utf8) + [0] + Array("a".utf8) + [0])
+        precondition(parseTeamClaudeProcArgs(truncated) == nil)
 
         // MARK: 상태 파일 파싱
         let command = "/opt/node /opt/pkg/src/teamclaude.js server"

@@ -111,24 +111,44 @@ func teamClaudeSyncPlan(serverReachable: Bool, accountConfigDrift: Int) -> TeamC
     return accountConfigDrift > 0 ? .reloadAccounts : .nothing
 }
 
-/// `ps -o ppid= -o lstart= -o command= -p <pid>`(LC_TIME=C) 한 줄을 읽는다.
-/// 프록시의 readProcessIdentity와 같은 형식(lstart 24자)이다.
-func parseTeamClaudePsIdentity(pid: Int32, output: String) -> TeamClaudeProcessIdentity? {
-    let line = output.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard let regex = try? NSRegularExpression(pattern: "^(\\d+)\\s+(.{24})\\s+([\\s\\S]+)$"),
-          let match = regex.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)),
-          let ppidRange = Range(match.range(at: 1), in: line),
-          let startedRange = Range(match.range(at: 2), in: line),
-          let commandRange = Range(match.range(at: 3), in: line),
-          let ppid = Int32(line[ppidRange]) else {
-        return nil
-    }
-    return TeamClaudeProcessIdentity(
-        pid: pid,
-        ppid: ppid,
-        startedAt: line[startedRange].trimmingCharacters(in: .whitespaces),
-        command: line[commandRange].trimmingCharacters(in: .whitespacesAndNewlines)
+/// ps의 lstart(`%c`, C 로케일 = `%a %b %e %H:%M:%S %Y`)와 같은 문자열. 프록시가 상태 파일에
+/// 기록한 worker 시작 시각과 그대로 비교하려고 서브프로세스 없이 만든다.
+func teamClaudeLstartString(epochSeconds: Int, timeZone: TimeZone) -> String {
+    var calendar = Calendar(identifier: .gregorian)
+    calendar.timeZone = timeZone
+    let date = Date(timeIntervalSince1970: TimeInterval(epochSeconds))
+    let parts = calendar.dateComponents([.weekday, .month, .day, .hour, .minute, .second, .year], from: date)
+    let weekdays = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+    let months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    let weekday = weekdays[((parts.weekday ?? 1) - 1 + 7) % 7]
+    let month = months[((parts.month ?? 1) - 1 + 12) % 12]
+    return String(
+        format: "%@ %@ %2d %02d:%02d:%02d %d",
+        weekday, month, parts.day ?? 0, parts.hour ?? 0, parts.minute ?? 0, parts.second ?? 0, parts.year ?? 0
     )
+}
+
+/// sysctl KERN_PROCARGS2 버퍼(argc, 실행 경로, NUL 패딩, argv...)에서 argv만 꺼낸다.
+func parseTeamClaudeProcArgs(_ buffer: [UInt8]) -> [String]? {
+    let intSize = MemoryLayout<Int32>.size
+    guard buffer.count > intSize else { return nil }
+    let argc = buffer.prefix(intSize).enumerated().reduce(Int32(0)) { value, element in
+        value | Int32(element.element) << (8 * Int32(element.offset))
+    }
+    guard argc > 0, argc < 4_096 else { return nil }
+    var index = intSize
+    while index < buffer.count, buffer[index] != 0 { index += 1 }
+    while index < buffer.count, buffer[index] == 0 { index += 1 }
+    var arguments: [String] = []
+    while arguments.count < Int(argc) {
+        guard index < buffer.count else { return nil }
+        let start = index
+        while index < buffer.count, buffer[index] != 0 { index += 1 }
+        guard index < buffer.count else { return nil }
+        arguments.append(String(decoding: buffer[start..<index], as: UTF8.self))
+        index += 1
+    }
+    return arguments
 }
 
 private func teamClaudeInt32(_ value: Any?) -> Int32? {

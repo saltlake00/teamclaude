@@ -3428,7 +3428,6 @@ let teamClaudeLaunchdLabel = "com.qjc.teamclaude"
 private func runTeamClaudeCapture(
     executable: String,
     arguments: [String],
-    environment: [String: String]? = nil,
     timeoutSeconds: Double = 5
 ) -> (status: Int32, output: String)? {
     let outputPath = NSTemporaryDirectory() + "cc-menubar-capture-\(UUID().uuidString)"
@@ -3446,7 +3445,6 @@ private func runTeamClaudeCapture(
     let process = Process()
     process.executableURL = URL(fileURLWithPath: executable)
     process.arguments = arguments
-    if let environment { process.environment = environment }
     process.standardOutput = output
     process.standardError = nullErr
     guard let result = runTrustedProcessInIsolatedGroup(
@@ -3471,18 +3469,33 @@ func teamClaudeProcessAlive(_ pid: Int32) -> Bool {
     return kill(pid, 0) == 0 || errno == EPERM
 }
 
-/// 프록시 CLI의 readProcessIdentity와 같은 형식으로 ps를 읽는다(LC_TIME=C로 lstart 고정).
+/// 프록시 CLI의 readProcessIdentity(ps ppid/lstart/command)와 같은 값을 sysctl로 읽는다.
+/// 부하가 높을 때 서브프로세스를 띄우지 않으려고 커널에서 직접 가져온다.
 func readTeamClaudeProcessIdentity(pid: Int32) -> TeamClaudeProcessIdentity? {
     guard pid > 1 else { return nil }
-    var environment = ProcessInfo.processInfo.environment
-    environment["LC_ALL"] = ""
-    environment["LC_TIME"] = "C"
-    guard let result = runTeamClaudeCapture(
-        executable: "/bin/ps",
-        arguments: ["-o", "ppid=", "-o", "lstart=", "-o", "command=", "-p", String(pid)],
-        environment: environment
-    ), result.status == 0 else { return nil }
-    return parseTeamClaudePsIdentity(pid: pid, output: result.output)
+    var info = kinfo_proc()
+    var infoSize = MemoryLayout<kinfo_proc>.stride
+    var procMib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+    guard sysctl(&procMib, u_int(procMib.count), &info, &infoSize, nil, 0) == 0,
+          infoSize >= MemoryLayout<kinfo_proc>.stride,
+          info.kp_proc.p_pid == pid else { return nil }
+
+    var argMaxMib: [Int32] = [CTL_KERN, KERN_ARGMAX]
+    var argMax: Int32 = 0
+    var argMaxSize = MemoryLayout<Int32>.size
+    guard sysctl(&argMaxMib, u_int(argMaxMib.count), &argMax, &argMaxSize, nil, 0) == 0, argMax > 0 else { return nil }
+    var buffer = [UInt8](repeating: 0, count: Int(argMax))
+    var bufferSize = buffer.count
+    var argsMib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
+    guard sysctl(&argsMib, u_int(argsMib.count), &buffer, &bufferSize, nil, 0) == 0,
+          let arguments = parseTeamClaudeProcArgs(Array(buffer.prefix(bufferSize))) else { return nil }
+
+    return TeamClaudeProcessIdentity(
+        pid: pid,
+        ppid: info.kp_eproc.e_ppid,
+        startedAt: teamClaudeLstartString(epochSeconds: Int(info.kp_proc.p_starttime.tv_sec), timeZone: .current),
+        command: arguments.joined(separator: " ")
+    )
 }
 
 private func probeTeamClaudeLoopback(port: Int, ipv6: Bool, timeoutMs: Int32) -> TeamClaudePortProbe {
