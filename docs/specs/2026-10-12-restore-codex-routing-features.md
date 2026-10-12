@@ -79,3 +79,9 @@ manual-rollout 자동 롤백 + rollback_hash 454a80aa.
 - 이식 기능 9개 파일(quota-reserve, account-manager-avoid, server-upstream-failure-avoid, server-codex-503-replay,
   server-codex-prestream-replay, codex-credits, server-codex, server-usage-tracking, sse): 164/164 통과.
 - 출력 원문: 세션 scratchpad `evidence-r2.txt`(로컬, 저장소 밖).
+
+### 배포 (2026-10-12 15:19 KST)
+- 적대 검증: 1라운드 REQUEST_CHANGES(I2·M1~M3) → 수정 → 2라운드 APPROVE(critical 0, important 0, minor 3). Codex 레인이 용량 초과로 판정 불가라 엔진 `--fallback-run` Claude 레인 판정 — 교차 벤더 아님.
+- 2라운드 m1(Claude 복구 보존 미실증) 해소: 저부하 워커에서 claude-recovery·run-recovery·cmux-session-*·supervisor 7파일을 BASE(5e47d84)·HEAD 각각 실행, 250/250 양쪽 통과.
+- `teamcodex-manual-rollout.py` 카나리 3/3 PASS, 라이브 아티팩트 `b3b7d146…`(롤백 대상 454a80aa). 배포 직후 status usable 6/6, 전 계정 `codexCreditsAt` 15:19로 갱신(이전 값은 10/11 스냅샷 고정), 라이브 아티팩트에 codexUseCredits·_isAvoided·TEAMCODEX_OVERLOAD_HOLD_MS·codexPrestreamEncodingOf·quotaReserve·markSendFailure 전부 존재.
+- 기준 브랜치(qjc/resilient-routing, cmux 계열만 변경) 병합 후 이식 기능 테스트 134/134, eslint 0.
