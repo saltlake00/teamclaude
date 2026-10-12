@@ -95,17 +95,23 @@ function pathInside(path, root) {
   return rel !== '..' && !rel.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`);
 }
 
+// Only a positive, safe-integer millisecond timestamp anchors a retry
+// deadline. Anything else (missing, negative, fractional, out of range) yields
+// null so the caller falls back to the transcript mtime instead of waiting on
+// a deadline it can never compute.
 function recordTimestampMs(record) {
   const value = record?.timestamp;
+  let ms = null;
   if (typeof value === 'number' && Number.isFinite(value)) {
-    return value > 1e12 ? value : value * 1000;
-  }
-  if (typeof value === 'string' && value.length > 0) {
+    ms = value > 1e12 ? value : value * 1000;
+  } else if (typeof value === 'string' && value.length > 0) {
     const parsed = Date.parse(value);
-    if (Number.isFinite(parsed)) return parsed;
+    if (Number.isFinite(parsed)) ms = parsed;
   }
-  return null;
+  return Number.isSafeInteger(ms) && ms > 0 ? ms : null;
 }
+
+const TAIL_WINDOW_BYTES = 256 * 1024;
 
 async function unresolvedApiError(path, transcriptRoot, sessionId, recoverableKinds) {
   try {
@@ -121,7 +127,20 @@ async function unresolvedApiError(path, transcriptRoot, sessionId, recoverableKi
     const { handle, info } = await openPrivateFile(resolvedPath);
     try {
       if (await realpath(path) !== resolvedPath) return false;
-      const start = Math.max(0, info.size - 256 * 1024);
+      // Read the last 256 KiB. When its start cuts a record, look back at most
+      // another 256 KiB for that record's beginning: an API-error record is
+      // small, so an error cut by the window is always recovered whole. A cut
+      // record longer than that is a conversation record (it would resolve any
+      // earlier error); it is skipped as before, keeping each pass bounded.
+      let start = Math.max(0, info.size - TAIL_WINDOW_BYTES);
+      if (start > 0) {
+        const from = Math.max(0, start - TAIL_WINDOW_BYTES);
+        const probe = Buffer.alloc(start - from);
+        const { bytesRead } = await handle.read(probe, 0, probe.length, from);
+        const newline = probe.subarray(0, bytesRead).lastIndexOf(10);
+        if (newline !== -1) start = from + newline + 1;
+        else if (from === 0) start = 0; // the file's first byte begins a record
+      }
       const buffer = Buffer.alloc(info.size - start);
       await handle.read(buffer, 0, buffer.length, start);
       let blocked = null;
@@ -137,7 +156,15 @@ async function unresolvedApiError(path, transcriptRoot, sessionId, recoverableKi
           blocked = {
             kind: event.kind,
             retryAfterSeconds: event.retryAfterSeconds ?? null,
-            timestampMs: recordTimestampMs(record),
+            // The record's own timestamp and uuid identify this error EVENT
+            // (they key a recovery claim); null when the record has none.
+            eventTimestampMs: recordTimestampMs(record),
+            eventId: typeof record.uuid === 'string' && UUID_RE.test(record.uuid)
+              ? record.uuid
+              : null,
+            // Without a usable record timestamp the transcript mtime anchors
+            // the retry deadline, so recovery is bounded instead of parked.
+            timestampMs: recordTimestampMs(record) ?? Math.floor(info.mtimeMs),
           };
         }
         else if (blocked && isConversationRecord(record)) blocked = null;

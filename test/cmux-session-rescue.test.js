@@ -11,6 +11,7 @@ import {
   rename,
   rm,
   symlink,
+  utimes,
   writeFile,
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -31,6 +32,7 @@ import {
   releaseSessionClaim,
   releaseSessionLease,
   sameClaudeProcess,
+  unresolvedRecoverableApiErrorState,
 } from '../src/cmux-session-guards.js';
 
 const SESSION_ID = '11111111-1111-4111-8111-111111111111';
@@ -1947,4 +1949,76 @@ test('rejects process identity or active mapping changes before workspace launch
     });
     assert.equal(launches, 0);
   });
+});
+
+// A fleet-exhaustion record without a usable timestamp must still yield a
+// bounded retry deadline: the transcript's modification time stands in, so
+// automatic recovery is never parked forever.
+test('a fleet-exhaustion record without a timestamp falls back to the transcript mtime', async t => {
+  const fx = await fixture(t);
+  const record = JSON.parse(fleetExhaustedRecord(fx.cwd, 60));
+  delete record.timestamp;
+  await writeFile(fx.transcriptPath, `${JSON.stringify(record)}\n`);
+  const past = new Date(Date.now() - 3600_000);
+  await utimes(fx.transcriptPath, past, past);
+  const state = await unresolvedRecoverableApiErrorState(fx.transcriptPath, fx.transcriptRoot, SESSION_ID);
+  assert.equal(state.kind, 'fleet_exhausted');
+  assert.ok(Number.isFinite(state.timestampMs), 'a deadline anchor exists');
+  assert.ok(Math.abs(state.timestampMs - past.getTime()) < 2000, 'anchored at the transcript mtime');
+  assert.equal(state.eventTimestampMs, null, 'the record itself carries no event timestamp');
+});
+
+test('malformed fleet-exhaustion timestamps fall back to the transcript mtime', async t => {
+  const fx = await fixture(t);
+  const past = new Date(Date.now() - 3600_000);
+  for (const timestamp of [-1, 1791600000000.5, Number.MAX_VALUE, 0, 'not a date']) {
+    const record = JSON.parse(fleetExhaustedRecord(fx.cwd, 60));
+    record.timestamp = timestamp;
+    await writeFile(fx.transcriptPath, `${JSON.stringify(record)}\n`);
+    await utimes(fx.transcriptPath, past, past);
+    const state = await unresolvedRecoverableApiErrorState(fx.transcriptPath, fx.transcriptRoot, SESSION_ID);
+    assert.ok(Math.abs(state.timestampMs - past.getTime()) < 2000, `timestamp ${timestamp}`);
+    assert.equal(state.eventTimestampMs, null, `no event timestamp for ${timestamp}`);
+  }
+});
+
+test('the unresolved-error state exposes the record event identity', async t => {
+  const fx = await fixture(t);
+  const at = Date.now() - 5000;
+  const record = JSON.parse(fleetExhaustedRecord(fx.cwd, 60, new Date(at).toISOString()));
+  await writeFile(fx.transcriptPath, `${JSON.stringify({ ...record, uuid: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' })}\n`);
+  let state = await unresolvedRecoverableApiErrorState(fx.transcriptPath, fx.transcriptRoot, SESSION_ID);
+  assert.equal(state.eventTimestampMs, at);
+  assert.equal(state.timestampMs, at);
+  assert.equal(state.eventId, 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa');
+  await writeFile(fx.transcriptPath, `${JSON.stringify({ ...record, uuid: 'not-a-uuid' })}\n`);
+  state = await unresolvedRecoverableApiErrorState(fx.transcriptPath, fx.transcriptRoot, SESSION_ID);
+  assert.equal(state.eventId, null, 'only a valid uuid identifies the event');
+});
+
+// The unresolved-error scan reads a bounded tail; an error record that straddles
+// the start of that window must still be read whole, not dropped as a partial
+// line (non-conversation records after it do not resolve it).
+test('an error record straddling the tail window is still seen as unresolved', async t => {
+  const fx = await fixture(t);
+  const error = fleetExhaustedRecord(fx.cwd, 60);
+  const filler = `${JSON.stringify({ type: 'system', subtype: 'note', content: 'x'.repeat(200) })}\n`;
+  // Put the error record so it begins before the last 256 KiB and ends inside it.
+  const fillerCount = Math.floor((256 * 1024 - Math.floor(error.length / 2)) / filler.length);
+  await writeFile(fx.transcriptPath, `${error}\n${filler.repeat(fillerCount)}`);
+  const state = await unresolvedRecoverableApiErrorState(fx.transcriptPath, fx.transcriptRoot, SESSION_ID);
+  assert.equal(state?.kind, 'fleet_exhausted');
+});
+
+// The look-back is bounded: a final record far larger than the window is a
+// conversation record, so an older error before it counts as resolved instead
+// of the scan reading back through megabytes on every rescue pass.
+test('a huge final record resolves an older error without unbounded look-back', async t => {
+  const fx = await fixture(t);
+  const huge = `${JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: 'z'.repeat(8 * 1024 * 1024) } })}\n`;
+  await writeFile(fx.transcriptPath, `${fleetExhaustedRecord(fx.cwd, 60)}\n${huge}`);
+  const started = Date.now();
+  const state = await unresolvedRecoverableApiErrorState(fx.transcriptPath, fx.transcriptRoot, SESSION_ID);
+  assert.equal(state, null, 'the error is resolved by the conversation record after it');
+  assert.ok(Date.now() - started < 1000, 'bounded work');
 });
