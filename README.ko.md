@@ -151,23 +151,23 @@ Node.js 18 이상이 필요합니다.
 npm install -g teamcodex
 
 # Claude 계정 추가 — 브라우저 OAuth가 열립니다
-teamclaude login
-teamclaude login
+teamcodex login
+teamcodex login
 
 # Claude 프록시 시작
-teamclaude server
+teamcodex server
 
 # 다른 터미널에서 Claude Code 실행
-teamclaude run
+teamcodex run
 ```
 
 > [!IMPORTANT]
-> 프록시가 실행 중이어도 일반 `claude` 명령은 자동으로 프록시를 사용하지 않습니다. 계정 자동 전환을 사용하려면 반드시 `teamclaude run`으로 시작하세요.
-> `teamclaude run`은 프록시가 없으면 자동으로 background supervisor를 기동합니다. proxy worker가 비정상 종료되어도 public listener는 유지되고 worker가 자동 재기동됩니다.
+> 프록시가 실행 중이어도 일반 `claude` 명령은 자동으로 프록시를 사용하지 않습니다. 계정 자동 전환을 사용하려면 반드시 `teamcodex run`으로 시작하세요.
+> `teamcodex run`은 프록시가 없으면 자동으로 background supervisor를 기동합니다. proxy worker가 비정상 종료되어도 public listener는 유지되고 worker가 자동 재기동됩니다.
 > `launchModel` fallback은 일반 한도 기준으로 사용 가능한 계정 전부의 모델별 window가 유효하게 측정된 한도 도달 상태일 때만 적용됩니다. 미측정 또는 만료 window가 하나라도 있으면 조기 downgrade하지 않습니다.
 
 Claude Code 로컬 OAuth와 TeamClaude pool 계정 OAuth는 서로 별개입니다.
-`teamclaude login --name <name>`은 pool 계정만 복구하며 Claude Code 로컬
+`teamcodex login --name <name>`은 pool 계정만 복구하며 Claude Code 로컬
 세션은 갱신하지 못합니다. 로컬 인증은 다음 명령으로 점검·복구하세요.
 
 ```bash
@@ -188,7 +188,7 @@ handoff입니다. 계정 소유자의 인증 정보와 승인이 필요한 브�
 
 ```bash
 claude /login
-teamclaude import
+teamcodex import
 ```
 
 ## Codex 다계정 설정
@@ -276,33 +276,33 @@ Hermes는 하나의 고정 주소만 사용하고, 실제 계정 선택·갱신�
 ### OAuth 로그인
 
 ```bash
-teamclaude login
+teamcodex login
 ```
 
 ### Claude Code에서 가져오기
 
 ```bash
-teamclaude import
-teamclaude import --name work
+teamcodex import
+teamcodex import --name work
 ```
 
 ### API key 계정
 
 ```bash
-teamclaude api --name production
+teamcodex api --name production
 ```
 
 ## 서버와 대시보드
 
 ```bash
-teamclaude server
-teamclaude status
-teamclaude accounts
-teamclaude stop
-teamclaude restart
+teamcodex server
+teamcodex status
+teamcodex accounts
+teamcodex stop
+teamcodex restart
 ```
 
-TTY에서 `teamclaude server` 또는 `teamcodex codex server`를 실행하면
+TTY에서 `teamcodex server` 또는 `teamcodex codex server`를 실행하면
 전체 화면 대시보드가 열립니다.
 
 | 키 | 동작 |
