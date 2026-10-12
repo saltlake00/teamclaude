@@ -42,6 +42,24 @@ function assertSessionId(sessionId) {
   if (!UUID_RE.test(sessionId || '')) throw new Error('Invalid recovery session id.');
 }
 
+// A permanent replay claim is keyed either by the bare session id (the
+// launcher's Codex-handoff claim, or a rescue of an error record without any
+// event identity) or by `<session>@<event>`, where the event is the error
+// record's uuid or its positive millisecond timestamp.
+const CLAIM_EVENT_RE = /^(?:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|[1-9]\d{0,15})$/i;
+
+function assertRecoveryClaimKey(key) {
+  const at = typeof key === 'string' ? key.indexOf('@') : -1;
+  if (at === -1) {
+    assertSessionId(key);
+    return;
+  }
+  assertSessionId(key.slice(0, at));
+  if (!CLAIM_EVENT_RE.test(key.slice(at + 1))) {
+    throw new Error('Invalid recovery claim event.');
+  }
+}
+
 async function openPrivateFile(path) {
   const before = await lstat(path);
   if (!ownedPrivate(before, 'isFile')) throw new Error('Untrusted file.');
@@ -307,7 +325,7 @@ export async function claimSessionOnce(
   sessionId,
   { syncDirectory = handle => handle.sync() } = {},
 ) {
-  assertSessionId(sessionId);
+  assertRecoveryClaimKey(sessionId);
   const claimDir = `${storePath}.recovery-claims`;
   await mkdir(claimDir, { recursive: true, mode: 0o700 });
   const { handle: directoryHandle, info: directoryInfo } =
@@ -372,7 +390,7 @@ export async function claimSessionOnce(
 }
 
 export async function releaseSessionClaim(storePath, sessionId, expectedIdentity = null) {
-  assertSessionId(sessionId);
+  assertRecoveryClaimKey(sessionId);
   const claimDir = `${storePath}.recovery-claims`;
   let directoryHandle;
   try {
@@ -393,6 +411,21 @@ export async function releaseSessionClaim(storePath, sessionId, expectedIdentity
     throw err;
   } finally {
     await directoryHandle?.close();
+  }
+}
+
+// Whether a permanent session-level claim exists. The launcher writes one when
+// it hands a session to Codex; an event-keyed rescue must honour it so Claude
+// is never replayed after the handoff. Anything but a definitive "absent"
+// throws, and the caller treats that as inconclusive.
+export async function sessionClaimExists(storePath, sessionId) {
+  assertSessionId(sessionId);
+  try {
+    await lstat(join(`${storePath}.recovery-claims`, sessionId));
+    return true;
+  } catch (err) {
+    if (err.code === 'ENOENT') return false;
+    throw err;
   }
 }
 

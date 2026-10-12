@@ -2022,3 +2022,121 @@ test('a huge final record resolves an older error without unbounded look-back', 
   assert.equal(state, null, 'the error is resolved by the conversation record after it');
   assert.ok(Date.now() - started < 1000, 'bounded work');
 });
+
+// A claim covers one recoverable error event: the same event is never
+// launched twice (even with a fresh in-memory attempt set, as after a
+// supervisor restart), but a NEW fleet exhaustion in the same session is
+// rescued again instead of being blocked forever by the first claim.
+test('recovery claims are per error event: a later exhaustion of the same session is rescued again', async t => {
+  const fx = await fixture(t);
+  fx.session.pid = 999999;
+  const firstErrorAt = Date.now() - 5000;
+  fx.session.startedAt = firstErrorAt / 1000 + 1;
+  await writeFile(fx.storePath, JSON.stringify(fx.store));
+  await writeFile(fx.transcriptPath, `${fleetExhaustedRecord(fx.cwd, 1, new Date(firstErrorAt).toISOString())}\n`);
+  let launches = 0;
+  const run = () => rescueCmuxSessionsOnce({
+    storePath: fx.storePath,
+    transcriptRoot: fx.transcriptRoot,
+    nodePath: '/usr/local/bin/node',
+    scriptPath: '/opt/teamclaude/src/index.js',
+    trustedClaudePath: fx.executablePath,
+    inspectProcess: async () => ({ alive: false }),
+    stopProcess: async () => true,
+    launchRecoveryWorkspace: async () => { launches += 1; },
+  });
+
+  assert.equal((await run()).rescued, 1, 'first event rescued');
+  assert.equal((await run()).rescued, 0, 'the same event is not launched twice');
+  assert.equal(launches, 1);
+
+  const secondErrorAt = Date.now() - 3000;
+  await writeFile(fx.transcriptPath, `${fleetExhaustedRecord(fx.cwd, 1, new Date(secondErrorAt).toISOString())}\n`);
+  assert.equal((await run()).rescued, 1, 'a new exhaustion event is rescued again');
+  assert.equal(launches, 2);
+
+  // Two distinct error records written in the same millisecond are still two
+  // events: the record uuid tells them apart.
+  const sameAt = new Date(Date.now() - 2000).toISOString();
+  const withUuid = uuid => JSON.stringify({ ...JSON.parse(fleetExhaustedRecord(fx.cwd, 1, sameAt)), uuid });
+  await writeFile(fx.transcriptPath, `${withUuid('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')}\n`);
+  assert.equal((await run()).rescued, 1, 'first same-millisecond event');
+  await writeFile(fx.transcriptPath, `${withUuid('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb')}\n`);
+  assert.equal((await run()).rescued, 1, 'second same-millisecond event with another uuid');
+  assert.equal((await run()).rescued, 0, 'and that event is not launched twice');
+  assert.equal(launches, 4);
+});
+
+// A permanent session-level claim (the Codex handoff written by the launcher,
+// or a claim left by an earlier per-session rescuer) blocks every later event
+// of that session: Codex owns it, so Claude must never be replayed.
+test('a session-level handoff claim blocks rescuing any later error event', async t => {
+  const fx = await fixture(t);
+  fx.session.pid = 999999;
+  const errorAt = Date.now() - 5000;
+  fx.session.startedAt = errorAt / 1000 + 1;
+  await writeFile(fx.storePath, JSON.stringify(fx.store));
+  const record = JSON.parse(fleetExhaustedRecord(fx.cwd, 1, new Date(errorAt).toISOString()));
+  await writeFile(fx.transcriptPath, `${JSON.stringify({ ...record, uuid: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc' })}\n`);
+  assert.ok(await claimSessionOnce(fx.storePath, SESSION_ID));
+  let launches = 0;
+  const result = await rescueCmuxSessionsOnce({
+    storePath: fx.storePath,
+    transcriptRoot: fx.transcriptRoot,
+    nodePath: '/usr/local/bin/node',
+    scriptPath: '/opt/teamclaude/src/index.js',
+    trustedClaudePath: fx.executablePath,
+    inspectProcess: async () => ({ alive: false }),
+    stopProcess: async () => true,
+    launchRecoveryWorkspace: async () => { launches += 1; },
+  });
+  assert.equal(result.rescued, 0);
+  assert.equal(launches, 0);
+});
+
+// Every recheck stage must confirm the SAME error event: if the transcript
+// moves on to another event while the rescue is being verified, this pass
+// must not launch under the first event's claim.
+test('a rescue whose error event changes during verification does not launch', async t => {
+  const fx = await fixture(t);
+  fx.session.pid = 999999;
+  const firstAt = Date.now() - 5000;
+  fx.session.startedAt = firstAt / 1000 + 1;
+  await writeFile(fx.storePath, JSON.stringify(fx.store));
+  await writeFile(fx.transcriptPath, `${fleetExhaustedRecord(fx.cwd, 1, new Date(firstAt).toISOString())}\n`);
+  let reads = 0;
+  let launches = 0;
+  await rescueCmuxSessionsOnce({
+    storePath: fx.storePath,
+    transcriptRoot: fx.transcriptRoot,
+    nodePath: '/usr/local/bin/node',
+    scriptPath: '/opt/teamclaude/src/index.js',
+    trustedClaudePath: fx.executablePath,
+    readStore: async path => {
+      reads += 1;
+      // The fourth read happens after the claim; a new error lands just then.
+      if (reads === 4) {
+        await writeFile(fx.transcriptPath, `${fleetExhaustedRecord(fx.cwd, 1, new Date(Date.now() - 4000).toISOString())}\n`);
+      }
+      return readPrivateJson(path);
+    },
+    inspectProcess: async () => ({ alive: false }),
+    stopProcess: async () => true,
+    launchRecoveryWorkspace: async () => { launches += 1; },
+  });
+  assert.ok(reads >= 4, 'the post-claim registry read happened');
+  assert.equal(launches, 0);
+});
+
+test('event-keyed recovery claims accept only a uuid or positive millisecond event', async t => {
+  const fx = await fixture(t);
+  for (const key of [`${SESSION_ID}@1791600000000`, `${SESSION_ID}@aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa`]) {
+    const claim = await claimSessionOnce(fx.storePath, key);
+    assert.ok(claim, key);
+    assert.equal(await claimSessionOnce(fx.storePath, key), false, `${key} is claimed once`);
+    assert.equal(await releaseSessionClaim(fx.storePath, key, claim), true);
+  }
+  for (const key of [`${SESSION_ID}@`, `${SESSION_ID}@0`, `${SESSION_ID}@-1`, `${SESSION_ID}@../x`, `not-a-session@1`]) {
+    await assert.rejects(claimSessionOnce(fx.storePath, key), /Invalid recovery/, key);
+  }
+});
