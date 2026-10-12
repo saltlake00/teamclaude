@@ -175,6 +175,10 @@ struct TeamClaudeHealth {
     let host: TeamClaudeHostMetrics?
     var runtimeSummary: String? = nil
     var runtimeSummaryShort: String? = nil
+    /// status가 응답하지 않지만 프록시 프로세스는 살아 있다(부하로 인한 지연). 재시작 대상이 아니다.
+    var serverResponseDelayed = false
+    /// 계정 불일치가 worker 재로딩 뒤에도 남았다. 재시작하지 않고 경고만 한다.
+    var driftPersistsAfterReload = false
 
     // 호스트 CPU/RAM 한 줄 요약 (표시할 값이 없으면 nil → 라인 생략)
     var hostSummaryText: String? {
@@ -215,6 +219,7 @@ struct TeamClaudeHealth {
         if serverReachable && accountConfigDrift == 0 {
             return "Claude Fable 사용 가능 \(fableAvailability().filter { $0.state == .ready }.count)/\(total)"
         }
+        if !serverReachable && serverResponseDelayed { return "Claude 응답 지연" }
         return teamClaudeTitleSlot(TeamClaudeHeadlineInput(
             serverReachable: serverReachable,
             accountConfigDrift: accountConfigDrift,
@@ -2037,7 +2042,9 @@ final class TeamClaudeTableView: NSView {
         markDraw("TeamClaudeTableView.header")
         drawText("TeamClaude", innerX, topY, titleFont, text)
         let titleWidth = "TeamClaude".size(withAttributes: attrs(titleFont, text)).width
-        pill(health.serverReachable ? "실행중" : "오프라인", x: innerX + titleWidth + 12, y: topY - 2, color: health.serverReachable ? green : red)
+        let serverPillColor = health.serverReachable ? green : (health.serverResponseDelayed ? yellow : red)
+        pill(teamClaudeServerPillLabel(serverReachable: health.serverReachable, responseDelayed: health.serverResponseDelayed),
+             x: innerX + titleWidth + 12, y: topY - 2, color: serverPillColor)
         let integrationLabel = health.accountConfigDrift == 0 ? "연동 정상" : "연동 불일치 \(health.accountConfigDrift)"
         let serverBase = "port \(health.serverPort ?? 0)  ·  pid \(health.serverPid.map(String.init) ?? "-")  ·  \(integrationLabel)"
         let serverColor = health.accountConfigDrift == 0 ? muted : yellow
@@ -2069,7 +2076,7 @@ final class TeamClaudeTableView: NSView {
         } else if health.accountConfigDrift > 0 {
             actionColor = yellow
             actionTitle = "\(health.accountConfigDrift)개 계정 연동 불일치"
-            actionDetail = "자동 동기화 중 · 서버 반영 확인"
+            actionDetail = teamClaudeDriftActionDetail(persistsAfterReload: health.driftPersistsAfterReload)
         } else if pendingCount > 0 {
             actionColor = yellow
             actionTitle = "\(pendingCount)개 계정 측정 필요"
@@ -3411,17 +3418,244 @@ func teamCodexPoolHealth(
     )
 }
 
+// MARK: - TeamClaude 프록시 무중단 제어
+//
+// supervisor 강제 재시작(kickstart의 -k 옵션)은 진행 중인 Claude Code 요청을 모두 끊는다(10/10 23:47 inflight 14건).
+// 자동 경로는 재시작하지 않는다. 판정은 TeamClaudeServerControl.swift의 순수 함수가 한다.
+
+let teamClaudeLaunchdLabel = "com.qjc.teamclaude"
+
+private func runTeamClaudeCapture(
+    executable: String,
+    arguments: [String],
+    environment: [String: String]? = nil,
+    timeoutSeconds: Double = 5
+) -> (status: Int32, output: String)? {
+    let outputPath = NSTemporaryDirectory() + "cc-menubar-capture-\(UUID().uuidString)"
+    guard FileManager.default.createFile(atPath: outputPath, contents: nil, attributes: [.posixPermissions: 0o600]),
+          let output = FileHandle(forWritingAtPath: outputPath),
+          let nullErr = FileHandle(forWritingAtPath: "/dev/null") else {
+        try? FileManager.default.removeItem(atPath: outputPath)
+        return nil
+    }
+    defer {
+        output.closeFile()
+        nullErr.closeFile()
+        try? FileManager.default.removeItem(atPath: outputPath)
+    }
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: executable)
+    process.arguments = arguments
+    if let environment { process.environment = environment }
+    process.standardOutput = output
+    process.standardError = nullErr
+    guard let result = runTrustedProcessInIsolatedGroup(
+        process,
+        timeoutSeconds: timeoutSeconds,
+        terminationGraceMicroseconds: 300_000
+    ), !result.timedOut else { return nil }
+    let data = (try? Data(contentsOf: URL(fileURLWithPath: outputPath))) ?? Data()
+    return (result.terminationStatus, String(decoding: data, as: UTF8.self))
+}
+
+func probeTeamClaudeLaunchd() -> TeamClaudeLaunchdProbe {
+    guard let result = runTeamClaudeCapture(
+        executable: "/bin/launchctl",
+        arguments: ["print", "gui/\(getuid())/\(teamClaudeLaunchdLabel)"]
+    ) else { return .unknown }
+    return parseTeamClaudeLaunchdPrint(output: result.output, exitStatus: result.status)
+}
+
+func teamClaudeProcessAlive(_ pid: Int32) -> Bool {
+    guard pid > 1 else { return false }
+    return kill(pid, 0) == 0 || errno == EPERM
+}
+
+/// 프록시 CLI의 readProcessIdentity와 같은 형식으로 ps를 읽는다(LC_TIME=C로 lstart 고정).
+func readTeamClaudeProcessIdentity(pid: Int32) -> TeamClaudeProcessIdentity? {
+    guard pid > 1 else { return nil }
+    var environment = ProcessInfo.processInfo.environment
+    environment["LC_ALL"] = ""
+    environment["LC_TIME"] = "C"
+    guard let result = runTeamClaudeCapture(
+        executable: "/bin/ps",
+        arguments: ["-o", "ppid=", "-o", "lstart=", "-o", "command=", "-p", String(pid)],
+        environment: environment
+    ), result.status == 0 else { return nil }
+    return parseTeamClaudePsIdentity(pid: pid, output: result.output)
+}
+
+private func probeTeamClaudeLoopback(port: Int, ipv6: Bool, timeoutMs: Int32) -> TeamClaudePortProbe {
+    let fd = socket(ipv6 ? AF_INET6 : AF_INET, SOCK_STREAM, 0)
+    guard fd >= 0 else { return .unknown }
+    defer { close(fd) }
+    var noSigPipe: Int32 = 1
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+    _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK)
+    let connected: Int32
+    if ipv6 {
+        var address = sockaddr_in6()
+        address.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+        address.sin6_family = sa_family_t(AF_INET6)
+        address.sin6_port = in_port_t(UInt16(port).bigEndian)
+        address.sin6_addr = in6addr_loopback
+        connected = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in6>.size))
+            }
+        }
+    } else {
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = in_port_t(UInt16(port).bigEndian)
+        address.sin_addr.s_addr = inet_addr("127.0.0.1")
+        connected = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+    }
+    if connected == 0 { return .listening }
+    if errno == ECONNREFUSED { return .refused }
+    guard errno == EINPROGRESS else { return .unknown }
+    var pollDescriptor = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+    guard poll(&pollDescriptor, 1, timeoutMs) > 0 else { return .unknown }
+    var socketError: Int32 = 0
+    var length = socklen_t(MemoryLayout<Int32>.size)
+    guard getsockopt(fd, SOL_SOCKET, SO_ERROR, &socketError, &length) == 0 else { return .unknown }
+    if socketError == 0 { return .listening }
+    return socketError == ECONNREFUSED ? .refused : .unknown
+}
+
+/// 포트에 TCP 연결만 시도한다(HTTP 요청 없음). IPv4·IPv6 루프백 둘 다 거절할 때만 refused.
+func probeTeamClaudePort(_ port: Int, timeoutMs: Int32 = 1_500) -> TeamClaudePortProbe {
+    guard port > 0, port < 65_536 else { return .unknown }
+    let ipv4 = probeTeamClaudeLoopback(port: port, ipv6: false, timeoutMs: timeoutMs)
+    if ipv4 == .listening { return .listening }
+    let ipv6 = probeTeamClaudeLoopback(port: port, ipv6: true, timeoutMs: timeoutMs)
+    if ipv6 == .listening { return .listening }
+    return ipv4 == .refused && ipv6 == .refused ? .refused : .unknown
+}
+
+func probeTeamClaudeOutage(port: Int) -> TeamClaudeOutageVerdict {
+    let launchd = probeTeamClaudeLaunchd()
+    if case .running(let pid) = launchd, teamClaudeProcessAlive(pid) {
+        return teamClaudeOutageVerdict(launchd: launchd, launchdPidAlive: true, port: .unknown)
+    }
+    return teamClaudeOutageVerdict(launchd: launchd, launchdPidAlive: false, port: probeTeamClaudePort(port))
+}
+
+/// 멈춘 서비스만 시작한다. `-k`가 없으므로 살아 있는 프로세스는 건드리지 않는다.
 @discardableResult
-func kickstartTeamClaudeServer() -> Bool {
+func startStoppedTeamClaudeService() -> Bool {
     let task = Process()
     task.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-    task.arguments = ["kickstart", "-k", "gui/\(getuid())/com.qjc.teamclaude"]
+    task.arguments = ["kickstart", "gui/\(getuid())/\(teamClaudeLaunchdLabel)"]
     do {
         try task.run()
         task.waitUntilExit()
         return task.terminationStatus == 0
     } catch {
         return false
+    }
+}
+
+/// supervisor를 죽였다 다시 띄운다. 진행 중 요청이 모두 끊긴다.
+/// 사용자가 확인 대화상자에서 재시작을 고른 restartTeamClaudeAction에서만 부른다.
+@discardableResult
+func forceRestartTeamClaudeServerConfirmedByUser() -> Bool {
+    let task = Process()
+    task.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+    task.arguments = ["kickstart", "-k", "gui/\(getuid())/\(teamClaudeLaunchdLabel)"]
+    do {
+        try task.run()
+        task.waitUntilExit()
+        return task.terminationStatus == 0
+    } catch {
+        return false
+    }
+}
+
+enum TeamClaudeSyncOutcome: Equatable {
+    case inSync
+    case reloaded
+    case driftPersists(String)
+    case responseDelayed(pid: Int32?)
+    case serviceStarted
+    case serviceStartFailed
+    case serviceNotLoaded
+    case undetermined
+
+    var logText: String {
+        switch self {
+        case .inSync: return "서버 반영 확인 · 재시작 안 함"
+        case .reloaded: return "worker 무중단 재로딩으로 반영"
+        case .driftPersists(let reason): return "불일치 남음(\(reason)) · 재시작 안 함, 경고만 표시"
+        case .responseDelayed(let pid):
+            return "프로세스 실행 중(pid \(pid.map(String.init) ?? "포트 점유")) · 응답 지연, 재시작 안 함"
+        case .serviceStarted: return "멈춘 서비스 시작(kickstart, -k 없음)"
+        case .serviceStartFailed: return "멈춘 서비스 시작 실패"
+        case .serviceNotLoaded: return "launchd 서비스 미등록 · 조치 안 함"
+        case .undetermined: return "launchd 상태 확인 불가 · 조치 안 함"
+        }
+    }
+}
+
+private func reloadTeamClaudeWorkerAccounts(current: TeamClaudeHealth) -> (TeamClaudeSyncOutcome, TeamClaudeHealth) {
+    let configPath = "\(NSHomeDirectory())/.config/teamclaude.json"
+    let state = parseTeamClaudeServerState(readTeamClaudeJSON("\(NSHomeDirectory())/.config/teamclaude.server.json"))
+    let launchd = probeTeamClaudeLaunchd()
+    let observed = state?.workerPid.flatMap { readTeamClaudeProcessIdentity(pid: $0) }
+    let decision = teamClaudeWorkerSignalDecision(
+        state: state,
+        expectedConfigPath: configPath,
+        launchd: launchd,
+        observedWorker: observed
+    )
+    guard case .signal(let pid) = decision else {
+        if case .refuse(let reason) = decision { return (.driftPersists("worker 확인 불가: \(reason)"), current) }
+        return (.driftPersists("worker 확인 불가"), current)
+    }
+    guard kill(pid, SIGHUP) == 0 else { return (.driftPersists("SIGHUP 실패 errno \(errno)"), current) }
+    var health = current
+    for _ in 0..<10 {
+        Thread.sleep(forTimeInterval: 2)
+        health = loadTeamClaudeHealth()
+        if health.serverReachable && health.accountConfigDrift == 0 { return (.reloaded, health) }
+    }
+    return (.driftPersists("재로딩 후 불일치 \(health.accountConfigDrift)개"), health)
+}
+
+/// 계정 변경·서버 연결 실패를 재시작 없이 처리한다.
+/// - 서버 응답 + 불일치 없음: CLI가 이미 라이브 반영했다. 아무것도 하지 않는다.
+/// - 서버 응답 + 불일치: 검증된 worker에 SIGHUP. 그래도 남으면 경고만.
+/// - 서버 무응답: 프로세스가 살아 있으면 응답 지연. 프로세스·포트가 모두 없을 때만 -k 없이 시작.
+func syncTeamClaudeServerWithoutRestart(current: TeamClaudeHealth) -> (outcome: TeamClaudeSyncOutcome, health: TeamClaudeHealth) {
+    switch teamClaudeSyncPlan(serverReachable: current.serverReachable, accountConfigDrift: current.accountConfigDrift) {
+    case .nothing:
+        return (.inSync, current)
+    case .reloadAccounts:
+        let (outcome, health) = reloadTeamClaudeWorkerAccounts(current: current)
+        return (outcome, health)
+    case .checkLiveness:
+        switch probeTeamClaudeOutage(port: current.serverPort ?? 3456) {
+        case .responseDelayed(let pid):
+            return (.responseDelayed(pid: pid), current)
+        case .serviceNotLoaded:
+            return (.serviceNotLoaded, current)
+        case .undetermined:
+            return (.undetermined, current)
+        case .startStoppedService:
+            guard startStoppedTeamClaudeService() else { return (.serviceStartFailed, current) }
+            var health = current
+            for _ in 0..<45 {
+                Thread.sleep(forTimeInterval: 1)
+                health = loadTeamClaudeHealth()
+                if health.serverReachable { return (.serviceStarted, health) }
+            }
+            return (.serviceStartFailed, health)
+        }
     }
 }
 
@@ -3623,30 +3857,23 @@ func teamClaudeTerminalCommand(
     let quotedExe = shellQuote(executable)
     let argString = arguments.map(shellQuote).joined(separator: " ")
     let product = codexMode ? "TeamCodex" : "TeamClaude"
-    let successCommand = codexMode
-        ? nil
-        : "launchctl kickstart -k gui/$(id -u)/com.qjc.teamclaude || \(quotedExe) restart"
-    // codex 경로는 서버를 다시 띄우지 않는다(successCommand가 없다).
+    // 어느 모드든 명령 뒤에 서버를 다시 띄우지 않는다. 재시작은 진행 중 요청을 모두 끊는다.
+    // TeamClaude 계정 명령(import/login/reauth)은 CLI가 실행 중 worker에 SIGHUP을 보내
+    // 재시작 없이 반영한다. 남은 불일치는 상태바 자동 동기화가 worker 재로딩으로 처리한다.
     // `codex enable`은 실행 중 서버에 라이브 리로드되지 않아 CLI가 바로 위에
     // "Apply the change with: teamcodex restart"를 찍는다. 앱이 그 줄을
     // "자동 반영됩니다"로 덮으면 사용자는 재시작을 건너뛰고 반영 안 된 상태로 남는다.
     let closingNote = codexMode
         ? "완료 후 위 실행 결과를 확인하세요 · 반영되지 않으면 teamcodex restart가 필요합니다."
         : "완료되면 상태바에 자동 반영됩니다."
-    var commands = [
+    let commands = [
         "clear",
         "echo \(shellQuote("\(product): \(commandTitle)"))",
         "\(quotedExe) \(argString)",
-    ]
-    if let successCommand {
-        commands.append("exit_code=$?")
-        commands.append("if [ $exit_code -eq 0 ]; then \(successCommand); fi")
-    }
-    commands.append(contentsOf: [
         "echo",
         "echo \(shellQuote(closingNote))",
         "read -n 1 -s -r -p \(shellQuote("닫으려면 아무 키나 누르세요"))",
-    ])
+    ]
     return commands.joined(separator: "; ")
 }
 
@@ -3888,6 +4115,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var teamClaudeOutageStartedAt: TimeInterval?
     var attemptedTeamClaudeOutageStartedAt: TimeInterval?
     var attemptedTeamClaudeDriftTopologySignature: Int?
+    /// 마지막 확인에서 status는 무응답이지만 프로세스는 살아 있었다(재시작하지 않고 "응답 지연" 표시).
+    var teamClaudeResponseDelayed = false
+    /// worker 재로딩 뒤에도 계정 불일치가 남았다. 불일치가 0이 되면 해제한다.
+    var teamClaudeDriftPersists = false
     weak var openDashboardView: StatusMenuDashboardView?
     var cachedDashboardView: StatusMenuDashboardView?
     weak var cachedDashboardItem: NSMenuItem?
@@ -4391,6 +4622,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func commitTeamClaudeHealth(_ candidate: TeamClaudeHealth, outageDuration: TimeInterval = 0) {
+        // 병합 경로가 새 TeamClaudeHealth를 만들어도 무중단 제어 상태가 화면까지 가도록 모든 출구에서 덧입힌다.
+        defer {
+            if let committed = currentTeamClaude {
+                if committed.serverReachable && committed.accountConfigDrift == 0 { teamClaudeDriftPersists = false }
+                currentTeamClaude?.serverResponseDelayed = !committed.serverReachable && teamClaudeResponseDelayed
+                currentTeamClaude?.driftPersistsAfterReload = committed.accountConfigDrift > 0 && teamClaudeDriftPersists
+            }
+        }
         guard teamClaudeCandidateIsCurrent(
             candidateCheckedAt: candidate.checkedAt,
             currentCheckedAt: currentTeamClaude?.checkedAt
@@ -4467,35 +4706,37 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
             }
 
+            // 자동 경로는 supervisor를 재시작하지 않는다(재시작은 진행 중 요청을 모두 끊는다).
             var syncAttempted = false
-            var syncSucceeded = false
+            var syncOutcome: TeamClaudeSyncOutcome?
             if let syncReason, forcedSyncReason != nil || autoSyncAllowed {
                 syncAttempted = true
-                print("TEAMCLAUDE-AUTOSYNC: \(syncReason), 서버 재시작")
+                let result = syncTeamClaudeServerWithoutRestart(current: teamClaude)
+                teamClaude = result.health
+                syncOutcome = result.outcome
+                if teamClaude.serverReachable { outageStartedAt = nil }
+                print("TEAMCLAUDE-AUTOSYNC: \(syncReason) → \(result.outcome.logText)")
                 fflush(stdout)
-                let kicked = kickstartTeamClaudeServer()
-                if kicked {
-                    for _ in 0..<45 {
-                        Thread.sleep(forTimeInterval: 1)
-                        teamClaude = loadTeamClaudeHealth()
-                        if teamClaude.serverReachable && teamClaude.accountConfigDrift == 0 {
-                            outageStartedAt = nil
-                            syncSucceeded = true
-                            break
-                        }
-                    }
-                }
-                if !syncSucceeded {
-                    print("TEAMCLAUDE-AUTOSYNC-FAILED: \(syncReason) kicked=\(kicked)")
-                    fflush(stdout)
-                }
             }
+            // 무응답이면 표시용으로 프로세스 생존을 본다. 살아 있으면 "응답 지연"이지 오프라인이 아니다.
+            var responseDelayed = false
+            if case .responseDelayed? = syncOutcome {
+                responseDelayed = true
+            } else if syncOutcome == nil, !teamClaude.serverReachable, teamClaude.configPresent,
+                      case .responseDelayed = probeTeamClaudeOutage(port: teamClaude.serverPort ?? 3456) {
+                responseDelayed = true
+            }
+            let driftPersists: Bool
+            if case .driftPersists? = syncOutcome { driftPersists = true } else { driftPersists = false }
 
             DispatchQueue.main.async {
                 guard let self = self else { return }
+                self.teamClaudeResponseDelayed = responseDelayed
+                if driftPersists { self.teamClaudeDriftPersists = true }
                 if syncAttempted {
                     self.lastTeamClaudeAutoSyncAt = Date()
-                    if let outageStartedAt {
+                    // 응답 지연은 복구 시도로 치지 않는다. 같은 장애 중 프로세스가 실제로 죽으면 다시 판정해야 한다.
+                    if let outageStartedAt, !responseDelayed {
                         self.attemptedTeamClaudeOutageStartedAt = outageStartedAt
                     }
                     if teamClaude.serverReachable && teamClaude.accountConfigDrift > 0 {
@@ -4998,7 +5239,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let restartTeamClaudeItem = NSMenuItem(title: "TeamClaude 서버 재시작", action: #selector(restartTeamClaudeAction), keyEquivalent: "")
         restartTeamClaudeItem.target = self
-        let restartTeamClaudeView = MenuActionRowView(frame: NSRect(x: 0, y: 0, width: actionWidth, height: MenuActionRowView.preferredHeight), icon: "⟳", symbolName: "arrow.triangle.2.circlepath", title: "TeamClaude 서버 재시작", detail: "계정 반영", tone: blue)
+        let restartTeamClaudeView = MenuActionRowView(frame: NSRect(x: 0, y: 0, width: actionWidth, height: MenuActionRowView.preferredHeight), icon: "⟳", symbolName: "arrow.triangle.2.circlepath", title: "TeamClaude 서버 재시작", detail: "요청 끊김 · 확인 후", tone: blue)
         restartTeamClaudeView.onClick = { [weak self, weak menu] in
             self?.restartTeamClaudeAction()
             menu?.cancelTracking()
@@ -5075,19 +5316,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self?.scheduleDashboardRefresh(reason: "measureTeamClaudeAction", immediate: true)
                 self?.updateTitle()
             }
-            _ = kickstartTeamClaudeServer()
-            var serverReady = false
-            for _ in 0..<10 {
-                if loadTeamClaudeHealth().serverReachable {
-                    serverReady = true
-                    break
+            // 재시작하지 않는다. CLI가 이미 반영했으면 그대로, 불일치만 worker SIGHUP으로 무중단 재로딩한다.
+            let sync = syncTeamClaudeServerWithoutRestart(current: loadTeamClaudeHealth())
+            print("TEAMCLAUDE-MEASURE-SYNC: \(sync.outcome.logText)")
+            fflush(stdout)
+            guard sync.health.serverReachable else {
+                let detail: String
+                if case .responseDelayed = sync.outcome {
+                    detail = "서버 응답 지연 · 잠시 후 다시 시도"
+                } else {
+                    detail = "서버 연결 실패"
                 }
-                Thread.sleep(forTimeInterval: 1)
-            }
-            guard serverReady else {
                 DispatchQueue.main.async {
                     self?.isMeasuringTeamClaude = false
-                    self?.teamClaudeMeasureDetail = "서버 연결 실패"
+                    self?.teamClaudeMeasureDetail = detail
                     self?.scheduleDashboardRefresh(reason: "measureTeamClaudeAction", immediate: true)
                     self?.updateTitle()
                 }
@@ -5364,9 +5606,30 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         )
     }
 
+    /// 사용자가 명시적으로 누르는 재시작. 끊길 진행 중 요청 수를 보여 주고 확인을 받은 뒤에만 -k 재시작한다.
     @objc func restartTeamClaudeAction() {
+        let health = currentTeamClaude
+        let confirmation = teamClaudeRestartConfirmation(
+            inflight: health?.inflight,
+            serverReachable: health?.serverReachable ?? false
+        )
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = confirmation.title
+        alert.informativeText = confirmation.message
+        // 첫 버튼(기본, Return)은 취소다. 재시작은 두 번째 버튼을 눌러야 한다.
+        alert.addButton(withTitle: confirmation.cancelTitle)
+        alert.addButton(withTitle: confirmation.confirmTitle)
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertSecondButtonReturn else {
+            print("TEAMCLAUDE-RESTART: 사용자 취소")
+            fflush(stdout)
+            return
+        }
+        print("TEAMCLAUDE-RESTART: 사용자 확인 inflight=\(health?.inflight.description ?? "unknown")")
+        fflush(stdout)
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            _ = kickstartTeamClaudeServer()
+            _ = forceRestartTeamClaudeServerConfirmedByUser()
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
                 self?.refreshStatusOnly()
             }
@@ -5767,7 +6030,9 @@ if CommandLine.arguments.contains("--teamcodex-dashboard-selftest") {
         arguments: ["login"],
         codexMode: false
     )
-    precondition(claudeLoginCommand.contains("exit_code=$?"))
+    // 계정 명령 뒤에 프록시를 재시작하지 않는다(CLI가 worker SIGHUP으로 무중단 반영한다).
+    precondition(!claudeLoginCommand.contains("kickstart"))
+    precondition(!claudeLoginCommand.contains(" restart"))
     // codex 명령은 서버를 다시 띄우지 않는다. CLI가 "teamcodex restart"를 요구하는 줄을
     // 찍는 바로 그 화면에서 앱이 "자동 반영됩니다"라고 덮어쓰면 안 된다.
     precondition(!codexLoginCommand.contains("완료되면 상태바에 자동 반영됩니다."))

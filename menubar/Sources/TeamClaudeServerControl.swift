@@ -2,7 +2,7 @@ import Foundation
 
 // 상태바 앱이 TeamClaude 프록시를 다루는 방식의 판정 로직(순수 함수).
 //
-// supervisor 재시작(`launchctl kickstart -k`)은 진행 중인 Claude Code 요청을 모두 끊는다.
+// supervisor 강제 재시작(launchctl kickstart의 -k 옵션)은 진행 중인 Claude Code 요청을 모두 끊는다.
 // 그래서 앱은 다음 원칙을 지킨다.
 //  - 계정 설정 변경: CLI가 이미 worker에 SIGHUP으로 무중단 반영한다. 남은 불일치만
 //    검증된 worker에 SIGHUP을 한 번 더 보내고, 그래도 남으면 경고만 한다.
