@@ -72,6 +72,17 @@ async function defaultResolveRecoveryWindow({ workspaceId, surfaceId }) {
   return windowId;
 }
 
+// Marks a launch failure that provably ran nothing (no cmux binary, no target
+// window, or the process could not be spawned). Only such failures release the
+// recovery claim for a retry; a timeout or a cmux error after spawning is
+// ambiguous (the workspace may exist) and keeps the claim so the event is never
+// launched twice.
+function notLaunched(error) {
+  const wrapped = error instanceof Error ? error : new Error(String(error));
+  wrapped.recoveryNotLaunched = true;
+  return wrapped;
+}
+
 async function defaultLaunchRecoveryWorkspace({
   workspaceId,
   surfaceId,
@@ -80,26 +91,37 @@ async function defaultLaunchRecoveryWorkspace({
   sessionId,
   command,
 }) {
-  const cmuxBinary = await resolveCmuxBinary();
-  const resolvedWindowId = windowId || await defaultResolveRecoveryWindow({
-    workspaceId,
-    surfaceId,
-  });
-  await execFileAsync(cmuxBinary, [
-    'new-workspace',
-    '--window',
-    resolvedWindowId,
-    '--name',
-    `Recovered Claude ${sessionId.slice(0, 8)}`,
-    '--cwd',
-    cwd,
-    '--command',
-    command,
-    '--focus',
-    'false',
-  ], {
-    timeout: 5000,
-  });
+  let cmuxBinary;
+  let resolvedWindowId;
+  try {
+    cmuxBinary = await resolveCmuxBinary();
+    resolvedWindowId = windowId || await defaultResolveRecoveryWindow({
+      workspaceId,
+      surfaceId,
+    });
+  } catch (error) {
+    throw notLaunched(error);
+  }
+  try {
+    await execFileAsync(cmuxBinary, [
+      'new-workspace',
+      '--window',
+      resolvedWindowId,
+      '--name',
+      `Recovered Claude ${sessionId.slice(0, 8)}`,
+      '--cwd',
+      cwd,
+      '--command',
+      command,
+      '--focus',
+      'false',
+    ], {
+      timeout: 5000,
+    });
+  } catch (error) {
+    if (error?.code === 'ENOENT' || error?.code === 'EACCES') throw notLaunched(error);
+    throw error;
+  }
 }
 
 async function defaultReadStore(path) {
@@ -598,11 +620,12 @@ export async function rescueCmuxSessionsOnce({
       rescued += 1;
       await releaseLeaseForRetry();
       claimOwned = false;
-    } catch {
+    } catch (error) {
       // Keep the permanent replay claim when workspace launch is ambiguous;
-      // before launch there is no replay ambiguity, so release both claims
-      // and allow a later scan to retry the stopped session.
-      if (launchStarted) {
+      // before launch, or when the launch provably ran nothing (no cmux
+      // binary/window, spawn ENOENT/EACCES), there is no replay ambiguity, so
+      // release both claims and allow a later scan to retry the session.
+      if (launchStarted && error?.recoveryNotLaunched !== true) {
         await releaseLeaseForRetry();
       } else {
         await releaseClaimForRetry();

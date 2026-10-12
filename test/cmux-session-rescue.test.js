@@ -2140,3 +2140,67 @@ test('event-keyed recovery claims accept only a uuid or positive millisecond eve
     await assert.rejects(claimSessionOnce(fx.storePath, key), /Invalid recovery/, key);
   }
 });
+
+// A launch that provably ran nothing (e.g. cmux not installed yet) releases
+// the claim and lease so the same event is retried once cmux is available; an
+// ambiguous failure keeps the claim (covered by the no-replay tests).
+test('a launch that ran nothing is retried on a later pass', async t => {
+  const fx = await fixture(t);
+  fx.session.pid = 999999;
+  const errorAt = Date.now() - 5000;
+  fx.session.startedAt = errorAt / 1000 + 1;
+  await writeFile(fx.storePath, JSON.stringify(fx.store));
+  await writeFile(fx.transcriptPath, `${fleetExhaustedRecord(fx.cwd, 1, new Date(errorAt).toISOString())}\n`);
+  let attempts = 0;
+  const attempted = new Set();
+  const run = () => rescueCmuxSessionsOnce({
+    storePath: fx.storePath,
+    transcriptRoot: fx.transcriptRoot,
+    nodePath: '/usr/local/bin/node',
+    scriptPath: '/opt/teamclaude/src/index.js',
+    trustedClaudePath: fx.executablePath,
+    attempted,
+    inspectProcess: async () => ({ alive: false }),
+    stopProcess: async () => true,
+    launchRecoveryWorkspace: async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        const error = new Error('Unable to resolve the cmux executable.');
+        error.recoveryNotLaunched = true;
+        throw error;
+      }
+    },
+  });
+  assert.deepEqual(await run(), { scanned: 1, candidates: 1, rescued: 0, failed: 1 });
+  assert.deepEqual(await run(), { scanned: 1, candidates: 1, rescued: 1, failed: 0 });
+  assert.equal(attempts, 2);
+});
+
+test('an ambiguous launch failure keeps the event claim', async t => {
+  const fx = await fixture(t);
+  fx.session.pid = 999999;
+  const errorAt = Date.now() - 5000;
+  fx.session.startedAt = errorAt / 1000 + 1;
+  await writeFile(fx.storePath, JSON.stringify(fx.store));
+  await writeFile(fx.transcriptPath, `${fleetExhaustedRecord(fx.cwd, 1, new Date(errorAt).toISOString())}\n`);
+  let attempts = 0;
+  const run = () => rescueCmuxSessionsOnce({
+    storePath: fx.storePath,
+    transcriptRoot: fx.transcriptRoot,
+    nodePath: '/usr/local/bin/node',
+    scriptPath: '/opt/teamclaude/src/index.js',
+    trustedClaudePath: fx.executablePath,
+    attempted: new Set(),
+    inspectProcess: async () => ({ alive: false }),
+    stopProcess: async () => true,
+    launchRecoveryWorkspace: async () => {
+      attempts += 1;
+      const error = new Error('cmux timed out');
+      error.code = 'ETIMEDOUT';
+      throw error;
+    },
+  });
+  assert.equal((await run()).failed, 1);
+  assert.equal((await run()).failed, 0, 'the claimed event is not relaunched');
+  assert.equal(attempts, 1);
+});
