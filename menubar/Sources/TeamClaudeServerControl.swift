@@ -254,16 +254,14 @@ func teamClaudeDriftActionDetail(persistsAfterReload: Bool) -> String {
 // 프록시 `getConfigPath()`/`getServerStatePath()`와 같은 규칙으로 설정·상태 파일 경로를 정한다.
 // TEAMCLAUDE_CONFIG → XDG_CONFIG_HOME/teamclaude.json → ~/.config/teamclaude.json.
 // 앱의 상태 확인·드리프트 계산·worker 신원 확인이 모두 이 경로를 써야 서로 어긋나지 않는다.
-func teamClaudeConfigPath(environment: [String: String], home: String) -> String {
-    if let explicit = environment["TEAMCLAUDE_CONFIG"], !explicit.isEmpty { return explicit }
+// 상대 경로는 서버 프로세스의 cwd 기준이라 앱이 같은 파일을 가리킨다고 보장할 수 없으므로
+// nil(설정 특정 불가)을 돌려주고, 모든 호출 지점이 그 경우 설정을 읽지 않는다.
+func teamClaudeConfigPath(environment: [String: String], home: String) -> String? {
+    if let explicit = environment["TEAMCLAUDE_CONFIG"], !explicit.isEmpty {
+        return explicit.hasPrefix("/") ? explicit : nil
+    }
     let configDir = environment["XDG_CONFIG_HOME"].flatMap { $0.isEmpty ? nil : $0 } ?? "\(home)/.config"
-    return "\(configDir)/teamclaude.json"
-}
-
-// 상대 경로는 서버 프로세스의 cwd 기준이라 앱이 같은 파일을 가리킨다고 보장할 수 없다.
-// 그런 설정에서는 worker 신호를 보내지 않고 사유만 표시한다.
-func teamClaudeConfigPathIsUsable(_ path: String) -> Bool {
-    path.hasPrefix("/")
+    return configDir.hasPrefix("/") ? "\(configDir)/teamclaude.json" : nil
 }
 
 func teamClaudeServerStatePath(configPath: String) -> String {

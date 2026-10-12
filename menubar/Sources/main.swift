@@ -547,8 +547,8 @@ func computeTeamClaudeRetryAfterSeconds(accounts: [[String: Any]], threshold: Do
 
 func loadTeamClaudeHealth() -> TeamClaudeHealth {
     let configPath = currentTeamClaudeConfigPath()
-    let config = readTeamClaudeJSON(configPath)
-    let server = readTeamClaudeJSON(teamClaudeServerStatePath(configPath: configPath))
+    let config = configPath.flatMap { readTeamClaudeJSON($0) }
+    let server = configPath.flatMap { readTeamClaudeJSON(teamClaudeServerStatePath(configPath: $0)) }
     let port = tcInt(server?["port"])
         ?? tcInt(tcDict(config?["proxy"])?["port"])
         ?? 3456
@@ -3159,7 +3159,7 @@ func resolveTeamCodexExecutable() -> String {
 }
 
 func teamClaudeConfigSignature() -> String {
-    let path = currentTeamClaudeConfigPath()
+    guard let path = currentTeamClaudeConfigPath() else { return "unresolved" }
     let modifiedAt = (try? FileManager.default.attributesOfItem(atPath: path)[.modificationDate] as? Date)?
         .timeIntervalSince1970 ?? 0
     guard let config = readTeamClaudeJSON(path) else {
@@ -3170,7 +3170,7 @@ func teamClaudeConfigSignature() -> String {
 }
 
 func teamClaudeAccountTopologySignature() -> Int {
-    guard let config = readTeamClaudeJSON(currentTeamClaudeConfigPath()) else {
+    guard let config = currentTeamClaudeConfigPath().flatMap({ readTeamClaudeJSON($0) }) else {
         return 0
     }
     let accounts = tcArray(config["accounts"]) ?? []
@@ -3615,13 +3615,12 @@ enum TeamClaudeSyncOutcome: Equatable {
     }
 }
 
-func currentTeamClaudeConfigPath() -> String {
+func currentTeamClaudeConfigPath() -> String? {
     teamClaudeConfigPath(environment: ProcessInfo.processInfo.environment, home: NSHomeDirectory())
 }
 
 private func reloadTeamClaudeWorkerAccounts(current: TeamClaudeHealth) -> (TeamClaudeSyncOutcome, TeamClaudeHealth) {
-    let configPath = currentTeamClaudeConfigPath()
-    guard teamClaudeConfigPathIsUsable(configPath) else {
+    guard let configPath = currentTeamClaudeConfigPath() else {
         return (.driftPersists("TEAMCLAUDE_CONFIG가 상대 경로라 서버 설정 파일을 특정할 수 없음"), current)
     }
     let state = parseTeamClaudeServerState(readTeamClaudeJSON(teamClaudeServerStatePath(configPath: configPath)))
@@ -5312,7 +5311,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard !isMeasuringTeamClaude else { return }
         let port = currentTeamClaude?.serverPort ?? 3456
         let model = preferredTeamClaudeProbeModel()
-        let config = readTeamClaudeJSON(currentTeamClaudeConfigPath())
+        let config = currentTeamClaudeConfigPath().flatMap { readTeamClaudeJSON($0) }
         let proxyAuthorizationValue = tcString(tcDict(config?["proxy"])?["apiKey"])
         isMeasuringTeamClaude = true
         teamClaudeMeasureDetail = "OAuth 갱신 중"
