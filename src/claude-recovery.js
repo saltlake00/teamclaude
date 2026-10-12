@@ -10,6 +10,7 @@ import {
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 import { parseClaudeRecoveryAccount } from './claude-auth.js';
+import { modelQuotaLabel } from './account-manager.js';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -91,12 +92,37 @@ function accountGeneralQuotaBlocked(account, threshold) {
   return false;
 }
 
-export function isClaudeFleetExhausted(status, threshold = 0.98) {
+function modelWindowBlocked(account, label, threshold) {
+  const win = account?.quota?.modelWeekly?.[label];
+  return freshBlocked(win?.utilization, win?.reset, threshold);
+}
+
+// With `modelLabel` (the model-scoped weekly window of the session's model,
+// e.g. the Fable tier), an account that still has general quota but whose
+// window for THAT model is full also counts as exhausted. Callers pass it only
+// when the proxy itself reported that every account is exhausted for the
+// session's request (a fleet-exhaustion error); windows of other models never
+// count, and without a known session model only general quota decides.
+export function isClaudeFleetExhausted(status, threshold = 0.98, { modelLabel = null } = {}) {
   const accounts = Array.isArray(status?.accounts)
     ? status.accounts.filter(account => account?.enabled !== false)
     : [];
   return accounts.length > 0
-    && accounts.every(account => accountGeneralQuotaBlocked(account, threshold));
+    && accounts.every(account => accountGeneralQuotaBlocked(account, threshold)
+      || (typeof modelLabel === 'string' && modelWindowBlocked(account, modelLabel, threshold)));
+}
+
+// The model the session runs with: an explicit --model argument wins over the
+// environment the launcher prepared.
+function sessionModel(claudeArgs, childEnv) {
+  const args = Array.isArray(claudeArgs) ? claudeArgs : [];
+  for (let i = 0; i < args.length; i += 1) {
+    if (args[i] === '--model' && typeof args[i + 1] === 'string') return args[i + 1];
+    if (typeof args[i] === 'string' && args[i].startsWith('--model=')) {
+      return args[i].slice('--model='.length);
+    }
+  }
+  return typeof childEnv?.ANTHROPIC_MODEL === 'string' ? childEnv.ANTHROPIC_MODEL : null;
 }
 
 function textBlocks(content) {
@@ -1306,7 +1332,11 @@ export async function runClaudeWithRecovery({
     } catch {}
 
     if (config.codexFallbackOnExhaustion === true
-        && isClaudeFleetExhausted(status, config.switchThreshold ?? 0.98)) {
+        && isClaudeFleetExhausted(status, config.switchThreshold ?? 0.98, {
+          modelLabel: outcome.event.kind === 'fleet_exhausted'
+            ? modelQuotaLabel(sessionModel(claudeArgs, nextEnv ?? childEnv))
+            : null,
+        })) {
       if (!(await protectCodexHandoff(sessionId))) {
         log(`[TeamClaude] Could not publish the permanent handoff claim for session ${sessionId}; preserving Claude without a Codex handoff.`);
         return await preserveChild(child);

@@ -4437,3 +4437,92 @@ test('a transcript rotated while the session runs is rescanned from the start', 
   assert.equal(calls.length, 2, 'the error early in the rotated file triggered the fleet resume');
   await rm(root, { recursive: true, force: true });
 });
+
+test('model-scoped windows count only for the session model when the proxy reported fleet exhaustion', () => {
+  const reset = new Date(Date.now() + 3600_000).getTime();
+  const account = modelWeekly => ({ enabled: true, quota: {
+    unified5h: 0.2, unified5hReset: reset, unified7d: 0.3, unified7dReset: reset, modelWeekly,
+  } });
+  const fableFull = { accounts: [account({ '7d_oi': { utilization: 1, reset } })] };
+  assert.equal(isClaudeFleetExhausted(fableFull, 0.98), false, 'general quota remains');
+  assert.equal(isClaudeFleetExhausted(fableFull, 0.98, { modelLabel: '7d_oi' }), true, 'the session model tier is full');
+  assert.equal(isClaudeFleetExhausted(fableFull, 0.98, { modelLabel: '7d_xx' }), false, 'another model tier');
+  assert.equal(isClaudeFleetExhausted(fableFull, 0.98, { modelLabel: null }), false, 'unknown session model');
+  const expired = { accounts: [account({ '7d_oi': { utilization: 1, reset: Date.now() - 1000 } })] };
+  assert.equal(isClaudeFleetExhausted(expired, 0.98, { modelLabel: '7d_oi' }), false, 'an expired window is not blocking');
+  const mixed = { accounts: [account({ '7d_oi': { utilization: 1, reset } }), account({})] };
+  assert.equal(isClaudeFleetExhausted(mixed, 0.98, { modelLabel: '7d_oi' }), false, 'an account with that tier free');
+});
+
+async function runFleetModelHandoff({ claudeArgs = [], childEnv }) {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-fleet-model-'));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  const handoffRoot = join(root, 'handoffs');
+  await mkdir(cwd);
+  const calls = [];
+  let codexCalls = 0;
+  const reset = new Date(Date.now() + 3600_000).getTime();
+  try {
+    await runClaudeWithRecovery({
+      claudeArgs,
+      childEnv,
+      config: { autoResumeClaude: true, codexFallbackOnExhaustion: true },
+      cwd,
+      transcriptRoot,
+      handoffRoot,
+      pollIntervalMs: 5,
+      fetchStatus: async () => ({ accounts: [{ enabled: true, quota: {
+        unified5h: 0.2, unified5hReset: reset, unified7d: 0.3, unified7dReset: reset,
+        modelWeekly: { '7d_oi': { utilization: 1, reset } },
+      } }] }),
+      wait: async () => {},
+      spawnClaude(args) {
+        const child = fakeChild();
+        calls.push([...args]);
+        if (calls.length === 1) {
+          const sessionId = args[args.indexOf('--session-id') + 1];
+          setTimeout(async () => {
+            const dir = join(transcriptRoot, 'project');
+            await mkdir(dir, { recursive: true });
+            await writeFile(join(dir, `${sessionId}.jsonl`), `${fleetExhaustedRecord(cwd, 3600)}\n`);
+          }, 10);
+        } else {
+          setTimeout(() => child.finish(0), 10);
+        }
+        return child;
+      },
+      launchCodex: async () => { codexCalls += 1; return { status: 0, signal: null }; },
+      log() {},
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+  return { codexCalls, calls: calls.length };
+}
+
+// A Fable-only shortage across the fleet arrives as a fleet-exhaustion error
+// while general quota remains; with Codex fallback on it must hand off rather
+// than resume into the same exhausted tier. The session model comes from an
+// explicit --model argument first, then ANTHROPIC_MODEL.
+test('fleet exhaustion with only the session model tier full hands off when Codex fallback is on', async () => {
+  for (const [claudeArgs, childEnv] of [
+    [[], { ANTHROPIC_MODEL: 'claude-fable-5' }],
+    [['--model', 'claude-fable-5'], {}],
+    [['--model=claude-fable-5'], { ANTHROPIC_MODEL: 'claude-opus-4-8' }],
+  ]) {
+    assert.deepEqual(await runFleetModelHandoff({ claudeArgs, childEnv }), { codexCalls: 1, calls: 1 },
+      JSON.stringify({ claudeArgs, childEnv }));
+  }
+});
+
+test('a session on another model is not handed off for a Fable-only shortage', async () => {
+  for (const [claudeArgs, childEnv] of [
+    [[], { ANTHROPIC_MODEL: 'claude-opus-4-8' }],
+    [['--model', 'claude-opus-4-8'], { ANTHROPIC_MODEL: 'claude-fable-5' }],
+    [[], {}],
+  ]) {
+    assert.deepEqual(await runFleetModelHandoff({ claudeArgs, childEnv }), { codexCalls: 0, calls: 2 },
+      `the session waits and resumes instead: ${JSON.stringify({ claudeArgs, childEnv })}`);
+  }
+});
