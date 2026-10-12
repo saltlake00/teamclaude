@@ -553,7 +553,8 @@ async function monitorChild({
   const sessionWasKnownAtLaunch = Boolean(sessionId);
   let currentOffset = offset;
   let currentIdentity = null;
-  let pending = '';
+  let pending = Buffer.alloc(0);
+  let skippingOversizedLine = false;
   let unresolvedEvent = null;
   const failureSettleMs = Number.isFinite(pollIntervalMs)
     ? Math.min(1000, Math.max(100, pollIntervalMs))
@@ -592,38 +593,77 @@ async function monitorChild({
       currentPath = null;
       return unresolvedEvent;
     }
-    if (info.size < currentOffset) {
+    // A shrunk file (truncation) or a different file at the same path
+    // (rotation) cannot continue the old offset: read it from the start.
+    if (info.size < currentOffset
+        || (currentIdentity
+          && (info.dev !== currentIdentity.dev || info.ino !== currentIdentity.ino))) {
       currentOffset = 0;
-      pending = '';
+      pending = Buffer.alloc(0);
+      skippingOversizedLine = false;
     }
-    if (info.size === currentOffset && (!final || !pending)) return unresolvedEvent;
+    if (info.size === currentOffset && (!final || pending.length === 0)) {
+      currentIdentity = { dev: info.dev, ino: info.ino };
+      return unresolvedEvent;
+    }
 
-    let chunk = Buffer.alloc(0);
-    if (info.size > currentOffset) {
-      const handle = await open(currentPath, 'r');
-      try {
-        chunk = Buffer.alloc(info.size - currentOffset);
-        await handle.read(chunk, 0, chunk.length, currentOffset);
-      } finally {
-        await handle.close();
-      }
-    }
-    currentOffset = info.size;
-    currentIdentity = { dev: info.dev, ino: info.ino };
-    const lines = (pending + chunk.toString('utf8')).split('\n');
-    pending = final ? '' : lines.pop();
-    for (const line of lines) {
+    const processLine = line => {
       const event = classifyTranscriptLine(line);
       if (event) {
         unresolvedEvent = event;
-        continue;
+        return;
       }
-      if (!unresolvedEvent) continue;
+      if (!unresolvedEvent) return;
       try {
         if (isConversationRecord(JSON.parse(line))) unresolvedEvent = null;
       } catch {
         // A malformed/non-JSON line cannot prove that the API error resolved.
       }
+    };
+    // Read the growth in bounded chunks: a burst of large tool output between
+    // polls must not be allocated in one buffer. Lines are split on raw bytes
+    // so a multi-byte UTF-8 character cut by a chunk boundary stays whole. A
+    // line too large to hold is a real conversation record (API error records
+    // are small), so it resolves a pending error and the rest of it is skipped.
+    if (info.size > currentOffset) {
+      const handle = await open(currentPath, 'r');
+      try {
+        const chunk = Buffer.alloc(TRANSCRIPT_SCAN_CHUNK_BYTES);
+        let position = currentOffset;
+        while (position < info.size) {
+          const { bytesRead } = await handle.read(
+            chunk, 0, Math.min(chunk.length, info.size - position), position,
+          );
+          if (bytesRead === 0) break;
+          position += bytesRead;
+          let data = chunk.subarray(0, bytesRead);
+          if (skippingOversizedLine) {
+            const newline = data.indexOf(10);
+            if (newline === -1) continue;
+            skippingOversizedLine = false;
+            data = data.subarray(newline + 1);
+          }
+          data = Buffer.concat([pending, data]);
+          for (let newline = data.indexOf(10); newline !== -1; newline = data.indexOf(10)) {
+            processLine(data.subarray(0, newline).toString('utf8'));
+            data = data.subarray(newline + 1);
+          }
+          if (data.length > TRANSCRIPT_MAX_LINE_BYTES) {
+            unresolvedEvent = null;
+            skippingOversizedLine = true;
+            data = Buffer.alloc(0);
+          }
+          pending = Buffer.from(data);
+        }
+        currentOffset = position;
+      } finally {
+        await handle.close();
+      }
+    }
+    currentIdentity = { dev: info.dev, ino: info.ino };
+    if (final && pending.length > 0) {
+      processLine(pending.toString('utf8'));
+      pending = Buffer.alloc(0);
     }
     return unresolvedEvent;
   }

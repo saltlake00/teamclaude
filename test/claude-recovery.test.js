@@ -4327,3 +4327,113 @@ test('transcript activity scan fails closed when the file rotates or shrinks mid
   await writeFile(path, errorLine);
   assert.equal(await scan, true, 'shrunk mid-scan');
 });
+
+// A burst of output between two polls is scanned in bounded chunks: an error
+// written after several MiB of tool output is still found, and an oversized
+// record after an error counts as conversation activity (no resume).
+test('the live monitor scans a multi-MiB burst in chunks', async () => {
+  const run = async lines => {
+    const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-burst-'));
+    const cwd = join(root, 'project');
+    const transcriptRoot = join(root, 'transcripts');
+    await mkdir(cwd);
+    const calls = [];
+    await runClaudeWithRecovery({
+      claudeArgs: [],
+      childEnv: {},
+      config: { autoResumeClaude: true, codexFallbackOnExhaustion: false },
+      cwd,
+      transcriptRoot,
+      pollIntervalMs: 5,
+      fetchStatus: async () => statusWithQuota(0.5),
+      wait: async () => {},
+      spawnClaude(args) {
+        const child = fakeChild();
+        calls.push([...args]);
+        if (calls.length === 1) {
+          const sessionId = args[args.indexOf('--session-id') + 1];
+          setTimeout(async () => {
+            const dir = join(transcriptRoot, 'project');
+            await mkdir(dir, { recursive: true });
+            await writeFile(join(dir, `${sessionId}.jsonl`), lines(cwd));
+            setTimeout(() => child.finish(0), 400);
+          }, 10);
+        } else {
+          setTimeout(() => child.finish(0), 10);
+        }
+        return child;
+      },
+      launchCodex: async () => { throw new Error('unexpected Codex handoff'); },
+      log() {},
+    });
+    await rm(root, { recursive: true, force: true });
+    return calls.length;
+  };
+  const note = `${JSON.stringify({ type: 'system', subtype: 'note', content: 'x'.repeat(4096) })}\n`;
+  assert.equal(await run(cwd => `${note.repeat(1500)}${fleetExhaustedRecord(cwd, 3)}\n`), 2,
+    'an error after ~6 MiB of output is detected and resumed');
+  const huge = `${JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: 'y'.repeat(17 * 1024 * 1024) } })}\n`;
+  assert.equal(await run(cwd => `${fleetExhaustedRecord(cwd, 3)}\n${huge}`), 1,
+    'an oversized record after the error resolves it');
+});
+
+// The live transcript monitor must notice that the path now names another
+// file (rotation) and read the new file from its start, not continue at the
+// old file's offset and miss an error written early in the new one.
+test('a transcript rotated while the session runs is rescanned from the start', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-rotated-'));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  await mkdir(cwd);
+  const calls = [];
+
+  await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: {},
+    config: {
+      autoResumeClaude: true,
+      claudeAutoResumeMaxRetries: 1,
+      claudeAutoResumeBackoffMs: 0,
+      codexFallbackOnExhaustion: false,
+    },
+    cwd,
+    transcriptRoot,
+    pollIntervalMs: 5,
+    fetchStatus: async () => statusWithQuota(0.5),
+    wait: async () => {},
+    spawnClaude(args) {
+      const child = fakeChild();
+      calls.push([...args]);
+      if (calls.length === 1) {
+        const sessionId = args[args.indexOf('--session-id') + 1];
+        const dir = join(transcriptRoot, 'project');
+        const path = join(dir, `${sessionId}.jsonl`);
+        const normal = `${normalAssistantRecord(cwd)}\n`;
+        setTimeout(async () => {
+          await mkdir(dir, { recursive: true });
+          await writeFile(path, normal.repeat(20));
+          // Let the monitor consume the first file, then rotate it.
+          setTimeout(async () => {
+            // Atomic swap (no window where the path is missing); the old file
+            // stays linked so its inode cannot be reused. The error is early
+            // in the new file (before the old offset) and only
+            // non-conversation records follow, so it stays unresolved.
+            const note = `${JSON.stringify({ type: 'system', subtype: 'note', content: 'x'.repeat(200) })}\n`;
+            await link(path, `${path}.old`);
+            await writeFile(`${path}.new`, `${fleetExhaustedRecord(cwd, 3)}\n${note.repeat(40)}`);
+            await rename(`${path}.new`, path);
+          }, 60);
+          setTimeout(() => child.finish(0), 400);
+        }, 10);
+      } else {
+        setTimeout(() => child.finish(0), 10);
+      }
+      return child;
+    },
+    launchCodex: async () => { throw new Error('unexpected Codex handoff'); },
+    log() {},
+  });
+
+  assert.equal(calls.length, 2, 'the error early in the rotated file triggered the fleet resume');
+  await rm(root, { recursive: true, force: true });
+});
