@@ -10,6 +10,7 @@ import {
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 import { parseClaudeRecoveryAccount } from './claude-auth.js';
+import { modelQuotaLabel } from './account-manager.js';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -91,12 +92,37 @@ function accountGeneralQuotaBlocked(account, threshold) {
   return false;
 }
 
-export function isClaudeFleetExhausted(status, threshold = 0.98) {
+function modelWindowBlocked(account, label, threshold) {
+  const win = account?.quota?.modelWeekly?.[label];
+  return freshBlocked(win?.utilization, win?.reset, threshold);
+}
+
+// With `modelLabel` (the model-scoped weekly window of the session's model,
+// e.g. the Fable tier), an account that still has general quota but whose
+// window for THAT model is full also counts as exhausted. Callers pass it only
+// when the proxy itself reported that every account is exhausted for the
+// session's request (a fleet-exhaustion error); windows of other models never
+// count, and without a known session model only general quota decides.
+export function isClaudeFleetExhausted(status, threshold = 0.98, { modelLabel = null } = {}) {
   const accounts = Array.isArray(status?.accounts)
     ? status.accounts.filter(account => account?.enabled !== false)
     : [];
   return accounts.length > 0
-    && accounts.every(account => accountGeneralQuotaBlocked(account, threshold));
+    && accounts.every(account => accountGeneralQuotaBlocked(account, threshold)
+      || (typeof modelLabel === 'string' && modelWindowBlocked(account, modelLabel, threshold)));
+}
+
+// The model the session runs with: an explicit --model argument wins over the
+// environment the launcher prepared.
+function sessionModel(claudeArgs, childEnv) {
+  const args = Array.isArray(claudeArgs) ? claudeArgs : [];
+  for (let i = 0; i < args.length; i += 1) {
+    if (args[i] === '--model' && typeof args[i + 1] === 'string') return args[i + 1];
+    if (typeof args[i] === 'string' && args[i].startsWith('--model=')) {
+      return args[i].slice('--model='.length);
+    }
+  }
+  return typeof childEnv?.ANTHROPIC_MODEL === 'string' ? childEnv.ANTHROPIC_MODEL : null;
 }
 
 function textBlocks(content) {
@@ -531,6 +557,9 @@ async function stopChild(child) {
   }
 }
 
+const TRANSCRIPT_SCAN_CHUNK_BYTES = 1024 * 1024;
+const TRANSCRIPT_MAX_LINE_BYTES = 16 * 1024 * 1024;
+
 async function monitorChild({
   child,
   exitPromise = null,
@@ -549,7 +578,9 @@ async function monitorChild({
   let currentSessionId = sessionId;
   const sessionWasKnownAtLaunch = Boolean(sessionId);
   let currentOffset = offset;
-  let pending = '';
+  let currentIdentity = null;
+  let pending = Buffer.alloc(0);
+  let skippingOversizedLine = false;
   let unresolvedEvent = null;
   const failureSettleMs = Number.isFinite(pollIntervalMs)
     ? Math.min(1000, Math.max(100, pollIntervalMs))
@@ -588,37 +619,77 @@ async function monitorChild({
       currentPath = null;
       return unresolvedEvent;
     }
-    if (info.size < currentOffset) {
+    // A shrunk file (truncation) or a different file at the same path
+    // (rotation) cannot continue the old offset: read it from the start.
+    if (info.size < currentOffset
+        || (currentIdentity
+          && (info.dev !== currentIdentity.dev || info.ino !== currentIdentity.ino))) {
       currentOffset = 0;
-      pending = '';
+      pending = Buffer.alloc(0);
+      skippingOversizedLine = false;
     }
-    if (info.size === currentOffset && (!final || !pending)) return unresolvedEvent;
+    if (info.size === currentOffset && (!final || pending.length === 0)) {
+      currentIdentity = { dev: info.dev, ino: info.ino };
+      return unresolvedEvent;
+    }
 
-    let chunk = Buffer.alloc(0);
-    if (info.size > currentOffset) {
-      const handle = await open(currentPath, 'r');
-      try {
-        chunk = Buffer.alloc(info.size - currentOffset);
-        await handle.read(chunk, 0, chunk.length, currentOffset);
-      } finally {
-        await handle.close();
-      }
-    }
-    currentOffset = info.size;
-    const lines = (pending + chunk.toString('utf8')).split('\n');
-    pending = final ? '' : lines.pop();
-    for (const line of lines) {
+    const processLine = line => {
       const event = classifyTranscriptLine(line);
       if (event) {
         unresolvedEvent = event;
-        continue;
+        return;
       }
-      if (!unresolvedEvent) continue;
+      if (!unresolvedEvent) return;
       try {
         if (isConversationRecord(JSON.parse(line))) unresolvedEvent = null;
       } catch {
         // A malformed/non-JSON line cannot prove that the API error resolved.
       }
+    };
+    // Read the growth in bounded chunks: a burst of large tool output between
+    // polls must not be allocated in one buffer. Lines are split on raw bytes
+    // so a multi-byte UTF-8 character cut by a chunk boundary stays whole. A
+    // line too large to hold is a real conversation record (API error records
+    // are small), so it resolves a pending error and the rest of it is skipped.
+    if (info.size > currentOffset) {
+      const handle = await open(currentPath, 'r');
+      try {
+        const chunk = Buffer.alloc(TRANSCRIPT_SCAN_CHUNK_BYTES);
+        let position = currentOffset;
+        while (position < info.size) {
+          const { bytesRead } = await handle.read(
+            chunk, 0, Math.min(chunk.length, info.size - position), position,
+          );
+          if (bytesRead === 0) break;
+          position += bytesRead;
+          let data = chunk.subarray(0, bytesRead);
+          if (skippingOversizedLine) {
+            const newline = data.indexOf(10);
+            if (newline === -1) continue;
+            skippingOversizedLine = false;
+            data = data.subarray(newline + 1);
+          }
+          data = Buffer.concat([pending, data]);
+          for (let newline = data.indexOf(10); newline !== -1; newline = data.indexOf(10)) {
+            processLine(data.subarray(0, newline).toString('utf8'));
+            data = data.subarray(newline + 1);
+          }
+          if (data.length > TRANSCRIPT_MAX_LINE_BYTES) {
+            unresolvedEvent = null;
+            skippingOversizedLine = true;
+            data = Buffer.alloc(0);
+          }
+          pending = Buffer.from(data);
+        }
+        currentOffset = position;
+      } finally {
+        await handle.close();
+      }
+    }
+    currentIdentity = { dev: info.dev, ino: info.ino };
+    if (final && pending.length > 0) {
+      processLine(pending.toString('utf8'));
+      pending = Buffer.alloc(0);
     }
     return unresolvedEvent;
   }
@@ -630,6 +701,7 @@ async function monitorChild({
       transcriptPath: currentPath,
       sessionId: currentSessionId,
       offset: currentOffset,
+      identity: currentIdentity,
     };
   }
 
@@ -663,23 +735,69 @@ async function monitorChild({
   }
 }
 
-async function transcriptHasConversationAfter(path, offset) {
-  if (typeof path !== 'string' || !Number.isFinite(offset) || offset < 0) return false;
-  const info = await stat(path).catch(() => null);
-  if (!info || info.size <= offset) return false;
+// Scan what was appended after `offset` in bounded chunks: a session can keep
+// writing for days while parked, so the tail must never be read in one buffer.
+// A line too large to hold is a real conversation record (API error records are
+// small), so it counts as activity — the safe side against a duplicate resume.
+//
+// Anything that prevents a trustworthy answer counts as activity too, so the
+// caller preserves the session instead of resuming it blind: an unreadable
+// transcript, one that shrank below the recorded offset (truncated/rewritten),
+// or a different file than the one the offset was taken from (rotated).
+export async function transcriptHasConversationAfter(path, offset, expectedIdentity = null) {
+  if (typeof path !== 'string' || !Number.isFinite(offset) || offset < 0) return true;
+  // No size shortcut before opening: a record appended between a size check
+  // and the read would be missed. The read loop below re-checks at EOF.
   const handle = await open(path, 'r').catch(() => null);
-  if (!handle) return false;
+  if (!handle) return true;
+  const opened = await handle.stat().catch(() => null);
+  if (!opened || opened.size < offset
+      || (expectedIdentity
+        && (opened.dev !== expectedIdentity.dev || opened.ino !== expectedIdentity.ino))) {
+    await handle.close();
+    return true;
+  }
+  const isConversationLine = line => {
+    if (line.length === 0) return false;
+    try {
+      return isConversationRecord(JSON.parse(line.toString('utf8')));
+    } catch {
+      return false;
+    }
+  };
   try {
-    const buffer = Buffer.alloc(info.size - offset);
-    await handle.read(buffer, 0, buffer.length, offset);
-    return buffer.toString('utf8').split('\n').some(line => {
-      if (!line) return false;
-      try {
-        return isConversationRecord(JSON.parse(line));
-      } catch {
-        return false;
+    let pending = Buffer.alloc(0);
+    let position = offset;
+    const chunk = Buffer.alloc(TRANSCRIPT_SCAN_CHUNK_BYTES);
+    // Read to the live end of file rather than the size seen at the start:
+    // Claude may append a record while the scan runs, and missing it would
+    // resume a turn that already continued. Stop only when a re-stat at EOF
+    // shows nothing new.
+    for (;;) {
+      const { bytesRead } = await handle.read(chunk, 0, chunk.length, position);
+      if (bytesRead === 0) {
+        // At EOF the path must still name the file being read and must not
+        // have shrunk: a rotation or truncation during the scan means records
+        // may live elsewhere, so the answer is "active" (preserve the session).
+        const [now, atPath] = await Promise.all([
+          handle.stat().catch(() => null),
+          stat(path).catch(() => null),
+        ]);
+        if (!now || !atPath || now.size < position
+            || atPath.dev !== opened.dev || atPath.ino !== opened.ino) return true;
+        if (now.size === position) break;
+        continue;
       }
-    });
+      position += bytesRead;
+      let data = Buffer.concat([pending, chunk.subarray(0, bytesRead)]);
+      for (let newline = data.indexOf(10); newline !== -1; newline = data.indexOf(10)) {
+        if (isConversationLine(data.subarray(0, newline))) return true;
+        data = data.subarray(newline + 1);
+      }
+      if (data.length > TRANSCRIPT_MAX_LINE_BYTES) return true;
+      pending = Buffer.from(data);
+    }
+    return isConversationLine(pending);
   } finally {
     await handle.close();
   }
@@ -1214,7 +1332,11 @@ export async function runClaudeWithRecovery({
     } catch {}
 
     if (config.codexFallbackOnExhaustion === true
-        && isClaudeFleetExhausted(status, config.switchThreshold ?? 0.98)) {
+        && isClaudeFleetExhausted(status, config.switchThreshold ?? 0.98, {
+          modelLabel: outcome.event.kind === 'fleet_exhausted'
+            ? modelQuotaLabel(sessionModel(claudeArgs, nextEnv ?? childEnv))
+            : null,
+        })) {
       if (!(await protectCodexHandoff(sessionId))) {
         log(`[TeamClaude] Could not publish the permanent handoff claim for session ${sessionId}; preserving Claude without a Codex handoff.`);
         return await preserveChild(child);
@@ -1249,7 +1371,7 @@ export async function runClaudeWithRecovery({
       }
       await stopChild(child);
       await wait(waitMs);
-      if (await transcriptHasConversationAfter(transcriptPath, outcome.offset)) {
+      if (await transcriptHasConversationAfter(transcriptPath, outcome.offset, outcome.identity)) {
         await releaseFleetRecoveryClaim();
         log(`[TeamClaude] Session ${sessionId} advanced while waiting; preserving the existing transcript without a duplicate resume.`);
         return await childExit(child);

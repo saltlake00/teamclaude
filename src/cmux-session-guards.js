@@ -42,6 +42,24 @@ function assertSessionId(sessionId) {
   if (!UUID_RE.test(sessionId || '')) throw new Error('Invalid recovery session id.');
 }
 
+// A permanent replay claim is keyed either by the bare session id (the
+// launcher's Codex-handoff claim, or a rescue of an error record without any
+// event identity) or by `<session>@<event>`, where the event is the error
+// record's uuid or its positive millisecond timestamp.
+const CLAIM_EVENT_RE = /^(?:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|[1-9]\d{0,15})$/i;
+
+function assertRecoveryClaimKey(key) {
+  const at = typeof key === 'string' ? key.indexOf('@') : -1;
+  if (at === -1) {
+    assertSessionId(key);
+    return;
+  }
+  assertSessionId(key.slice(0, at));
+  if (!CLAIM_EVENT_RE.test(key.slice(at + 1))) {
+    throw new Error('Invalid recovery claim event.');
+  }
+}
+
 async function openPrivateFile(path) {
   const before = await lstat(path);
   if (!ownedPrivate(before, 'isFile')) throw new Error('Untrusted file.');
@@ -95,17 +113,23 @@ function pathInside(path, root) {
   return rel !== '..' && !rel.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`);
 }
 
+// Only a positive, safe-integer millisecond timestamp anchors a retry
+// deadline. Anything else (missing, negative, fractional, out of range) yields
+// null so the caller falls back to the transcript mtime instead of waiting on
+// a deadline it can never compute.
 function recordTimestampMs(record) {
   const value = record?.timestamp;
+  let ms = null;
   if (typeof value === 'number' && Number.isFinite(value)) {
-    return value > 1e12 ? value : value * 1000;
-  }
-  if (typeof value === 'string' && value.length > 0) {
+    ms = value > 1e12 ? value : value * 1000;
+  } else if (typeof value === 'string' && value.length > 0) {
     const parsed = Date.parse(value);
-    if (Number.isFinite(parsed)) return parsed;
+    if (Number.isFinite(parsed)) ms = parsed;
   }
-  return null;
+  return Number.isSafeInteger(ms) && ms > 0 ? ms : null;
 }
+
+const TAIL_WINDOW_BYTES = 256 * 1024;
 
 async function unresolvedApiError(path, transcriptRoot, sessionId, recoverableKinds) {
   try {
@@ -121,7 +145,20 @@ async function unresolvedApiError(path, transcriptRoot, sessionId, recoverableKi
     const { handle, info } = await openPrivateFile(resolvedPath);
     try {
       if (await realpath(path) !== resolvedPath) return false;
-      const start = Math.max(0, info.size - 256 * 1024);
+      // Read the last 256 KiB. When its start cuts a record, look back at most
+      // another 256 KiB for that record's beginning: an API-error record is
+      // small, so an error cut by the window is always recovered whole. A cut
+      // record longer than that is a conversation record (it would resolve any
+      // earlier error); it is skipped as before, keeping each pass bounded.
+      let start = Math.max(0, info.size - TAIL_WINDOW_BYTES);
+      if (start > 0) {
+        const from = Math.max(0, start - TAIL_WINDOW_BYTES);
+        const probe = Buffer.alloc(start - from);
+        const { bytesRead } = await handle.read(probe, 0, probe.length, from);
+        const newline = probe.subarray(0, bytesRead).lastIndexOf(10);
+        if (newline !== -1) start = from + newline + 1;
+        else if (from === 0) start = 0; // the file's first byte begins a record
+      }
       const buffer = Buffer.alloc(info.size - start);
       await handle.read(buffer, 0, buffer.length, start);
       let blocked = null;
@@ -137,7 +174,15 @@ async function unresolvedApiError(path, transcriptRoot, sessionId, recoverableKi
           blocked = {
             kind: event.kind,
             retryAfterSeconds: event.retryAfterSeconds ?? null,
-            timestampMs: recordTimestampMs(record),
+            // The record's own timestamp and uuid identify this error EVENT
+            // (they key a recovery claim); null when the record has none.
+            eventTimestampMs: recordTimestampMs(record),
+            eventId: typeof record.uuid === 'string' && UUID_RE.test(record.uuid)
+              ? record.uuid
+              : null,
+            // Without a usable record timestamp the transcript mtime anchors
+            // the retry deadline, so recovery is bounded instead of parked.
+            timestampMs: recordTimestampMs(record) ?? Math.floor(info.mtimeMs),
           };
         }
         else if (blocked && isConversationRecord(record)) blocked = null;
@@ -280,7 +325,7 @@ export async function claimSessionOnce(
   sessionId,
   { syncDirectory = handle => handle.sync() } = {},
 ) {
-  assertSessionId(sessionId);
+  assertRecoveryClaimKey(sessionId);
   const claimDir = `${storePath}.recovery-claims`;
   await mkdir(claimDir, { recursive: true, mode: 0o700 });
   const { handle: directoryHandle, info: directoryInfo } =
@@ -344,8 +389,13 @@ export async function claimSessionOnce(
   }
 }
 
-export async function releaseSessionClaim(storePath, sessionId, expectedIdentity = null) {
-  assertSessionId(sessionId);
+export async function releaseSessionClaim(
+  storePath,
+  sessionId,
+  expectedIdentity = null,
+  { afterCheck = null } = {},
+) {
+  assertRecoveryClaimKey(sessionId);
   const claimDir = `${storePath}.recovery-claims`;
   let directoryHandle;
   try {
@@ -358,7 +408,26 @@ export async function releaseSessionClaim(storePath, sessionId, expectedIdentity
     }
     if (expectedIdentity
         && !sameIdentity(claimInfo, expectedIdentity)) return false;
-    await unlink(claimPath);
+    await afterCheck?.();
+    // Detach the claim with an atomic rename to a hidden unique name and
+    // verify what was detached: a claim swapped in after the check above is
+    // put back instead of deleted. If a newer claim already took the name
+    // (EEXIST), the detached one is superseded and only it is removed.
+    const detached = join(claimDir, `.${sessionId}.releasing-${randomUUID()}`);
+    await rename(claimPath, detached);
+    const detachedInfo = await lstat(detached);
+    if (!ownedPrivate(detachedInfo, 'isFile')
+        || (expectedIdentity && !sameIdentity(detachedInfo, expectedIdentity))) {
+      try {
+        await link(detached, claimPath);
+      } catch (err) {
+        if (err.code !== 'EEXIST') throw err;
+      }
+      await unlink(detached);
+      await directoryHandle.sync();
+      return false;
+    }
+    await unlink(detached);
     await directoryHandle.sync();
     return true;
   } catch (err) {
@@ -366,6 +435,21 @@ export async function releaseSessionClaim(storePath, sessionId, expectedIdentity
     throw err;
   } finally {
     await directoryHandle?.close();
+  }
+}
+
+// Whether a permanent session-level claim exists. The launcher writes one when
+// it hands a session to Codex; an event-keyed rescue must honour it so Claude
+// is never replayed after the handoff. Anything but a definitive "absent"
+// throws, and the caller treats that as inconclusive.
+export async function sessionClaimExists(storePath, sessionId) {
+  assertSessionId(sessionId);
+  try {
+    await lstat(join(`${storePath}.recovery-claims`, sessionId));
+    return true;
+  } catch (err) {
+    if (err.code === 'ENOENT') return false;
+    throw err;
   }
 }
 
