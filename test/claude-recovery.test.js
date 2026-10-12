@@ -2912,6 +2912,55 @@ test('unknown or partial quota never triggers a Codex handoff', async () => {
   }, 0.98), false);
 });
 
+// A burst of output between two polls is scanned in bounded chunks: an error
+// written after several MiB of tool output is still found, and an oversized
+// record after an error counts as conversation activity (no resume).
+test('the live monitor scans a multi-MiB burst in chunks', async () => {
+  const run = async lines => {
+    const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-burst-'));
+    const cwd = join(root, 'project');
+    const transcriptRoot = join(root, 'transcripts');
+    await mkdir(cwd);
+    const calls = [];
+    await runClaudeWithRecovery({
+      claudeArgs: [],
+      childEnv: {},
+      config: { autoResumeClaude: true, codexFallbackOnExhaustion: false },
+      cwd,
+      transcriptRoot,
+      pollIntervalMs: 5,
+      fetchStatus: async () => statusWithQuota(0.5),
+      wait: async () => {},
+      spawnClaude(args) {
+        const child = fakeChild();
+        calls.push([...args]);
+        if (calls.length === 1) {
+          const sessionId = args[args.indexOf('--session-id') + 1];
+          setTimeout(async () => {
+            const dir = join(transcriptRoot, 'project');
+            await mkdir(dir, { recursive: true });
+            await writeFile(join(dir, `${sessionId}.jsonl`), lines(cwd));
+            setTimeout(() => child.finish(0), 400);
+          }, 10);
+        } else {
+          setTimeout(() => child.finish(0), 10);
+        }
+        return child;
+      },
+      launchCodex: async () => { throw new Error('unexpected Codex handoff'); },
+      log() {},
+    });
+    await rm(root, { recursive: true, force: true });
+    return calls.length;
+  };
+  const note = `${JSON.stringify({ type: 'system', subtype: 'note', content: 'x'.repeat(4096) })}\n`;
+  assert.equal(await run(cwd => `${note.repeat(1500)}${fleetExhaustedRecord(cwd, 3)}\n`), 2,
+    'an error after ~6 MiB of output is detected and resumed');
+  const huge = `${JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: 'y'.repeat(17 * 1024 * 1024) } })}\n`;
+  assert.equal(await run(cwd => `${fleetExhaustedRecord(cwd, 3)}\n${huge}`), 1,
+    'an oversized record after the error resolves it');
+});
+
 test('model-scoped windows count only when the proxy reported fleet exhaustion', () => {
   const reset = new Date(Date.now() + 3600_000).getTime();
   const status = { accounts: [{ enabled: true, quota: {
