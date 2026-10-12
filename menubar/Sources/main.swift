@@ -3621,6 +3621,9 @@ func currentTeamClaudeConfigPath() -> String {
 
 private func reloadTeamClaudeWorkerAccounts(current: TeamClaudeHealth) -> (TeamClaudeSyncOutcome, TeamClaudeHealth) {
     let configPath = currentTeamClaudeConfigPath()
+    guard teamClaudeConfigPathIsUsable(configPath) else {
+        return (.driftPersists("TEAMCLAUDE_CONFIG가 상대 경로라 서버 설정 파일을 특정할 수 없음"), current)
+    }
     let state = parseTeamClaudeServerState(readTeamClaudeJSON(teamClaudeServerStatePath(configPath: configPath)))
     let launchd = probeTeamClaudeLaunchd()
     let observed = state?.workerPid.flatMap { readTeamClaudeProcessIdentity(pid: $0) }

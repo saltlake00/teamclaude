@@ -225,6 +225,10 @@ struct TeamClaudeServerControlTests {
         precondition(teamClaudeServerStatePath(configPath: "/alt/c.json") == "/alt/c.server.json")
         precondition(teamClaudeServerStatePath(configPath: "/h/.config/teamclaude.json") == "/h/.config/teamclaude.server.json")
 
+        precondition(teamClaudeConfigPathIsUsable("/h/.config/teamclaude.json"))
+        precondition(!teamClaudeConfigPathIsUsable("./config.json"))
+        precondition(!teamClaudeConfigPathIsUsable("config.json"))
+
         print("TeamClaudeServerControlTests: ok")
     }
 }

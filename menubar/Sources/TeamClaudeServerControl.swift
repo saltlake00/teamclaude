@@ -260,6 +260,12 @@ func teamClaudeConfigPath(environment: [String: String], home: String) -> String
     return "\(configDir)/teamclaude.json"
 }
 
+// 상대 경로는 서버 프로세스의 cwd 기준이라 앱이 같은 파일을 가리킨다고 보장할 수 없다.
+// 그런 설정에서는 worker 신호를 보내지 않고 사유만 표시한다.
+func teamClaudeConfigPathIsUsable(_ path: String) -> Bool {
+    path.hasPrefix("/")
+}
+
 func teamClaudeServerStatePath(configPath: String) -> String {
     let base = configPath.hasSuffix(".json") ? String(configPath.dropLast(5)) : configPath
     return base + ".server.json"
