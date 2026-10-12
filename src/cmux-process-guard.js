@@ -92,7 +92,7 @@ async function trustedNativeClaudeExecutable(path) {
 export function isTeamClaudeSupervisor(info) {
   return info?.alive
     && info.supervised !== true
-    && /\/teamcodex\/src\/index\.js\s+run(?:\s|$)/.test(info.command)
+    && /\/src\/(?:index|teamclaude)\.js\s+run(?:\s|$)/.test(info.command)
     && info.environmentValid === true
     && Array.isArray(info.launchArgv)
     && typeof info.launchArgv[0] === 'string'
@@ -139,6 +139,7 @@ async function selectDirectClaudeChild(
   if (knownChild?.pid) rowByPid.set(knownChild.pid, { pid: knownChild.pid });
 
   const candidates = [];
+  let foreignSelector = false;
   for (const row of rowByPid.values()) {
     const child = row.pid === knownChild?.pid
       ? knownChild
@@ -146,6 +147,11 @@ async function selectDirectClaudeChild(
     if (childLooksLikeClaude(child, sessionId)
         && childBelongsToSupervisor(child, supervisor, supervisorPid)) {
       candidates.push(child);
+    } else if (child?.alive
+        && hasSessionSelector(child.command)
+        && typeof selectorFromCommand(child.command, sessionId) !== 'string'
+        && childBelongsToSupervisor(child, supervisor, supervisorPid)) {
+      foreignSelector = true;
     }
   }
 
@@ -156,7 +162,11 @@ async function selectDirectClaudeChild(
   if (selected.length === 1) return { ambiguous: false, child: selected[0] };
 
   const selectorless = candidates.filter(child => !hasSessionSelector(child.command));
-  if (selectorless.length > 1) return { ambiguous: true, child: null };
+  // A sibling naming another session means the supervisor runs more than this
+  // session, so a selectorless child cannot be tied to it.
+  if (selectorless.length > 1 || (selectorless.length === 1 && foreignSelector)) {
+    return { ambiguous: true, child: null };
+  }
   return { ambiguous: false, child: selectorless[0] || null };
 }
 
@@ -214,14 +224,17 @@ export async function inspectClaudeProcess(pid) {
     const agentLaunchKindValues = environmentValues(environmentText, 'CMUX_AGENT_LAUNCH_KIND');
     const executablePath = processCommand.split(/\s+/)[0] || '';
     const launchCwd = environmentValues(environmentText, 'CMUX_AGENT_LAUNCH_CWD')[0] || '';
-    let cwd = environmentValues(environmentText, 'PWD')[0] || launchCwd;
+    // Only the kernel's view of the cwd counts; PWD and the launch cwd in the
+    // environment can be stale or set by anyone, so an unreadable cwd stays
+    // null and identity checks that compare it fail closed.
+    let cwd = null;
     try {
       const { stdout: cwdOutput } = await execFileAsync(
         'lsof',
         ['-a', '-p', String(pid), '-d', 'cwd', '-Fn'],
         { timeout: 1500 },
       );
-      cwd = cwdOutput.split('\n').find(line => line.startsWith('n'))?.slice(1) || cwd;
+      cwd = cwdOutput.split('\n').find(line => line.startsWith('n'))?.slice(1) || null;
     } catch {}
     const launchArgv = launchArgvValues.length === 1
       ? decodeLaunchArgv(launchArgvValues[0])
@@ -258,12 +271,21 @@ export async function inspectClaudeProcess(pid) {
   }
 }
 
+async function processTableRows() {
+  const { stdout } = await execFileAsync('ps', ['-axo', 'pid=,ppid=,command='], {
+    timeout: 2500,
+    env: { ...process.env, LC_ALL: 'C' },
+  });
+  return parseProcessTable(stdout);
+}
+
 export async function inspectClaudeProcessTree(
   pid,
   sessionId,
   {
     inspectProcess = inspectClaudeProcess,
     listDirectChildren = directChildRows,
+    listProcessTable = processTableRows,
   } = {},
 ) {
   if (typeof sessionId !== 'string' || !/^[0-9a-f-]{36}$/i.test(sessionId)) {
@@ -350,11 +372,7 @@ export async function inspectClaudeProcessTree(
     if (directRows.length === 0) throw new Error('No direct child.');
   } catch {}
   try {
-    const { stdout } = await execFileAsync('ps', ['-axo', 'pid=,ppid=,command='], {
-      timeout: 2500,
-      env: { ...process.env, LC_ALL: 'C' },
-    });
-    table = parseProcessTable(stdout);
+    table = await listProcessTable();
   } catch {
     return { alive: false };
   }
@@ -364,31 +382,25 @@ export async function inspectClaudeProcessTree(
     list.push(row);
     childrenByParent.set(row.ppid, list);
   }
-  let queue = [...(childrenByParent.get(pid) || [])];
-  const seen = new Set();
-  while (queue.length > 0 && seen.size < 64) {
-    const row = queue.shift();
-    if (seen.has(row.pid)) continue;
-    seen.add(row.pid);
-    if (selectorFromCommand(row.command, sessionId)) {
-      const child = await inspectProcess(row.pid);
-      if (childLooksLikeClaude(child, sessionId)
-          && child.parentPid === pid
-          && child.surfaceId === supervisor.surfaceId
-          && (!supervisor.teamClaudeBin || child.teamClaudeBin === supervisor.teamClaudeBin)) {
-        return {
-          ...child,
-          processRole: 'teamclaude-child',
-          launcherCommand: supervisor,
-          launcherProcessIdentity: supervisor.processIdentity,
-        };
-      }
-    }
-    const descendants = childrenByParent.get(row.pid) || [];
-    if (descendants.length > 0) {
-      const matching = descendants.filter(child => selectorFromCommand(child.command, sessionId));
-      const remaining = descendants.filter(child => !selectorFromCommand(child.command, sessionId));
-      queue = [...matching, ...queue, ...remaining];
+  // Only a DIRECT child of the supervisor is adopted: `run` spawns the native
+  // Claude binary itself, so a deeper chain (shell, wrapper) is not a session
+  // this supervisor launched and recovering it would act on an unverified PID.
+  // Every direct child is considered (no count cap): only rows that carry the
+  // exact session selector are inspected, so a large process table stays cheap.
+  const directChildren = childrenByParent.get(pid) || [];
+  for (const row of directChildren) {
+    if (!selectorFromCommand(row.command, sessionId)) continue;
+    const child = await inspectProcess(row.pid);
+    if (childLooksLikeClaude(child, sessionId)
+        && child.parentPid === pid
+        && child.surfaceId === supervisor.surfaceId
+        && (!supervisor.teamClaudeBin || child.teamClaudeBin === supervisor.teamClaudeBin)) {
+      return {
+        ...child,
+        processRole: 'teamclaude-child',
+        launcherCommand: supervisor,
+        launcherProcessIdentity: supervisor.processIdentity,
+      };
     }
   }
   return { alive: false };

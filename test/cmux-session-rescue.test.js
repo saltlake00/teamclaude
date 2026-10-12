@@ -2222,3 +2222,226 @@ test('a claim swapped in between the check and the removal is restored, not dele
   assert.deepEqual((await readdir(claimDir)).filter(name => name.includes('releasing')), [],
     'no detached claim is left behind');
 });
+
+// A legacy native process without launch-argv metadata is judged on its ps
+// command alone; it must never throw out of the rescue loop.
+test('legacy native process without launch argv is matched by command and never throws', async t => {
+  const fx = await fixture(t);
+  const native = join(fx.root, 'native-claude');
+  await writeFile(native, '#!/bin/sh\n', { mode: 0o755 });
+  fx.session.launchCommand.executablePath = native;
+  const base = {
+    processRole: 'legacy-native',
+    environmentValid: false,
+    legacyEnvironmentValid: true,
+    executablePath: native,
+    launchArgv: null,
+    nativeExecutableTrusted: true,
+  };
+  for (const command of [
+    `${native} --resume ${SESSION_ID}`,
+    `${native} --session-id ${SESSION_ID}`,
+    `${native} --settings '{}'`,
+  ]) {
+    assert.equal(await sameClaudeProcess(fx.session, processInfo(fx, { ...base, command }), fx.executablePath), true, command);
+  }
+  const other = '00000000-0000-4000-8000-000000000000';
+  assert.equal(
+    await sameClaudeProcess(fx.session, processInfo(fx, { ...base, command: `${native} --resume ${other}` }), fx.executablePath),
+    false,
+  );
+});
+
+// A fleet-exhausted session is parked and later relaunched with --resume, so
+// its process can start hours or days after the registry entry. That window is
+// only safe because identity is still pinned by the exact session selector,
+// the surface, and the expected process identity.
+test('a later relaunch is adopted only while selector, surface and identity still match', async t => {
+  const fx = await fixture(t);
+  const later = fx.session.startedAt + 3 * 24 * 60 * 60;
+  const relaunched = processInfo(fx, { processStartedAt: later });
+  assert.equal(await sameClaudeProcess(fx.session, relaunched, fx.executablePath), true, 'resumed days later');
+
+  const other = '00000000-0000-4000-8000-000000000000';
+  const wrongSelector = processInfo(fx, {
+    processStartedAt: later,
+    command: relaunched.command.replace(SESSION_ID, other),
+    launchArgv: relaunched.launchArgv.map(a => a.replace(SESSION_ID, other)),
+  });
+  assert.equal(await sameClaudeProcess(fx.session, wrongSelector, fx.executablePath), false, 'another session');
+  assert.equal(
+    await sameClaudeProcess(fx.session, { ...relaunched, surfaceId: 'other-surface' }, fx.executablePath),
+    false,
+    'another surface',
+  );
+  assert.equal(
+    await sameClaudeProcess(fx.session, relaunched, fx.executablePath, 'expected-identity-that-differs'),
+    false,
+    'a pinned process identity that differs',
+  );
+  assert.equal(
+    await sameClaudeProcess(fx.session, processInfo(fx, { processStartedAt: fx.session.startedAt + 8 * 24 * 60 * 60 }), fx.executablePath),
+    false,
+    'beyond the 7-day window',
+  );
+});
+
+// The supervisor is recognised by its run entry point wherever it is
+// installed, not by one fixed package directory name.
+test('supervisor detection follows the run entry point across install paths', async () => {
+  const supervisorPid = 54321;
+  const childPid = 54322;
+  const child = {
+    alive: true,
+    command: `/Users/example/.local/share/claude/versions/2.1.289 --resume ${SESSION_ID}`,
+    legacyEnvironmentValid: true,
+    nativeExecutableTrusted: true,
+    supervised: false,
+    surfaceId: SURFACE_ID,
+    parentPid: supervisorPid,
+    teamClaudeBin: '/tmp/teamclaude',
+  };
+  const adopted = async command => (await inspectClaudeProcessTree(childPid, SESSION_ID, {
+    inspectProcess: async pid => pid === childPid ? child : {
+      alive: true,
+      command,
+      environmentValid: true,
+      launchArgv: ['/tmp/teamclaude'],
+      teamClaudeBin: '/tmp/teamclaude',
+      supervised: false,
+      surfaceId: SURFACE_ID,
+    },
+  })).alive;
+  for (const command of [
+    '/usr/bin/node /tmp/teamcodex/src/index.js run -- x',
+    '/usr/bin/node /opt/teamclaude/src/index.js run -- x',
+    '/usr/bin/node /srv/checkout/src/teamclaude.js run',
+    '/opt/homebrew/bin/node /usr/local/lib/node_modules/@karpeleslab/teamclaude/src/index.js run',
+  ]) {
+    assert.equal(await adopted(command), false, `a supervised child is not a legacy native: ${command}`);
+  }
+  for (const command of [
+    '/usr/bin/node /opt/teamclaude/src/index.js status',
+    '/usr/bin/node /srv/other/index.js run',
+    '/usr/bin/node /srv/checkout/src/index.jsx run',
+  ]) {
+    assert.equal(await adopted(command), true, `not a supervisor: ${command}`);
+  }
+});
+
+test('a process whose cwd could not be read is never treated as the session process', async t => {
+  const fx = await fixture(t);
+  assert.equal(await sameClaudeProcess(fx.session, processInfo(fx, { cwd: null }), fx.executablePath), false);
+});
+
+// Only the kernel's view of the cwd counts. When lsof cannot report it, the
+// PWD / launch-cwd values in the (caller-controlled) environment must not stand
+// in, so the identity check fails closed.
+test('process inspection never takes the cwd from the environment', async t => {
+  const binDir = await mkdtemp(join(tmpdir(), 'teamclaude-no-lsof-'));
+  t.after(() => rm(binDir, { recursive: true, force: true }));
+  await symlink('/bin/ps', join(binDir, 'ps'));
+  // A non-platform binary, so `ps eww` shows its (forged) environment.
+  const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], {
+    env: { PWD: '/Users/example/forged', CMUX_AGENT_LAUNCH_CWD: '/Users/example/forged' },
+    stdio: 'ignore',
+  });
+  t.after(() => child.kill('SIGKILL'));
+  await once(child, 'spawn');
+  const originalPath = process.env.PATH;
+  process.env.PATH = binDir;
+  let info;
+  try {
+    info = await inspectClaudeProcess(child.pid);
+  } finally {
+    process.env.PATH = originalPath;
+  }
+  assert.equal(info.alive, true);
+  assert.equal(info.cwd, null, 'no lsof: the cwd is unknown, not PWD');
+});
+
+// The ps fallback must consider every direct child of the supervisor, not
+// only the first few: the session's child may sit anywhere in the table.
+test('the ps fallback finds the session child beyond the first 64 direct children', async () => {
+  const supervisorPid = 54401;
+  const target = { ...selectorlessChildInfo(54401 + 70, supervisorPid) };
+  target.command = `${target.command} --resume ${SESSION_ID}`;
+  target.launchArgv = [...target.launchArgv, '--resume', SESSION_ID];
+  const other = '00000000-0000-4000-8000-000000000000';
+  const table = [];
+  for (let i = 1; i < 70; i += 1) {
+    table.push({ pid: supervisorPid + i, ppid: supervisorPid, command: `/usr/bin/sleep --resume ${other}` });
+  }
+  table.push({ pid: target.pid, ppid: supervisorPid, command: target.command });
+  const result = await inspectClaudeProcessTree(supervisorPid, SESSION_ID, {
+    inspectProcess: async pid => (pid === supervisorPid ? supervisorProcessInfo(supervisorPid)
+      : pid === target.pid ? target : { alive: false }),
+    listDirectChildren: async () => { throw new Error('ps -p argument list too long'); },
+    listProcessTable: async () => table,
+  });
+  assert.equal(result.pid, target.pid);
+});
+
+// The ps fallback adopts only DIRECT children: a matching grandchild behind a
+// shell or wrapper was not launched by this supervisor.
+test('the ps fallback never adopts a grandchild of the supervisor', async () => {
+  const supervisorPid = 54501;
+  const wrapper = { pid: 54502, ppid: supervisorPid, command: '/bin/sh -c claude' };
+  const grandchild = { ...selectorlessChildInfo(54503, wrapper.pid) };
+  grandchild.command = `${grandchild.command} --resume ${SESSION_ID}`;
+  grandchild.launchArgv = [...grandchild.launchArgv, '--resume', SESSION_ID];
+  let inspectedGrandchild = false;
+  const result = await inspectClaudeProcessTree(supervisorPid, SESSION_ID, {
+    inspectProcess: async pid => {
+      if (pid === supervisorPid) return supervisorProcessInfo(supervisorPid);
+      if (pid === grandchild.pid) {
+        inspectedGrandchild = true;
+        return grandchild;
+      }
+      return { alive: false };
+    },
+    listDirectChildren: async () => { throw new Error('pgrep failed'); },
+    listProcessTable: async () => [
+      wrapper,
+      { pid: grandchild.pid, ppid: wrapper.pid, command: grandchild.command },
+    ],
+  });
+  assert.equal(result.alive, false);
+  assert.equal(inspectedGrandchild, false);
+});
+
+// A selectorless child is only the session's process when it is the sole
+// Claude child of the supervisor. A sibling that names ANOTHER session makes
+// the selectorless one ambiguous, entered either from the supervisor or from
+// the registry's child PID.
+test('fails closed when a selectorless child has a sibling naming another session', async () => {
+  const supervisorPid = 54341;
+  const other = '00000000-0000-4000-8000-000000000000';
+  const selectorless = selectorlessChildInfo(54342, supervisorPid, '2.1.289');
+  const foreign = {
+    ...selectorlessChildInfo(54343, supervisorPid, '2.1.290'),
+    command: `${selectorlessChildInfo(54343, supervisorPid, '2.1.290').command} --resume ${other}`,
+  };
+  const processes = new Map([
+    [supervisorPid, supervisorProcessInfo(supervisorPid)],
+    [selectorless.pid, selectorless],
+    [foreign.pid, foreign],
+  ]);
+  const options = {
+    inspectProcess: async pid => processes.get(pid) || { alive: false },
+    listDirectChildren: async () => [
+      { pid: selectorless.pid, command: selectorless.command },
+      { pid: foreign.pid, command: foreign.command },
+    ],
+  };
+  for (const entryPid of [supervisorPid, selectorless.pid]) {
+    const result = await inspectClaudeProcessTree(entryPid, SESSION_ID, options);
+    assert.equal(result.alive, false, `entered from ${entryPid}`);
+  }
+  // Without the foreign sibling the selectorless child is still adopted.
+  const alone = await inspectClaudeProcessTree(supervisorPid, SESSION_ID, {
+    ...options,
+    listDirectChildren: async () => [{ pid: selectorless.pid, command: selectorless.command }],
+  });
+  assert.equal(alone.pid, selectorless.pid);
+});
