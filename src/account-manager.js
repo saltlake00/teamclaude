@@ -1262,21 +1262,18 @@ export class AccountManager {
     // A transport-only park carries no auth evidence, so it is a cooldown like
     // a throttle: it lapses on its own instead of waiting for a restart. This
     // is the path that heals anthropic accounts, which have no usage poll.
-    // Read-only callers (status) treat the lapsed cooldown as healed, exactly
-    // like a lapsed throttle above, without performing the heal.
-    let sendFailureLapsed = false;
-    if (account.status === 'error' && account.errorReason === 'send-failed'
+    // Read-only callers (status) neither perform the heal nor pretend it
+    // happened: the row still says `error`, so it must not also claim
+    // creditBacked (matching _creditPathRecoverable and _isUsableNow). The
+    // next routing pass heals it.
+    if (!readOnly && account.status === 'error' && account.errorReason === 'send-failed'
       && account._errorFromSendFailure === true
       && Date.now() >= (account._sendFailedUntil ?? 0)) {
-      if (readOnly) {
-        sendFailureLapsed = true;
-      } else {
-        this.clearSendFailure(account);
-        console.log(`[TeamClaude] Account "${account.name}" send-failure cooldown expired, marking active`);
-      }
+      this.clearSendFailure(account);
+      console.log(`[TeamClaude] Account "${account.name}" send-failure cooldown expired, marking active`);
     }
 
-    if (account.status === 'exhausted' || (account.status === 'error' && !sendFailureLapsed)) return false;
+    if (account.status === 'exhausted' || account.status === 'error') return false;
     if (this._isModelUnsupported(account, model)) return false;
     // A codex account whose included quota is spent stays routable on its
     // credit balance — but only as the LAST resort: no account anywhere may

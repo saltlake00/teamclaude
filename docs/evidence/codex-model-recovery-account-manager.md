@@ -5,7 +5,7 @@
 고정하고, 검토에 필요한 구간만 원문 그대로 옮겼습니다.
 
 - Source: `src/account-manager.js`
-- SHA-256: `edb3a1ffdaac5c39ce8a8e64ff17156feaa49f58b0a75a1442230b7cc2af196a`
+- SHA-256: `f967d52f99858feda10c3879daa0821ecd44f6015d9de4c85b5ac0f6577f6d20`
 - Source: `src/config.js`
 - SHA-256: `dd982f9cdc909071ae37785d67862b753a99fbbee26da5c373998b2f3e703959`
 - 2026-09-08 갱신: 기본 브랜치 `09de69e`의 두 파일과 아래 발췌 구간을 대조했다.
@@ -35,7 +35,7 @@
 ## Eligibility and bounded TTL quarantine
 
 ```js
-    if (account.status === 'exhausted' || (account.status === 'error' && !sendFailureLapsed)) return false;
+    if (account.status === 'exhausted' || account.status === 'error') return false;
     if (this._isModelUnsupported(account, model)) return false;
     // ...
     if (this._isNearQuota(account, model)

@@ -436,6 +436,22 @@ test('status creditBacked follows routing and never mutates account state', () =
   assert.equal(am.getActiveAccount().name, 'included', 'routing agrees');
 });
 
+test('status never reports an error row as creditBacked (lapsed send-failed cooldown)', () => {
+  const am = pool([{ name: 'oncredit', spent: true, credits: credits(62500) }]);
+  const account = am.accounts[0];
+  am.markSendFailure(account, Date.now() - 10 * 60_000); // cooldown already lapsed
+  assert.equal(account.status, 'error');
+  const row = am.getStatus().accounts[0];
+  assert.equal(row.status, 'error');
+  assert.equal(row.creditBacked, false, 'an error row must not also claim to serve on credits');
+  assert.equal(row.creditBacked, row.creditRecoverable, 'creditBacked and creditRecoverable agree');
+  assert.equal(account.status, 'error', 'reading status must not heal the send-failed park');
+  // Routing still performs the heal and then serves on credits.
+  assert.equal(am.getActiveAccount()?.name, 'oncredit');
+  assert.equal(account.status, 'active');
+  assert.equal(am.getStatus().accounts[0].creditBacked, true);
+});
+
 test('a reset-credit deferral holds credit accounts out of selection', () => {
   const am = pool([{ name: 'oncredit', spent: true, credits: credits(62500) }]);
   let defer = true;
