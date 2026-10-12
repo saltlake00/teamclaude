@@ -926,6 +926,70 @@ test('server: a reset attempt that frees nothing falls through to paid credits i
   }
 });
 
+test('server: a charged reset-credit pass unlocks paid credits even while another account still holds a reset credit', async () => {
+  // Fleet policy, two exhausted accounts that BOTH hold a reset credit and a
+  // paid balance. The first consume fails ambiguously (HTTP 500), which ends
+  // the request's single redemption pass and cools down only that account.
+  // The other account is still reset-eligible, but this request may not
+  // redeem again — so the paid-credit tier must open for it instead of the
+  // request failing fast with a usage-limit 429.
+  const state = { consumed: 0, events: [] };
+  const reset = () => Math.floor(Date.now() / 1000) + 5 * 24 * 3600;
+  const upstream = http.createServer((req, res) => {
+    const who = req.headers.authorization === 'Bearer access-a' ? 'a' : 'b';
+    if (req.url === '/backend-api/wham/rate-limit-reset-credits/consume') {
+      state.consumed++;
+      state.events.push(`consume:${who}`);
+      res.writeHead(500, { 'content-type': 'application/json' });
+      res.end('{"error":{"message":"internal error"}}');
+      return;
+    }
+    if (req.url === '/backend-api/wham/usage') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        rate_limit_reset_credits: { available_count: 1, applicable_available_count: 1 },
+        rate_limit: { allowed: false, limit_reached: true, primary_window: { used_percent: 100, limit_window_seconds: 604800, reset_at: reset() } },
+        credits: { has_credits: true, unlimited: false, overage_limit_reached: false, balance: '62500' },
+      }));
+      return;
+    }
+    state.events.push(`infer:${who}`);
+    res.writeHead(200, {
+      'content-type': 'application/json',
+      'x-codex-primary-used-percent': '100',
+      'x-codex-primary-window-minutes': '10080',
+      'x-codex-primary-reset-at': String(reset()),
+    });
+    res.end(JSON.stringify({ id: 'paid-by-credits', usage: { input_tokens: 1, output_tokens: 1 } }));
+  });
+  const upstreamPort = await listen(upstream);
+  const manager = new AccountManager([codexAccount('a'), codexAccount('b')]);
+  const proxy = createProxyServer(manager, {
+    provider: 'codex',
+    upstream: `http://127.0.0.1:${upstreamPort}/backend-api/codex`,
+    activeWarmup: false,
+    warmupIntervalMs: 0,
+    codexUsageActiveMs: 0,
+    codexResetCredits: true,
+    codexResetCreditsPolicy: 'fleet',
+  });
+  const proxyPort = await listen(proxy);
+  try {
+    await waitFor(() => manager.accounts.every(a => a.quota.codexUsageAt != null));
+    const response = await fetch(`http://127.0.0.1:${proxyPort}/codex/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-5.6', input: [] }),
+    });
+    const body = await response.text();
+    assert.equal(response.status, 200, body);
+    assert.equal(state.consumed, 1, 'exactly one redemption attempt per request');
+    assert.equal(state.events.filter(e => e.startsWith('infer:')).length, 1, `served on credits: ${state.events.join(',')}`);
+  } finally {
+    await Promise.all([closeServer(proxy), closeServer(upstream)]);
+  }
+});
+
 // ── CLI status and TUI ──────────────────────────────────────────────────────
 
 const entry = fileURLToPath(new URL('../src/index.js', import.meta.url));

@@ -348,8 +348,10 @@ export class AccountManager {
       return warmup;
     }
 
-    if (!this._isAvailable(current, model)) {
-      const best = this._selectBest(null, model);
+    // `scope` still reaches the credit gate on this no-exclusion path: it is
+    // empty here but may carry request state (a charged reset-credit pass).
+    if (!this._isAvailable(current, model, { scope })) {
+      const best = this._selectBest(null, model, scope);
       if (best) {
         if (best.index !== this.currentIndex) {
           console.log(`[TeamClaude] Switched to account "${best.name}" (current unavailable)`);
@@ -366,7 +368,7 @@ export class AccountManager {
     // failover — no timer-driven switching.
     if (this.reevalIntervalMs > 0 && now - this.lastEvalAt >= this.reevalIntervalMs) {
       this.lastEvalAt = now;
-      const best = this._selectBest(null, model);
+      const best = this._selectBest(null, model, scope);
       if (best && best.index !== this.currentIndex) {
         console.log(`[TeamClaude] Re-prioritized to account "${best.name}" (weekly reset soonest)`);
         this.currentIndex = best.index;
@@ -379,7 +381,7 @@ export class AccountManager {
     // to an unknown-quota account — so a cold-start burst stays spread even
     // after per-account warm-up attempts are exhausted.
     if (!this._isMeasured(current)) {
-      const best = this._selectBest(null, model);
+      const best = this._selectBest(null, model, scope);
       if (best) {
         this.currentIndex = best.index;
         return best;

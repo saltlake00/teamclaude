@@ -107,6 +107,17 @@ function requestUpstreamRaw(url, { method, headers, body, signal }) {
   });
 }
 
+// Request-scoped credit-gate scope (a Set of accounts this request may not
+// use) that also records whether the request's single reset-credit pass is
+// already charged. AccountManager only reads it through `has()`; the flag is
+// consumed by the server-installed creditDeferral.
+class CreditScope extends Set {
+  constructor(items, { resetCreditsSpent = false } = {}) {
+    super(items || []);
+    this.resetCreditsSpent = resetCreditsSpent;
+  }
+}
+
 // Credit-refusal evidence lives in the 429 body, which the codex path keeps
 // as raw (possibly gzip/br) bytes for the client. Inspect a bounded, decoded
 // COPY under the auxiliary memory budget; an undecodable or oversized body is
@@ -956,9 +967,12 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   accountManager.creditDeferral = accountManager.codexUseCredits && resetCredits.enabled
     // `scope` = accounts this request may not use; their reset credits cannot
     // serve it, so they must not defer it either.
-    ? (model, scope = null) => rankCodexResetCreditCandidates(
-      accountManager.accounts.filter(a => !(scope && scope.has(a))),
-      resetCreditEligibilityOptions(model)).length > 0
+    // A request whose reset-credit pass is already charged cannot redeem
+    // again, so nothing is left to defer to.
+    ? (model, scope = null) => scope?.resetCreditsSpent !== true
+      && rankCodexResetCreditCandidates(
+        accountManager.accounts.filter(a => !(scope && scope.has(a))),
+        resetCreditEligibilityOptions(model)).length > 0
     : null;
   // Auto-quarantine (codex): consecutive terminal (401/403) auth failures on
   // the wham/usage poll before the proxy escalates to a forced token refresh
@@ -3045,7 +3059,14 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   // all (credential-type filter, auth-failed). Accounts merely TRIED by this
   // request (transient 429 / 5xx) keep their included quota, so they still
   // hold the request off paid credits — it retries/waits instead.
-  const creditScope = () => requestExclusions(ctx.auth401);
+  // Once this request has charged its single reset-credit pass (fleet or
+  // account policy), no further redemption can serve it, so a reset credit
+  // still held by another account must not keep it off paid credits: the
+  // scope carries that fact to the creditDeferral check.
+  const creditScope = () => {
+    const scope = requestExclusions(ctx.auth401);
+    return ctx.resetCreditAttempts >= 1 ? new CreditScope(scope, { resetCreditsSpent: true }) : scope;
+  };
   const hasUsable = extra => accountManager.anyUsable(requestExclusions(extra), ctx.model, creditScope());
   const hasCapped = extra => accountManager.anyCapped(requestExclusions(extra), ctx.model, creditScope());
   // An account that already answered 401 to THIS request is auth-failed FOR this
