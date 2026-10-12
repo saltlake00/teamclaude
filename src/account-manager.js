@@ -2,6 +2,13 @@ import { refreshAccessToken, isTokenExpiringSoon, normalizeExpiresAt } from './o
 import { refreshCodexAccessToken } from './codex.js';
 import { parseCodexResetCreditsAvailable, withinCodexResetCreditGrace } from './codex-reset-credits.js';
 import {
+  CODEX_CREDIT_BALANCE_BUCKET,
+  DEFAULT_CODEX_CREDIT_REFUSAL_MS,
+  codexCreditsUsable,
+  normalizeCodexCredits,
+  parseCodexCredits,
+} from './codex-credits.js';
+import {
   cancellationIsDue,
   normalizeSubscriptionCancellation,
   subscriptionSnapshot,
@@ -112,6 +119,12 @@ function emptyQuota() {
     codexResetCreditLastOutcome: null,  // pending (consume POST in flight / died mid-flight — fail-closed until a poll re-reads the count) | reset | reset_no_windows | nothing_to_reset | no_credit | already_redeemed | http_<n> | timeout | error
     codexResetCreditsConsumed: 0,       // credits spent (reset or reset_no_windows) this snapshot lineage
     codexResetCreditResetAt: null,      // ms timestamp of the last EFFECTIVE reset (grace window + stale-response fence)
+    // Codex credits balance (paid usage after the plan's included limits):
+    // { balance, hasCredits, unlimited, overageLimitReached } from the last
+    // wham/usage apply, or null when unknown. Persisted with the snapshot;
+    // drives credit-backed routing (see AccountManager._creditRoutable).
+    codexCredits: null,
+    codexCreditsAt: null,               // ms timestamp of the balance above
     // Model-scoped weekly windows, keyed by header window label — e.g. `7d_oi`,
     // the separate weekly limit for the top model tier shown as "Fable" in
     // Claude's usage UI. Parsed generically from
@@ -242,6 +255,16 @@ export class AccountManager {
     });
     this.currentIndex = 0;
     this.switchThreshold = switchThreshold;
+    // Codex credit-backed routing: a codex account whose included quota is
+    // spent but that still has a credit balance stays routable, ranked after
+    // every account with included quota left. The server sets this from
+    // `config.codexUseCredits` (default on in codex mode); Anthropic accounts
+    // are never affected.
+    this.codexUseCredits = true;
+    // (model) => boolean, installed by the server when automatic reset credits
+    // are on: true while a free reset-credit redemption is possible, which
+    // keeps paid-credit accounts out of selection until that path has run.
+    this.creditDeferral = null;
     // Announce the reserve once at startup. A typo like `"session": 40` or
     // `"session": "0.4"` normalizes to null and silently protects nothing, which
     // looks identical to a working reserve from the outside — so say plainly
@@ -297,7 +320,7 @@ export class AccountManager {
    * otherwise be wasted) is consumed first, starting with the scarcer weekly
    * window. Returns null if every account is exhausted.
    */
-  getActiveAccount(exclude = null, model = null) {
+  getActiveAccount(exclude = null, model = null, scope = exclude) {
     const now = Date.now();
 
     // Per-request failover: a prior account already returned a non-quota 429
@@ -306,7 +329,7 @@ export class AccountManager {
     // — this diverts only the overflow of one request; steady-state selection
     // still prefers the use-or-lose primary, keeping its prompt cache warm.
     // Returns null once every available account has been tried this request.
-    if (exclude && exclude.size) return this._selectBest(exclude, model);
+    if (exclude && exclude.size) return this._selectBest(exclude, model, scope);
 
     const current = this.accounts[this.currentIndex];
 
@@ -435,31 +458,36 @@ export class AccountManager {
    * re-index, so an exclude/capped set captured before the request awaits
    * upstream can't later point at the wrong account.
    */
-  _cappedSet(exclude = null, model = null) {
+  _cappedSet(exclude = null, model = null, creditScope = exclude) {
     const capped = new Set();
     for (const a of this.accounts) {
       if (exclude && exclude.has(a)) continue;
-      if (this._isAvailable(a, model) && !this._hasCapacity(a)) capped.add(a);
+      if (this._isAvailable(a, model, { scope: creditScope }) && !this._hasCapacity(a)) capped.add(a);
     }
     return capped;
   }
 
   /**
-   * Is there an available account with a free slot (not excluded)? Non-mutating. (`exclude` = Set of account objects.)
+   * Is there an available account with a free slot (not excluded)? Non-mutating.
+   * (`exclude` = Set of account objects.) `creditScope` = the accounts that
+   * cannot serve this request at all (credential-type filter, auth-failed);
+   * it gates the paid-credit tier and defaults to `exclude`. A caller whose
+   * `exclude` also holds merely-TRIED accounts passes a narrower creditScope
+   * so a transient failure on an included account never unlocks credits.
    * Grace-eligible accounts count too, under the same rule _tryAcquire uses to
    * hand them out: only while no normal account is merely capped (that request
    * queues for the normal slot instead).
    */
-  anyUsable(exclude = null, model = null) {
+  anyUsable(exclude = null, model = null, creditScope = exclude) {
     return this.accounts.some(a =>
-      this._isAvailable(a, model) && this._hasCapacity(a) && !(exclude && exclude.has(a)))
-      || (this._cappedSet(exclude, model).size === 0 && this._anyGrace(exclude, model, true));
+      this._isAvailable(a, model, { scope: creditScope }) && this._hasCapacity(a) && !(exclude && exclude.has(a)))
+      || (this._cappedSet(exclude, model, creditScope).size === 0 && this._anyGrace(exclude, model, true));
   }
 
   /** Is there an available-but-capped account (not excluded)? A freed slot could serve it. (`exclude` = Set of account objects.) Includes capped grace accounts. */
-  anyCapped(exclude = null, model = null) {
+  anyCapped(exclude = null, model = null, creditScope = exclude) {
     return this.accounts.some(a =>
-      this._isAvailable(a, model) && !this._hasCapacity(a) && !(exclude && exclude.has(a)))
+      this._isAvailable(a, model, { scope: creditScope }) && !this._hasCapacity(a) && !(exclude && exclude.has(a)))
       || this._anyGrace(exclude, model, false);
   }
 
@@ -484,6 +512,7 @@ export class AccountManager {
     affinityKey = null,
     model = null,
     preferredAccountUuid = null,
+    creditScope = exclude,
   ) {
     // Only an object/function is a valid WeakMap key. Ignore anything else (a
     // primitive key from an external caller would otherwise throw on get/set).
@@ -494,7 +523,7 @@ export class AccountManager {
       const preferred = this.accounts.find(
         account => account.accountUuid === preferredAccountUuid,
       );
-      if (!preferred || !this._isAvailable(preferred, model)
+      if (!preferred || !this._isAvailable(preferred, model, { scope: creditScope })
           || (exclude && exclude.has(preferred)) || !this._hasCapacity(preferred)) {
         return null;
       }
@@ -521,14 +550,14 @@ export class AccountManager {
       // spreading to gather quota data / let tokens refresh on use). Once an
       // account returns rate-limit headers (every real Anthropic response does),
       // affinity engages normally.
-      if (a && this.accounts[a.index] === a && this._isMeasured(a) && this._isAvailable(a, model)
+      if (a && this.accounts[a.index] === a && this._isMeasured(a) && this._isAvailable(a, model, { scope: creditScope })
           && this._hasCapacity(a) && !(exclude && exclude.has(a)) && !this._isAvoided(a)) {
         a.inflight++;
         return a;
       }
     }
 
-    const capped = this._cappedSet(exclude, model);
+    const capped = this._cappedSet(exclude, model, creditScope);
     const pick = extra => {
       const eff = ((exclude && exclude.size) || capped.size || (extra && extra.size))
         ? new Set([...(exclude || []), ...capped, ...(extra || [])])
@@ -536,8 +565,11 @@ export class AccountManager {
       // eff === null → full sticky / warm-up path (cold start, nothing capped).
       // eff set → getActiveAccount routes to _selectBest(eff), which already skips
       // every excluded + capped (+ avoided) account.
-      const account = eff ? this.getActiveAccount(eff, model) : this.getActiveAccount(null, model);
-      if (account && this._isAvailable(account, model) && this._hasCapacity(account)
+      // `creditScope` (not eff) is the credit-gate scope: a capped or merely
+      // tried included account still blocks the credit tier (the request
+      // waits / retries), an account this request cannot use at all does not.
+      const account = eff ? this.getActiveAccount(eff, model, creditScope) : this.getActiveAccount(null, model, creditScope);
+      if (account && this._isAvailable(account, model, { scope: creditScope }) && this._hasCapacity(account)
           && !(eff && eff.has(account))) return account;
       return null;
     };
@@ -560,7 +592,8 @@ export class AccountManager {
       if (affOk) {
         const home = this._affinity.get(affinityKey);
         const homeUsable = home && this.accounts[home.index] === home
-          && this._isAvailable(home, model) && !this._isAvoided(home);
+          && this._isAvailable(home, model) && !this._isAvoided(home)
+          && !(this._isCreditBacked(home, model) && !this._isCreditBacked(account, model));
         if (!homeUsable) this._affinity.set(affinityKey, account);
       }
       return account;
@@ -747,6 +780,7 @@ export class AccountManager {
     affinityKey = null,
     model = null,
     preferredAccountUuid = null,
+    creditScope = exclude,
   ) {
     if (signal?.aborted) return null;
     const account = this._tryAcquire(
@@ -754,6 +788,7 @@ export class AccountManager {
       affinityKey,
       model,
       preferredAccountUuid,
+      creditScope,
     );
     if (account) return account;
     // Queue only when the blockage is cap-saturation (a slot WILL free as
@@ -764,8 +799,8 @@ export class AccountManager {
       ? this.accounts.find(account => account.accountUuid === preferredAccountUuid)
       : null;
     const canQueue = preferredAccountUuid == null
-      ? this.anyCapped(exclude, model)
-      : preferred && this._isAvailable(preferred, model)
+      ? this.anyCapped(exclude, model, creditScope)
+      : preferred && this._isAvailable(preferred, model, { scope: creditScope })
         && !this._hasCapacity(preferred) && !(exclude && exclude.has(preferred));
     if (timeoutMs <= 0 || !canQueue || this.isQueueFull()) return null;
     return this._enqueue(
@@ -775,6 +810,7 @@ export class AccountManager {
       affinityKey,
       model,
       preferredAccountUuid,
+      creditScope,
     );
   }
 
@@ -810,10 +846,12 @@ export class AccountManager {
     affinityKey = null,
     model = null,
     preferredAccountUuid = null,
+    creditScope = exclude,
   ) {
     return new Promise(resolve => {
       const waiter = {
         exclude,
+        creditScope,
         resolve,
         done: false,
         timer: null,
@@ -870,6 +908,7 @@ export class AccountManager {
         waiter.affinityKey,
         waiter.model,
         waiter.preferredAccountUuid,
+        waiter.creditScope,
       );
       if (account) {
         // _settleWaiter splices the waiter out, so don't advance i. If it was
@@ -888,8 +927,8 @@ export class AccountManager {
         ? this.accounts.find(account => account.accountUuid === waiter.preferredAccountUuid)
         : null;
       const canWait = waiter.preferredAccountUuid == null
-        ? this.anyCapped(waiter.exclude, waiter.model)
-        : preferred && this._isAvailable(preferred, waiter.model)
+        ? this.anyCapped(waiter.exclude, waiter.model, waiter.creditScope)
+        : preferred && this._isAvailable(preferred, waiter.model, { scope: waiter.creditScope })
           && !this._hasCapacity(preferred)
           && !(waiter.exclude && waiter.exclude.has(preferred));
       if (!canWait) { this._settleWaiter(waiter, null); continue; }
@@ -908,15 +947,25 @@ export class AccountManager {
    * accounts are skipped, and when nothing else is eligible this returns null
    * (instead of recovering one) so the caller can pass the 429 through.
    */
-  _selectBest(exclude = null, model = null) {
+  _selectBest(exclude = null, model = null, scope = exclude) {
     const has = a => (exclude ? exclude.has(a) : false);
-    const eligible = this.accounts.filter(a => this._isAvailable(a, model) && !has(a));
+    const eligible = this.accounts.filter(a => this._isAvailable(a, model, { scope }) && !has(a));
     if (eligible.length === 0) return exclude ? null : this._recoverSoonest(model);
 
+    // Included quota always outranks credits (tier 0 before 1), even an
+    // explicit priority: credits are paid and valid for months, included
+    // quota renews on a window and is lost if unused. Within the credit tier
+    // the largest (bucketed) balance drains first so the pool depletes evenly.
+    const tier = new Map(eligible.map(a => [a, this._creditTier(a, model, scope)]));
+    const creditRank = a => (tier.get(a) === 1 ? this._creditRank(a) : 0);
     eligible.sort((a, b) => {
+      const ta = tier.get(a), tb = tier.get(b);
+      if (ta !== tb) return ta - tb;                                     // included quota before credits
       const pa = this._priority(a);
       const pb = this._priority(b);
       if (pa !== pb) return pa - pb;                                     // explicit priority first (lower = preferred)
+      const ca = creditRank(a), cb = creditRank(b);
+      if (ca !== cb) return ca < cb ? -1 : 1;                            // credit tier: larger balance first
       return this.autoCompare(a, b);                                     // then the automatic use-or-lose order
     });
 
@@ -924,12 +973,16 @@ export class AccountManager {
     // sharing one priority) are load-balanced round-robin instead of always
     // pinning to the lowest index, so a startup burst can't pile onto one account
     // before quotas are known.
+    const t0 = tier.get(eligible[0]);
+    const c0 = creditRank(eligible[0]);
     const p0 = this._priority(eligible[0]);
     const w0 = this._weeklyResetTime(eligible[0]);
     const r0 = this._sessionResetTime(eligible[0]);
     const u0 = this._sessionUtilization(eligible[0]);
     const tied = eligible
-      .filter(a => this._priority(a) === p0
+      .filter(a => tier.get(a) === t0
+        && creditRank(a) === c0
+        && this._priority(a) === p0
         && this._weeklyResetTime(a) === w0
         && this._sessionResetTime(a) === r0
         && this._sessionUtilization(a) === u0)
@@ -1182,7 +1235,7 @@ export class AccountManager {
         || Date.now() - (a._lastFruitlessProbeAt || 0) >= this.probeRetryAfterMs));
   }
 
-  _isAvailable(account, model = null) {
+  _isAvailable(account, model = null, { allowCredits = true, scope = null, readOnly = false } = {}) {
     if (!account) return false;
 
     // Manually disabled accounts are out of rotation entirely. This single gate
@@ -1195,24 +1248,43 @@ export class AccountManager {
     // Check rate limit expiry
     if (account.status === 'throttled' && account.rateLimitedUntil) {
       if (Date.now() < account.rateLimitedUntil) return false;
-      account.status = 'active';
-      account.rateLimitedUntil = null;
-      console.log(`[TeamClaude] Account "${account.name}" rate limit expired, marking active`);
+      // Read-only callers (status) treat the lapsed throttle as healed, which
+      // is what routing would do, without performing the heal.
+      if (!readOnly) {
+        account.status = 'active';
+        account.rateLimitedUntil = null;
+        console.log(`[TeamClaude] Account "${account.name}" rate limit expired, marking active`);
+      }
     }
 
     // A transport-only park carries no auth evidence, so it is a cooldown like
     // a throttle: it lapses on its own instead of waiting for a restart. This
     // is the path that heals anthropic accounts, which have no usage poll.
+    // Read-only callers (status) treat the lapsed cooldown as healed, exactly
+    // like a lapsed throttle above, without performing the heal.
+    let sendFailureLapsed = false;
     if (account.status === 'error' && account.errorReason === 'send-failed'
       && account._errorFromSendFailure === true
       && Date.now() >= (account._sendFailedUntil ?? 0)) {
-      this.clearSendFailure(account);
-      console.log(`[TeamClaude] Account "${account.name}" send-failure cooldown expired, marking active`);
+      if (readOnly) {
+        sendFailureLapsed = true;
+      } else {
+        this.clearSendFailure(account);
+        console.log(`[TeamClaude] Account "${account.name}" send-failure cooldown expired, marking active`);
+      }
     }
 
-    if (account.status === 'exhausted' || account.status === 'error') return false;
+    if (account.status === 'exhausted' || (account.status === 'error' && !sendFailureLapsed)) return false;
     if (this._isModelUnsupported(account, model)) return false;
-    if (this._isNearQuota(account, model)) return false;
+    // A codex account whose included quota is spent stays routable on its
+    // credit balance — but only as the LAST resort: no account anywhere may
+    // have included quota left (busy-at-cap still counts as "left", so the
+    // request queues for it), and no free reset credit may be redeemable.
+    if (this._isNearQuota(account, model)
+        && !(allowCredits && this._creditRoutable(account, readOnly)
+          && this._creditsUnlocked(model, scope, readOnly))) {
+      return false;
+    }
 
     // The reserved account stays IN rotation (unlike `enabled: false`) but stops
     // accepting new inference once it crosses its ceiling, so the credential
@@ -1220,10 +1292,10 @@ export class AccountManager {
     // leaves that predicate — and every usableCount assertion built on it —
     // meaning exactly what it meant before.
     if (this._isReserveExceeded(account)) {
-      this._noteReserveState(account, true);
+      if (!readOnly) this._noteReserveState(account, true);
       return false;
     }
-    this._noteReserveState(account, false);
+    if (!readOnly) this._noteReserveState(account, false);
 
     return true;
   }
@@ -1333,6 +1405,103 @@ export class AccountManager {
     const account = this._resolve(accountIndex);
     if (!account || typeof model !== 'string' || !model) return false;
     return account.unsupportedModels.delete(model);
+  }
+
+  // ── Codex credits ──────────────────────────────────────────────────────────
+
+  /**
+   * Could this account be served on its credit balance right now? Codex only,
+   * flag on, a usable balance (codexCreditsUsable), and no recent refusal.
+   * Says nothing about included quota — see _isCreditBacked for that.
+   */
+  _creditRoutable(account, readOnly = false) {
+    if (!this.codexUseCredits || account.provider !== 'codex') return false;
+    if (account._creditRefusedUntil != null) {
+      if (Date.now() < account._creditRefusedUntil) return false;
+      if (!readOnly) account._creditRefusedUntil = null;
+    }
+    return codexCreditsUsable(account.quota.codexCredits);
+  }
+
+  /** Included quota spent and currently routable on credits (fleet gate included). */
+  _isCreditBacked(account, model = null, scope = null) {
+    return this._isNearQuota(account, model) && this._creditRoutable(account)
+      && this._creditsUnlocked(model, scope);
+  }
+
+  /** Public form for server.js / TUI: is this account currently on credits? */
+  isCreditBacked(accountOrIndex, model = null, scope = null) {
+    const account = this._resolve(accountOrIndex);
+    return Boolean(account) && this._isCreditBacked(account, model, scope);
+  }
+
+  /**
+   * Would a dispatch to this account right now be served on credits (included
+   * quota spent, usable balance)? Recorded per request by the server at
+   * dispatch time — selection already applied the fleet gate.
+   */
+  routedOnCredits(accountOrIndex, model = null) {
+    const account = this._resolve(accountOrIndex);
+    return Boolean(account) && this._isNearQuota(account, model) && this._creditRoutable(account);
+  }
+
+  /** 0 = included quota (preferred), 1 = credit-backed. */
+  _creditTier(account, model = null, scope = null) {
+    return this._isCreditBacked(account, model, scope) ? 1 : 0;
+  }
+
+  /** Larger balance ranks first within the credit tier (bucketed, see codex-credits.js). */
+  _creditRank(account) {
+    const c = account.quota.codexCredits;
+    if (c?.unlimited === true) return -Infinity;
+    return Number.isFinite(c?.balance) ? -Math.floor(c.balance / CODEX_CREDIT_BALANCE_BUCKET) : 0;
+  }
+
+  /**
+   * Does ANY account still have included quota it could serve this model on?
+   * Capacity is deliberately ignored: an included account that is merely at
+   * its concurrency cap still counts, so overflow waits in the queue for it
+   * instead of spilling onto paid credits. Uses the credit-free availability
+   * check, so it never recurses into the credit path. `scope` (a Set) holds
+   * accounts THIS request may not use (credential-type filter, already
+   * tried/failed): their included quota cannot serve it, so it must not hold
+   * the request away from credits.
+   */
+  _anyIncludedAvailable(model = null, scope = null, readOnly = false) {
+    return this.accounts.some(a => !(scope && scope.has(a))
+      && this._isAvailable(a, model, { allowCredits: false, readOnly }));
+  }
+
+  /**
+   * Paid credits are the last tier: included quota → free reset credits →
+   * credits. The server installs `creditDeferral(model)` (true while an
+   * automatic reset-credit redemption is possible); while it holds, credit
+   * accounts stay unavailable so the request reaches the reset-credit dead
+   * end first.
+   */
+  _creditsDeferredToResetCredits(model = null, scope = null) {
+    return typeof this.creditDeferral === 'function' && this.creditDeferral(model, scope) === true;
+  }
+
+  _creditsUnlocked(model = null, scope = null, readOnly = false) {
+    return !this._anyIncludedAvailable(model, scope, readOnly)
+      && !this._creditsDeferredToResetCredits(model, scope);
+  }
+
+  /**
+   * The backend answered a credit-backed account with a genuine limit 429:
+   * it did not draw credits for this request. Hold the account off the credit
+   * tier for `holdMs` so the normal throttle → switch path applies and the
+   * account is not retried every throttle window. In-memory only. Returns
+   * whether the account was credit-backed (and therefore marked).
+   */
+  noteCreditRefusal(accountOrIndex, holdMs = DEFAULT_CODEX_CREDIT_REFUSAL_MS, model = null) {
+    const account = this._resolve(accountOrIndex);
+    if (!account || !this.routedOnCredits(account, model)) return false;
+    const ms = Number.isFinite(holdMs) && holdMs > 0 ? holdMs : DEFAULT_CODEX_CREDIT_REFUSAL_MS;
+    account._creditRefusedUntil = Date.now() + ms;
+    console.log(`[TeamCodex] Account "${account.name}" was refused on credits (limit 429) — holding it off the credit tier for ${Math.round(ms / 1000)}s`);
+    return true;
   }
 
   _isNearQuota(account, model = null) {
@@ -1572,8 +1741,9 @@ export class AccountManager {
     account.usage.totalRequests++;
     account.usage.lastUsed = new Date().toISOString();
 
-    // Log when approaching quota
-    if (this._isNearQuota(account)) {
+    // Log when approaching quota. A credit-backed account keeps serving past
+    // its included limit, so "will switch" would be false (and per-request noise).
+    if (this._isNearQuota(account) && !this._creditRoutable(account)) {
       const pct = account.quota.unified7d != null
         ? (account.quota.unified7d * 100).toFixed(1)
         : account.quota.unified5h != null
@@ -1601,6 +1771,10 @@ export class AccountManager {
     // the automatic redemption stays off until the backend reports a count.
     account.quota.codexResetCredits = parseCodexResetCreditsAvailable(payload);
     account.quota.codexResetCreditsAt = account.quota.codexUsageAt;
+    // Credits balance rides on the same payload. Absent → null: credit-backed
+    // routing stays off for the account until the backend reports a balance.
+    account.quota.codexCredits = parseCodexCredits(payload);
+    account.quota.codexCreditsAt = account.quota.codexUsageAt;
 
     const limits = [];
     if (payload.rate_limit && typeof payload.rate_limit === 'object') {
@@ -2365,8 +2539,14 @@ export class AccountManager {
    * when they rank equal (a tie).
    */
   _strictlyPrefer(a, b) {
+    const ta = this._creditTier(a), tb = this._creditTier(b);
+    if (ta !== tb) return ta < tb;
     const pa = this._priority(a), pb = this._priority(b);
     if (pa !== pb) return pa < pb;
+    if (ta === 1) {
+      const ca = this._creditRank(a), cb = this._creditRank(b);
+      if (ca !== cb) return ca < cb;
+    }
     const wa = this._weeklyResetTime(a), wb = this._weeklyResetTime(b);
     if (wa !== wb) return wa < wb;
     const ra = this._sessionResetTime(a), rb = this._sessionResetTime(b);
@@ -2387,6 +2567,7 @@ export class AccountManager {
       quota: {
         ...a.quota,
         modelWeekly: {},
+        codexCredits: a.quota.codexCredits ? { ...a.quota.codexCredits } : null,
       },
       rateLimitedUntil: a.rateLimitedUntil,
       usage: { ...a.usage },
@@ -2430,6 +2611,10 @@ export class AccountManager {
           // Restoring it can pre-empt the very request needed to refresh it, so
           // always re-measure model windows after a restart.
           modelWeekly: {},
+          // Sanitize: a hand-edited or older snapshot must not smuggle a
+          // non-boolean flag or a string balance into routing.
+          codexCredits: normalizeCodexCredits(s.quota.codexCredits),
+          codexCreditsAt: Number.isFinite(s.quota.codexCreditsAt) ? s.quota.codexCreditsAt : null,
         };
       }
       if (s.usage && typeof s.usage === 'object') a.usage = { ...a.usage, ...s.usage };
@@ -2466,6 +2651,35 @@ export class AccountManager {
   }
 
   /**
+   * Status-side twin of _isCreditBacked with _isUsableNow's non-mutating
+   * gates (no throttle heal, no refusal clear, no reserve logging).
+   */
+  /**
+   * Time-independent half of the credit path: credits on, codex, enabled, not
+   * parked, included quota spent, usable balance, reserve not exceeded. The
+   * timed gates (throttle, refusal hold) are reported separately so recovery
+   * can compute WHEN the path opens. Read-only.
+   */
+  _creditPathRecoverable(account) {
+    return this.codexUseCredits === true
+      && account.provider === 'codex'
+      && account.enabled !== false
+      && account.status !== 'error' && account.status !== 'exhausted'
+      && this._isNearQuota(account)
+      && codexCreditsUsable(account.quota.codexCredits)
+      && !this._isReserveExceeded(account);
+  }
+
+  _isCreditBackedNow(account) {
+    // Derived from the routing predicate itself (read-only mode: no throttle
+    // heal, no refusal clear, no reserve logging) so the label can never
+    // disagree with what _isAvailable would route. Model-agnostic (status has
+    // no request model); an available near-quota account is only ever
+    // available through the credit tier.
+    return this._isNearQuota(account) && this._isAvailable(account, null, { readOnly: true });
+  }
+
+  /**
    * Return a status summary of all accounts (safe to expose, no credentials).
    */
   getStatus({ includeIdentity = false } = {}) {
@@ -2486,6 +2700,16 @@ export class AccountManager {
       // Computed BEFORE the quota snapshot below so _isNearQuota's lazy
       // sweep of expired windows is reflected in the copied quota.
       usable: this._isUsableNow(a),
+      // Routable ONLY on credits right now (included quota spent, usable
+      // balance). Disjoint from `usable`, which keeps its included-quota
+      // meaning so existing monitors and usableCount are unchanged.
+      creditBacked: this._isCreditBackedNow(a),
+      // Recovery inputs for the credit path (server fleetRecovery): could this
+      // account serve on credits once its throttle / refusal hold lapses?
+      creditRecoverable: this._creditPathRecoverable(a),
+      creditRefusedUntil: a._creditRefusedUntil != null && a._creditRefusedUntil > Date.now()
+        ? new Date(a._creditRefusedUntil).toISOString()
+        : null,
       enabled: a.enabled !== false,
       priority: a.priority ?? null,
       // Deep-copy the nested modelWeekly map — the shallow quota spread would
@@ -2494,6 +2718,7 @@ export class AccountManager {
         ...a.quota,
         modelWeekly: Object.fromEntries(
           Object.entries(a.quota.modelWeekly).map(([k, w]) => [k, { ...w }])),
+        codexCredits: a.quota.codexCredits ? { ...a.quota.codexCredits } : null,
       },
       usage: { ...a.usage },
       inflight: a.inflight,
@@ -2513,6 +2738,8 @@ export class AccountManager {
         : {}),
       switchThreshold: this.switchThreshold,
       usableCount: accounts.filter(a => a.usable).length,
+      creditBackedCount: accounts.filter(a => a.creditBacked).length,
+      codexUseCredits: this.codexUseCredits,
       totalCount: accounts.length,
       accounts,
     };

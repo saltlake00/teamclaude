@@ -37,6 +37,7 @@ import {
 } from './codex-recovery.js';
 import { TUI, applyTuiAccountMutation } from './tui.js';
 import { formatBytes } from './system-metrics.js';
+import { codexCreditsStatusLine } from './codex-credits.js';
 import { SseFramer, sseErrorEvent, isEventStream } from './sse.js';
 import { runClaudeWithRecovery } from './claude-recovery.js';
 import { reauthenticateAccount } from './reauth.js';
@@ -2931,6 +2932,16 @@ async function statusCommand() {
     if (data.usableCount != null && data.totalCount != null) {
       console.log(`Usable now:     ${data.usableCount}/${data.totalCount} accounts`);
     }
+    // Codex credit-backed routing (absent from older servers / Anthropic mode).
+    if (data.creditBackedCount > 0) {
+      console.log(`On credits:     ${data.creditBackedCount} account(s) routable on credits only (included quota spent)`);
+    }
+    // Servers report the flag as top-level `codexUseCredits` (and in the codex
+    // block as `codexCredits.enabled`); Anthropic-only pools also say false.
+    const codexPool = Array.isArray(data.accounts) && data.accounts.some(a => a.provider === 'codex');
+    if (codexPool && (data.codexUseCredits === false || data.codexCredits?.enabled === false)) {
+      console.log('Credit routing: off (codexUseCredits: false)');
+    }
     console.log(`Switch at:      ${(data.switchThreshold * 100).toFixed(0)}% usage\n`);
 
     for (const acct of data.accounts) {
@@ -2976,6 +2987,8 @@ async function statusCommand() {
         const req = q.requestsLimit ? ((1 - q.requestsRemaining / q.requestsLimit) * 100).toFixed(1) + '%' : '-';
         console.log(`    Tokens:   ${tok} used    Requests: ${req} used`);
       }
+      const creditsLine = codexCreditsStatusLine(q.codexCredits, acct.creditBacked === true);
+      if (creditsLine) console.log(`    Credits:  ${creditsLine}`);
 
       console.log(`    Total:    ${acct.usage.totalInputTokens + acct.usage.totalOutputTokens} tokens, ${acct.usage.totalRequests} requests`);
       if (acct.rateLimitedUntil) console.log(`    Throttled until: ${acct.rateLimitedUntil}`);

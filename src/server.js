@@ -37,6 +37,7 @@ import {
   rankCodexResetCreditCandidates,
   withinCodexResetCreditGrace,
 } from './codex-reset-credits.js';
+import { DEFAULT_CODEX_CREDIT_REFUSAL_MS, codexCreditRefusalEvidence } from './codex-credits.js';
 import {
   CODEX_INVOCATION_HEADER,
   CODEX_RECOVERY_SESSION_HEADER,
@@ -104,6 +105,20 @@ function requestUpstreamRaw(url, { method, headers, body, signal }) {
     request.once('error', reject);
     request.end(body);
   });
+}
+
+// Credit-refusal evidence lives in the 429 body, which the codex path keeps
+// as raw (possibly gzip/br) bytes for the client. Inspect a bounded, decoded
+// COPY under the auxiliary memory budget; an undecodable or oversized body is
+// simply no evidence (never a hold, never a throw).
+function creditRefusalInBody(ctx, body, contentEncoding) {
+  if (!ctx.reserveAuxiliaryResponseBytes(CODEX_ERROR_INSPECTION_MAX_BYTES)) return false;
+  try {
+    const decoded = decodeBodyForInspection(body, contentEncoding, CODEX_ERROR_INSPECTION_MAX_BYTES);
+    return decoded != null && codexCreditRefusalEvidence({ bodyText: decoded.toString('utf8') });
+  } finally {
+    ctx.releaseAuxiliaryResponseBytes(CODEX_ERROR_INSPECTION_MAX_BYTES);
+  }
 }
 
 function decodeBodyForInspection(body, contentEncoding, maxBytes) {
@@ -926,6 +941,25 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   // the automatic triggers; the local operator endpoint always works in codex
   // mode. See src/codex-reset-credits.js + docs/specs/2026-09-05-codex-reset-credits.md.
   const resetCredits = normalizeCodexResetCreditsConfig(config, provider);
+  // Credits (codex): once an account's included quota is spent it stays
+  // routable on its credit balance, ranked after every account with included
+  // quota left (AccountManager._creditRoutable). Default on in codex mode;
+  // `codexUseCredits: false` restores "exhausted = unavailable".
+  accountManager.codexUseCredits = provider === 'codex' && config.codexUseCredits !== false;
+  const codexCreditRefusalMs = Number.isFinite(config.codexCreditRefusalMs) && config.codexCreditRefusalMs > 0
+    ? config.codexCreditRefusalMs
+    : DEFAULT_CODEX_CREDIT_REFUSAL_MS;
+  // Free reset credits come before paid credits: while an automatic
+  // redemption is possible, credit accounts stay out of selection so the
+  // request reaches the reset-credit dead end below first. The candidate
+  // check never calls back into _isAvailable (no recursion).
+  accountManager.creditDeferral = accountManager.codexUseCredits && resetCredits.enabled
+    // `scope` = accounts this request may not use; their reset credits cannot
+    // serve it, so they must not defer it either.
+    ? (model, scope = null) => rankCodexResetCreditCandidates(
+      accountManager.accounts.filter(a => !(scope && scope.has(a))),
+      resetCreditEligibilityOptions(model)).length > 0
+    : null;
   // Auto-quarantine (codex): consecutive terminal (401/403) auth failures on
   // the wham/usage poll before the proxy escalates to a forced token refresh
   // plus a confirm re-poll. In-memory streak; the poll cadence is the pacing.
@@ -1993,6 +2027,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
                   cooldownMs: resetCredits.cooldownMs,
                   reserve: resetCredits.reserve,
                 },
+                codexCredits: { enabled: accountManager.codexUseCredits },
               }
             : {}),
           ...(includeIdentity ? { lifecycleId: config.lifecycleId || null } : {}),
@@ -2174,7 +2209,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         // auth401 = accounts that answered 401 after their refresh chance (cascade
         // guard input + per-request exclusion); authParked = what THIS request parked,
         // kept so a cascade can put it back.
-        const ctx = { account: null, status: null, model: null, provider, authRetried: new Set(), auth401: new Set(), authParked: [], authCascade: false, tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, capacityWaits: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: affinityKeyFor(req), upstreamFailureAvoidMs, preferredAccountUuid: recoveryAccountUuid, sawModelWeekly: false, byok: byokMatch != null, continuity, continuityDeadlineAt: null, failedFast: false, last429: null, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined, streamRecovery, maxResponseBytes, reserveResponseBytes, releaseReservedResponseBytes, reserveAuxiliaryResponseBytes, releaseAuxiliaryResponseBytes, reserveLogResponseBytes, releaseLogResponseBytes, registerIdleLogReservation, upstreamResponseTimeoutMs, streamIdleTimeoutMs, streamTotalTimeoutMs, subscriptionRecheckIntervalMs, resetCredits: resetCreditController, resetCreditAttempts: 0, resetCreditRetried: new Set(), resetCreditBackstopYielded: false, codexOverloadHeldSince: null };
+        const ctx = { account: null, status: null, model: null, provider, authRetried: new Set(), auth401: new Set(), authParked: [], authCascade: false, tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, capacityWaits: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: affinityKeyFor(req), upstreamFailureAvoidMs, codexCreditRefusalMs, preferredAccountUuid: recoveryAccountUuid, sawModelWeekly: false, byok: byokMatch != null, continuity, continuityDeadlineAt: null, failedFast: false, last429: null, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined, streamRecovery, maxResponseBytes, reserveResponseBytes, releaseReservedResponseBytes, reserveAuxiliaryResponseBytes, releaseAuxiliaryResponseBytes, reserveLogResponseBytes, releaseLogResponseBytes, registerIdleLogReservation, upstreamResponseTimeoutMs, streamIdleTimeoutMs, streamTotalTimeoutMs, subscriptionRecheckIntervalMs, resetCredits: resetCreditController, resetCreditAttempts: 0, resetCreditRetried: new Set(), resetCreditBackstopYielded: false, codexOverloadHeldSince: null };
         try {
           if (isStatusRequest) {
             res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -3006,8 +3041,13 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     }
     return excluded.size > 0 ? excluded : null;
   };
-  const hasUsable = extra => accountManager.anyUsable(requestExclusions(extra), ctx.model);
-  const hasCapped = extra => accountManager.anyCapped(requestExclusions(extra), ctx.model);
+  // Paid-credit gate scope: only accounts that cannot serve this request at
+  // all (credential-type filter, auth-failed). Accounts merely TRIED by this
+  // request (transient 429 / 5xx) keep their included quota, so they still
+  // hold the request off paid credits — it retries/waits instead.
+  const creditScope = () => requestExclusions(ctx.auth401);
+  const hasUsable = extra => accountManager.anyUsable(requestExclusions(extra), ctx.model, creditScope());
+  const hasCapped = extra => accountManager.anyCapped(requestExclusions(extra), ctx.model, creditScope());
   // An account that already answered 401 to THIS request is auth-failed FOR this
   // request even when the cascade guard deliberately left its status intact.
   // Both fleet-wide "everyone failed auth" checks below must see that, or a
@@ -3067,12 +3107,12 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         : null;
       const selectionHasUsable = ctx.preferredAccountUuid == null
         ? hasUsable(excludeForSelect)
-        : preferred && accountManager._isAvailable(preferred, ctx.model)
+        : preferred && accountManager._isAvailable(preferred, ctx.model, { scope: creditScope() })
           && accountManager._hasCapacity(preferred)
           && !(excludeForSelect && excludeForSelect.has(preferred));
       const selectionHasCapped = ctx.preferredAccountUuid == null
         ? hasCapped(excludeForSelect)
-        : preferred && accountManager._isAvailable(preferred, ctx.model)
+        : preferred && accountManager._isAvailable(preferred, ctx.model, { scope: creditScope() })
           && !accountManager._hasCapacity(preferred)
           && !(excludeForSelect && excludeForSelect.has(preferred));
       if (acquireTimeoutMs > 0 && ctx.continuity.enabled && ctx.continuity.maxWaitMs > 0
@@ -3086,6 +3126,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         ctx.affinityKey,
         ctx.model,
         ctx.preferredAccountUuid,
+        creditScope(),
       );
       if (account) {
         ctx.held = account;
@@ -3123,6 +3164,15 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       if (pass.redeemed) {
         ctx.tried429.clear();
         ctx.tried5xx.clear();
+        restartRetryCycle();
+        continue;
+      }
+      // The pass freed nothing, but by consuming the redemption chance it
+      // may have unlocked the paid-credit tier (AccountManager.creditDeferral).
+      // Re-acquire once so this request is served on credits instead of
+      // failing at a dead end that no longer exists.
+      if (!ctx.creditUnlockRetried && (hasUsable(null) || hasCapped(null))) {
+        ctx.creditUnlockRetried = true;
         restartRetryCycle();
         continue;
       }
@@ -3318,6 +3368,10 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     ctx.credentialType = account.type;
   }
   ctx.account = account.name;
+  // Was THIS dispatch served on paid credits? The 429 handler only applies
+  // the long credit hold to such a dispatch, and only on explicit evidence.
+  ctx.creditBackedDispatch = ctx.provider === 'codex' && accountManager.codexUseCredits
+    && accountManager.routedOnCredits(account, ctx.model);
   hooks.onRequestRouted?.(reqId, { account: account.name });
 
   // Refresh OAuth token if needed. Stop waiting if the client disconnects (the
@@ -3992,6 +4046,17 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         // re-dispatch to another available account — never sleep holding the
         // client. When every account is throttled, getActiveAccount returns
         // null and the client gets a 429 to back off on its own.
+        // A credit-backed account that still gets a limit 429 was NOT served
+        // from credits: hold it off the credit tier as well, so the short
+        // throttle lapsing cannot bring it straight back into a refusal loop.
+        // A transient 429 (no usage-limit signal) takes only the bounded
+        // Retry-After throttle below.
+        // The reached-type header is NOT evidence: it means "included quota
+        // reached", the premise of every credit-backed dispatch.
+        if (ctx.creditBackedDispatch && creditRefusalInBody(ctx, responseBody,
+          upstreamRes.headers.get('content-encoding'))) {
+          accountManager.noteCreditRefusal(account, ctx.codexCreditRefusalMs, ctx.model);
+        }
         console.log(`[TeamClaude] 429 (quota exhausted) on "${account.name}" — throttling ${retryAfter}s, switching accounts`);
         accountManager.markRateLimited(account, retryAfter);
         if (logDir) {
@@ -4672,8 +4737,8 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
 
       ctx.tried5xx.add(account);
       if (!continuityBoundedTimeout && replaySafe && retryCount < maxRetries
-          && (accountManager.anyUsable(ctx.tried5xx, ctx.model)
-            || accountManager.anyCapped(ctx.tried5xx, ctx.model))) {
+          && (accountManager.anyUsable(ctx.tried5xx, ctx.model, creditScope())
+            || accountManager.anyCapped(ctx.tried5xx, ctx.model, creditScope()))) {
         console.log(`[TeamClaude] Response timeout on "${account.name}" — switching account for this request`);
         releaseHeld();
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
@@ -4725,8 +4790,8 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     if (isTransient) {
       if (replaySafe && !res.headersSent && !res.destroyed && retryCount < maxRetries) {
         ctx.tried5xx.add(account);
-        if (accountManager.anyUsable(ctx.tried5xx, ctx.model)
-          || accountManager.anyCapped(ctx.tried5xx, ctx.model)) {
+        if (accountManager.anyUsable(ctx.tried5xx, ctx.model, creditScope())
+          || accountManager.anyCapped(ctx.tried5xx, ctx.model, creditScope())) {
           console.log(`[TeamClaude] Network error on "${account.name}" — switching account for this request`);
           releaseHeld();
           return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
@@ -5299,6 +5364,17 @@ function fleetRecovery(accounts, threshold = 0.98, model = null) {
     if (q.requestsLimit != null && q.requestsRemaining != null && requestsReset
         && 1 - q.requestsRemaining / q.requestsLimit >= threshold)
       freeAt = Math.max(freeAt, new Date(requestsReset).getTime());
+    // Credit path (codex): an account whose included quota is spent but that
+    // can serve on its credit balance is back as soon as its throttle and any
+    // credit-refusal hold lapse — not at the (days-away) included reset. The
+    // status snapshot carries `creditRecoverable` (credits on, usable balance,
+    // reserve not exceeded) and `creditRefusedUntil`; take the earlier path.
+    if (freeAt > 0 && acct.creditRecoverable === true) {
+      let creditFreeAt = now;
+      if (acct.rateLimitedUntil) creditFreeAt = Math.max(creditFreeAt, new Date(acct.rateLimitedUntil).getTime());
+      if (acct.creditRefusedUntil) creditFreeAt = Math.max(creditFreeAt, new Date(acct.creditRefusedUntil).getTime());
+      freeAt = Math.min(freeAt, Math.max(creditFreeAt, now + 1000));
+    }
     if (freeAt > 0) consider(freeAt - now, acct.name, true);
     else consider(60_000); // quota-healthy (merely capped/queued): a slot frees in seconds — cap the fleet wait at the short fallback
   }
