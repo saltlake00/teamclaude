@@ -250,3 +250,17 @@ func teamClaudeDriftActionDetail(persistsAfterReload: Bool) -> String {
         ? "재로딩 후에도 남음 · 재시작하지 않음"
         : "자동 동기화 중 · 서버 반영 확인"
 }
+
+// 프록시 `getConfigPath()`/`getServerStatePath()`와 같은 규칙으로 설정·상태 파일 경로를 정한다.
+// TEAMCLAUDE_CONFIG → XDG_CONFIG_HOME/teamclaude.json → ~/.config/teamclaude.json.
+// 앱의 상태 확인·드리프트 계산·worker 신원 확인이 모두 이 경로를 써야 서로 어긋나지 않는다.
+func teamClaudeConfigPath(environment: [String: String], home: String) -> String {
+    if let explicit = environment["TEAMCLAUDE_CONFIG"], !explicit.isEmpty { return explicit }
+    let configDir = environment["XDG_CONFIG_HOME"].flatMap { $0.isEmpty ? nil : $0 } ?? "\(home)/.config"
+    return "\(configDir)/teamclaude.json"
+}
+
+func teamClaudeServerStatePath(configPath: String) -> String {
+    let base = configPath.hasSuffix(".json") ? String(configPath.dropLast(5)) : configPath
+    return base + ".server.json"
+}

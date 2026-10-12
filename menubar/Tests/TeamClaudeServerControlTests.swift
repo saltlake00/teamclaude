@@ -217,6 +217,14 @@ struct TeamClaudeServerControlTests {
         precondition(teamClaudeDriftActionDetail(persistsAfterReload: false) == "자동 동기화 중 · 서버 반영 확인")
         precondition(teamClaudeDriftActionDetail(persistsAfterReload: true).contains("재시작하지 않음"))
 
+        // MARK: 설정·상태 파일 경로 (프록시 getConfigPath/getServerStatePath와 같은 규칙)
+        precondition(teamClaudeConfigPath(environment: [:], home: "/h") == "/h/.config/teamclaude.json")
+        precondition(teamClaudeConfigPath(environment: ["XDG_CONFIG_HOME": "/x"], home: "/h") == "/x/teamclaude.json")
+        precondition(teamClaudeConfigPath(environment: ["XDG_CONFIG_HOME": ""], home: "/h") == "/h/.config/teamclaude.json")
+        precondition(teamClaudeConfigPath(environment: ["TEAMCLAUDE_CONFIG": "/alt/c.json", "XDG_CONFIG_HOME": "/x"], home: "/h") == "/alt/c.json")
+        precondition(teamClaudeServerStatePath(configPath: "/alt/c.json") == "/alt/c.server.json")
+        precondition(teamClaudeServerStatePath(configPath: "/h/.config/teamclaude.json") == "/h/.config/teamclaude.server.json")
+
         print("TeamClaudeServerControlTests: ok")
     }
 }
