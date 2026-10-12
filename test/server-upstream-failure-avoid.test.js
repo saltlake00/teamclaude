@@ -136,6 +136,12 @@ test('anthropic: 503 after an unsafe POST is passed through unreplayed, and the 
 });
 
 test('codex: an upstream in-stream error terminal is relayed verbatim, and the reconnect on the same socket is served by the other account', async () => {
+  // B2 (pre-output stream replay, TEAMCODEX_OVERLOAD_HOLD_MS) would replay this
+  // exact shape — created, then an error terminal before any output — onto the
+  // other account inside the proxy. This test pins the LEGACY verbatim relay and
+  // its soft-avoid, so it runs with the shared B1/B2 kill switch off.
+  const savedHold = process.env.TEAMCODEX_OVERLOAD_HOLD_MS;
+  process.env.TEAMCODEX_OVERLOAD_HOLD_MS = '0';
   const hits = [];
   const upstream = http.createServer((req, res) => {
     const tok = tokenOf(req);
@@ -171,6 +177,8 @@ test('codex: an upstream in-stream error terminal is relayed verbatim, and the r
     assert.match(retry.text, /response\.completed/);
     assert.deepEqual(hits, ['tok-a', 'tok-b'], 'the reconnect is steered away from the failing account');
   } finally {
+    if (savedHold === undefined) delete process.env.TEAMCODEX_OVERLOAD_HOLD_MS;
+    else process.env.TEAMCODEX_OVERLOAD_HOLD_MS = savedHold;
     client.destroy();
     closeAll(proxy, upstream);
   }
@@ -181,6 +189,12 @@ test('codex: a gzip-encoded upstream stream that ends with an error terminal is 
   // the bytes encoded and watches the terminal through the encoded observer.
   // That observer must report the terminal event too, or this whole class of
   // failure would never steer (adversarial review finding, 2026-09-16).
+  // B2 now stages encoded streams too and would replay this exact shape
+  // (created, then an error terminal before any output) onto the other account
+  // inside the proxy. This test pins the LEGACY encoded relay and its
+  // soft-avoid, so it runs with the shared B1/B2 kill switch off.
+  const savedHold = process.env.TEAMCODEX_OVERLOAD_HOLD_MS;
+  process.env.TEAMCODEX_OVERLOAD_HOLD_MS = '0';
   const hits = [];
   const errorStream = gzipSync(Buffer.from(
     'event: response.created\ndata: {"type":"response.created"}\n\n'
@@ -222,6 +236,8 @@ test('codex: a gzip-encoded upstream stream that ends with an error terminal is 
     assert.equal(retry.status, 200);
     assert.deepEqual(hits, ['tok-a', 'tok-b'], 'the reconnect is steered away from the failing account');
   } finally {
+    if (savedHold === undefined) delete process.env.TEAMCODEX_OVERLOAD_HOLD_MS;
+    else process.env.TEAMCODEX_OVERLOAD_HOLD_MS = savedHold;
     client.destroy();
     closeAll(proxy, upstream);
   }

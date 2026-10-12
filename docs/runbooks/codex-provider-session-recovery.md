@@ -484,7 +484,115 @@ spent, the exact legacy passthrough is returned (`Upstream overloaded (HTTP
 503). Request was not replayed.` plus `X-TeamCodex-Recovery-Session`), so every
 wrapper recovery signal in this runbook is unchanged. HTML/text bodies,
 truncated bodies, 502/504/507, bodies over the inspection bound, and anything
-after client bytes are never replayed. No account state is mutated.
+after client bytes are never replayed. No account state is mutated. When a
+codex POST 503/529 is not replayed the log says why:
+`[TeamCodex] 503 not replayable: <headers-sent|non-json-body|oversize-body|read-error|hold-disabled|not-responses-path|client-gone>`.
+
+## Pre-output stream replay exception (B2)
+
+The second and last unsafe-POST shape the proxy replays is a capacity failure
+delivered INSIDE an HTTP 200 SSE stream. Under load the backend acknowledges the
+request (`response.created`, `response.in_progress`, pings) and then ends with
+`response.failed` (error code `server_is_overloaded` / `slow_down`) or an
+`error` event before any output item — or the stream simply ends, errors, or
+idles out. codex-rs renders that as "Selected model is at capacity" and does not
+retry. Because nothing output-bearing was produced, the relay stages whole SSE
+frames (up to `CODEX_PRESTREAM_STAGE_MAX_BYTES` — env, default 1 MiB, clamped to
+[64 KiB, 16 MiB]) while every frame is an acknowledgement or an
+envelope/reasoning frame, and on such a pre-output failure cancels the upstream
+body and replays the request through the
+same failover/backoff loop and hold cap as B1 (`TEAMCLAUDE_OVERLOAD_RETRIES`,
+`TEAMCLAUDE_OVERLOAD_BACKOFF_*`, `TEAMCODEX_OVERLOAD_HOLD_MS`; `0` disables
+B1 and B2 together). The client sees exactly one `response.created`, from the
+attempt that succeeded.
+
+**Envelope/reasoning phase (2026-09-17).** A real turn's frame order is
+`response.created` → `response.in_progress` → `response.output_item.added` →
+`response.content_part.added` → `response.output_text.delta`, so the envelope
+arrives BEFORE anything the user can see — and the measured production failures
+(3–8 s turns, `out_tokens=0`, `task_complete err=server_overloaded`) land one
+frame after it. Staging therefore also survives these frames:
+`response.output_item.added` with `item.type == "reasoning"`, every
+`response.reasoning*` event (`reasoning_summary_part.added/.done`,
+`reasoning_summary_text.delta/.done`, `reasoning_text.delta/.done`), and
+`response.content_part.added` whose `part.type` is a reasoning part
+(`summary_text`, `reasoning_text`). The allowlist is closed and fails safe to
+live: a `content_part.added` with `part.type == "output_text"`, an
+`output_item.added` with any other or missing `item.type` (message,
+function_call, custom_tool_call, web_search_call, mcp_*, …), an unparseable
+`data:` payload, and every unknown event name are OUTPUT, never acknowledgements.
+Because reasoning can run far longer than a capacity failure does — and holding
+it back delays the visible "thinking" text — the reasoning phase has its own
+budget, `CODEX_PRESTREAM_REASONING_MAX_MS` (default 20000, floor 1000), measured
+from the FIRST staged envelope/reasoning frame. On expiry the staged bytes are
+flushed and the stream goes live (no replay, upstream kept), logged as
+`[TeamCodex] pre-output reasoning cap <ms>ms reached on "<acct>"<, encoding> — going live`.
+The pre-reasoning phase (created / queued / in_progress only) keeps the existing
+`CODEX_PRESTREAM_STAGE_MAX_MS` cap.
+
+Not replayed (legacy passthrough, byte-identical): a failure after any
+output-bearing frame (`response.output_text.*`, an `output_text` content part, a
+non-reasoning `output_item.added`, `response.function_call*`,
+`response.completed`, …), a
+`response.failed`/`error` whose code is a request rejection
+(`invalid_request`, `usage_limit_reached`, `unauthorized`, …), a stream whose
+staged frames exceed the 64 KiB staging bound or keep trickling past
+`CODEX_PRESTREAM_STAGE_MAX_MS` (default = `TEAMCODEX_OVERLOAD_HOLD_MS`, floor
+1000 ms; at the cap the staged acknowledgements are flushed and the stream goes
+live, upstream kept) or past `CODEX_PRESTREAM_REASONING_MAX_MS`, a stream with an unsupported or multiple
+`content-encoding` (supported: identity, gzip, x-gzip, deflate, br — the
+production backend streams gzip; an encoded stream is staged as raw bytes and
+decoded on the side only to classify, so the client's bytes and
+`content-encoding` are untouched), an encoded stream whose decoder cannot settle
+the frames, and any failure once the retry budget or hold cap is spent. In every passthrough the client receives the 200, the staged frames
+and the failure frame, and the `Upstream response.failed event … steering new
+requests to other accounts` soft-avoid fires once, as before. A client that
+disconnects during staging or the backoff cancels the upstream immediately; no
+further upstream hits occur. Log lines: `[TeamCodex] pre-output stream failure
+on "<acct>" (<terminal|eof|error|timeout>[ code]) — replaying (n/max, held ms)`
+and `… — budget spent (…), passing through` / `… — not replayable, passing
+through`.
+
+**Diagnostics (2026-09-17).** B2 used to log only when it replayed or passed
+through, so a turn that never entered staging and one that staged and went live
+were indistinguishable. Two lines close that gap, each throttled to at most one
+per 60 s per account per reason (keyed per proxy instance, so a busy pool cannot
+flood the log):
+
+- `[TeamCodex] prestream skip: <reason>` — the gate did not stage. Reasons:
+  `not-post`, `not-responses-path`, `non-2xx`, `headers-sent`,
+  `hold-disabled`, `unsupported-encoding`, `aux-budget` (the 64 KiB staging
+  reservation was refused by the shared response-byte budget).
+
+Both lines are **codex-only**. Anthropic mode never enters B2, so it is skipped
+silently — there is no `not-codex` reason, and the Claude pool's log (port 3456)
+gains nothing from this change.
+- `[TeamCodex] prestream live on "<acct>"<, encoding>: <reason> after <n> frames, <ms>ms`
+  — staging ended and the stream went live. `<reason>` is one of
+  `output:<event-name>` (an output-bearing frame, named), `frame-overflow` (ONE
+  frame exceeded the staging bound, so `SseFramer` abandoned framing),
+  `staging-overflow` (cumulative staged bytes exceeded it), `decode-failed`,
+  `cap`, `reasoning-cap`. `<n>` counts the terminating frame too.
+
+When a turn fails fast with `server_overloaded` and no `pre-output stream
+failure` line appears, read the `prestream skip` / `prestream live` line for the
+same account: a skip names the gate condition; `output:response.output_text.delta`
+means the failure genuinely arrived after user-visible output (correctly not
+replayed); and `frame-overflow` / `staging-overflow` mean the bound is too small
+for this workload — raise `CODEX_PRESTREAM_STAGE_MAX_BYTES`.
+
+**Sizing the bound (2026-09-17).** The default was 64 KiB until live diagnostics
+on deploy c4ad3c37 showed three proxied failures logging
+`prestream live on "<acct>": none after 0 frames, 3ms` (and `165ms`) — identity
+encoding, zero frames judged, i.e. the `frame-overflow` branch. The cause is that
+`response.created` echoes the request's `instructions` and its entire `tools`
+array, so a session with ~14 MCP servers and a large skill set (inputs up to
+~237K tokens) emits a first frame of several hundred KiB, while a minimal probe's
+first frame is tiny — which is why only real sessions died in 3-8 s and probes of
+the same model replayed and succeeded in 35-42 s. The default is now 1 MiB. Cost
+is (concurrently staging streams × the bound) against the 256 MiB shared response
+budget, so raising it further is cheap; a refused reservation degrades to
+`prestream skip: aux-budget`, not to an error.
 
 ## Rollback
 
