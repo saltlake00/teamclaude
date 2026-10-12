@@ -637,7 +637,7 @@ test('does not adopt a legacy native child that still has a TeamClaude superviso
   };
   const child = {
     alive: true,
-    command: `/Users/sangrok/.local/share/claude/versions/2.1.289 --resume ${SESSION_ID}`,
+    command: `/Users/example/.local/share/claude/versions/2.1.289 --resume ${SESSION_ID}`,
     legacyEnvironmentValid: true,
     nativeExecutableTrusted: true,
     supervised: false,
@@ -666,7 +666,7 @@ function supervisorProcessInfo(pid) {
 }
 
 function selectorlessChildInfo(pid, parentPid, version = '2.1.289') {
-  const executablePath = `/Users/sangrok/.local/share/claude/versions/${version}`;
+  const executablePath = `/Users/example/.local/share/claude/versions/${version}`;
   return {
     alive: true,
     pid,
