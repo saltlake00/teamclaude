@@ -210,3 +210,25 @@ test('a reserved-out account reports usable:false in status', () => {
   assert.equal(reserved.enabled, true);
   assert.equal(reserved.status, 'active');
 });
+
+test('an account added at runtime starts with _reserveHeld false (no spurious rejoin log)', () => {
+  // The constructor initializes _reserveHeld so the first _isAvailable pass
+  // does not read undefined and log "rejoining rotation". A reserved account
+  // that arrives later via addAccount (disk sync / TUI import) needs the same.
+  const am = new AccountManager(makeAccounts(1), 0.98, 5 * MIN, 3, 256, { ...RESERVE, name: 'late' });
+  const index = am.addAccount({
+    name: 'late', type: 'oauth', accountUuid: 'uuid-late',
+    accessToken: 'tok-late', refreshToken: 'r-late', expiresAt: Date.now() + HOUR,
+  });
+  assert.equal(am.accounts[index]._reserveHeld, false);
+  const logs = [];
+  const original = console.log;
+  console.log = (...args) => { logs.push(args.join(' ')); };
+  try {
+    setSession(am, index, 0.10, 4 * HOUR);
+    assert.equal(am._isAvailable(am.accounts[index]), true);
+  } finally {
+    console.log = original;
+  }
+  assert.ok(!logs.some(line => /rejoining rotation/.test(line)), `unexpected log: ${logs.join(' | ')}`);
+});

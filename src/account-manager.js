@@ -2434,6 +2434,8 @@ export class AccountManager {
       unsupportedModels: new Map(),
       inflight: 0,
       maxConcurrent: coerceMaxConcurrent(acctData.maxConcurrent, this.maxConcurrentDefault),
+      // Same as the constructor: no spurious "rejoining rotation" on first pass.
+      _reserveHeld: false,
       _subscriptionFlagPromise: Promise.resolve(),
       _accountWritePending: false,
     });
