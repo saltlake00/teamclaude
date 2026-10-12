@@ -79,6 +79,17 @@ async function defaultResolveRecoveryWindow({ workspaceId, surfaceId }) {
   return windowId;
 }
 
+// Marks a launch failure that provably ran nothing (no cmux binary, no target
+// window, or the process could not be spawned). Only such failures release the
+// recovery claim for a retry; a timeout or a cmux error after spawning is
+// ambiguous (the workspace may exist) and keeps the claim so the event is never
+// launched twice.
+function notLaunched(error) {
+  const wrapped = error instanceof Error ? error : new Error(String(error));
+  wrapped.recoveryNotLaunched = true;
+  return wrapped;
+}
+
 async function defaultLaunchRecoveryWorkspace({
   workspaceId,
   surfaceId,
@@ -87,26 +98,37 @@ async function defaultLaunchRecoveryWorkspace({
   sessionId,
   command,
 }) {
-  const cmuxBinary = await resolveCmuxBinary();
-  const resolvedWindowId = windowId || await defaultResolveRecoveryWindow({
-    workspaceId,
-    surfaceId,
-  });
-  await execFileAsync(cmuxBinary, [
-    'new-workspace',
-    '--window',
-    resolvedWindowId,
-    '--name',
-    `Recovered Claude ${sessionId.slice(0, 8)}`,
-    '--cwd',
-    cwd,
-    '--command',
-    command,
-    '--focus',
-    'false',
-  ], {
-    timeout: 5000,
-  });
+  let cmuxBinary;
+  let resolvedWindowId;
+  try {
+    cmuxBinary = await resolveCmuxBinary();
+    resolvedWindowId = windowId || await defaultResolveRecoveryWindow({
+      workspaceId,
+      surfaceId,
+    });
+  } catch (error) {
+    throw notLaunched(error);
+  }
+  try {
+    await execFileAsync(cmuxBinary, [
+      'new-workspace',
+      '--window',
+      resolvedWindowId,
+      '--name',
+      `Recovered Claude ${sessionId.slice(0, 8)}`,
+      '--cwd',
+      cwd,
+      '--command',
+      command,
+      '--focus',
+      'false',
+    ], {
+      timeout: 5000,
+    });
+  } catch (error) {
+    if (error?.code === 'ENOENT' || error?.code === 'EACCES') throw notLaunched(error);
+    throw error;
+  }
 }
 
 async function defaultReadStore(path) {
@@ -495,7 +517,10 @@ export async function rescueCmuxSessionsOnce({
         command,
       });
       rescued += 1;
-    } catch {
+    } catch (error) {
+      // A launch that provably ran nothing frees its claim for a later pass;
+      // anything ambiguous keeps it (never launch the same event twice).
+      if (error?.recoveryNotLaunched === true) await releaseClaimForRetry();
       failed += 1;
     }
   }
