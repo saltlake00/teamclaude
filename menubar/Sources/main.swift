@@ -3606,7 +3606,7 @@ enum TeamClaudeSyncOutcome: Equatable {
         case .reloaded: return "worker 무중단 재로딩으로 반영"
         case .driftPersists(let reason): return "불일치 남음(\(reason)) · 재시작 안 함, 경고만 표시"
         case .responseDelayed(let pid):
-            return "프로세스 실행 중(pid \(pid.map(String.init) ?? "포트 점유")) · 응답 지연, 재시작 안 함"
+            return "프로세스 실행 중(pid \(pid.map(String.init) ?? "미확인")) · 응답 지연, 재시작 안 함"
         case .serviceStarted: return "멈춘 서비스 시작(kickstart, -k 없음)"
         case .serviceStartFailed: return "멈춘 서비스 시작 실패"
         case .serviceNotLoaded: return "launchd 서비스 미등록 · 조치 안 함"
