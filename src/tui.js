@@ -2,6 +2,7 @@ import { importCredentials, fetchProfile } from './oauth.js';
 import { importCodexCredentials } from './codex.js';
 import { createHostTracker } from './system-metrics.js';
 import { subscriptionSnapshot } from './subscription.js';
+import { formatCodexCreditsCompact } from './codex-credits.js';
 import { canReauthenticateTuiAccount, reauthenticateTuiAccount } from './reauth.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
@@ -148,6 +149,14 @@ function bar(ratio, w = 10, resetTs) {
   if (empty) out += `${ESC}100;37m${empty}`;
   out += RESET;
   return out;
+}
+
+/** A fixed-width centered text cell on the same gray background as an empty bar. */
+function textCell(text, w = 10) {
+  const t = String(text).slice(0, w);
+  const pad = w - t.length;
+  const lp = Math.floor(pad / 2);
+  return `${ESC}100;97m${' '.repeat(lp)}${t}${' '.repeat(pad - lp)}${RESET}`;
 }
 
 function timestamp() {
@@ -984,7 +993,10 @@ export class TUI {
       } else if (subscription.state === 'cancellation-scheduled') {
         status = yellow('canceling');
       } else {
-        switch (a.status) {
+        const onCredits = a.status === 'active' && this.am._isCreditBackedNow?.(a) === true;
+        switch (onCredits ? 'credits' : a.status) {
+          // Included quota spent, still routable on the credit balance.
+          case 'credits':   status = cyan('credits'); break;
           case 'active':    status = isCur ? green('active') : 'active'; break;
           case 'throttled': status = yellow('throttled'); break;
           case 'exhausted': status = red('exhausted'); break;
@@ -1038,10 +1050,17 @@ export class TUI {
     if (showBoth) {
       line += `  ${l2} ${bar(r2, bw, t2)}`;
     }
+    // Codex accounts have no model-scoped weekly window; the third slot shows
+    // the credit balance instead (narrow layouts append it after the bars).
+    const credits = a.provider === 'codex' ? formatCodexCreditsCompact(q.codexCredits) : null;
     if (showThree) {
       // API-key accounts have no third metric — pad the slot so the rank
       // badges stay column-aligned across mixed account types.
-      line += l3 ? `  ${l3} ${bar(r3, bw, t3)}` : ' '.repeat(6 + bw);
+      line += credits != null
+        ? `  Cr  ${textCell(credits, bw)}`
+        : l3 ? `  ${l3} ${bar(r3, bw, t3)}` : ' '.repeat(6 + bw);
+    } else if (credits != null) {
+      line += `  Cr ${credits}`;
     }
     // Order badge: ranked accounts show their 1-based position (#1 = most
     // preferred). While ordering, unranked accounts are labelled "auto" so the

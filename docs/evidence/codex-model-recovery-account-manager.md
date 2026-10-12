@@ -5,7 +5,7 @@
 고정하고, 검토에 필요한 구간만 원문 그대로 옮겼습니다.
 
 - Source: `src/account-manager.js`
-- SHA-256: `01a066e08e7d2d6a49a12d62c72620b753a6435c60736b8d6a258eb3acf252f0`
+- SHA-256: `f967d52f99858feda10c3879daa0821ecd44f6015d9de4c85b5ac0f6577f6d20`
 - Source: `src/config.js`
 - SHA-256: `dd982f9cdc909071ae37785d67862b753a99fbbee26da5c373998b2f3e703959`
 - 2026-09-08 갱신: 기본 브랜치 `09de69e`의 두 파일과 아래 발췌 구간을 대조했다.
@@ -14,6 +14,10 @@
   아래 발췌 구간은 바뀐 소스와 줄 단위로 그대로 일치함을 대조했고, 모델 복구 로직은 변경 없다.
 - 2026-10-09 갱신: 전송 실패 쿨다운(`markSendFailure`·`clearSendFailure` 등) 추가로 `src/account-manager.js`만 바뀌었다.
   아래 발췌 구간(`// ...` 생략 포함)은 바뀐 소스와 줄 단위·순서대로 일치함을 대조했고, 모델 복구 로직은 변경 없다.
+- 2026-10-12 갱신: Codex 라우팅 기능 복구(쿼터 예약 `quotaReserve`, 상류 실패 회피 `noteUpstreamFailure`,
+  유료 크레딧 라우팅 `codexUseCredits`)로 `src/account-manager.js`만 바뀌었다. `_isAvailable`의 포함 쿼터 판정이
+  크레딧 경로를 갖게 되어 "Eligibility" 발췌를 바뀐 소스와 줄 단위·순서대로 맞췄다(`// ...` 생략 포함).
+  모델 복구 로직(`_isModelUnsupported`·`markModelUnsupported`·`clearModelUnsupported`·`_recoverSoonest` 판정 순서)은 변경 없다.
 - 검증 명령: `shasum -a 256 src/account-manager.js src/config.js`
 - 전체 파일을 gate bundle에 직접 넣지 않은 이유: 모델 복구와 무관한 credential property
   identifiers가 value-shape secret scanner의 보수적 규칙에 걸립니다. 이 evidence는 값을
@@ -33,8 +37,13 @@
 ```js
     if (account.status === 'exhausted' || account.status === 'error') return false;
     if (this._isModelUnsupported(account, model)) return false;
-    if (this._isNearQuota(account, model)) return false;
-
+    // ...
+    if (this._isNearQuota(account, model)
+        && !(allowCredits && this._creditRoutable(account, readOnly)
+          && this._creditsUnlocked(model, scope, readOnly))) {
+      return false;
+    }
+    // ...
     return true;
   }
 

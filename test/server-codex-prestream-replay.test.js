@@ -1,0 +1,1074 @@
+// Codex-mode pre-output stream replay (B2, qjc fork).
+//
+// A codex `POST /codex/responses` whose HTTP 200 SSE stream fails BEFORE any
+// output-bearing frame (only `response.created` / `response.in_progress` /
+// pings so far, then `response.failed` with a capacity code, an `error` event,
+// or a dead stream) is replayed through the same failover/backoff loop B1 uses.
+// Once an output-bearing frame is staged the legacy live passthrough applies,
+// and when the budget is spent the client receives exactly the legacy bytes.
+// Anthropic mode is untouched (streamRecovery tests in server-midstream.test.js).
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import http from 'node:http';
+import { gzipSync, gunzipSync, createGzip, constants as zlibConstants } from 'node:zlib';
+import { AccountManager } from '../src/account-manager.js';
+import { createProxyServer, classifyCodexSseFrame } from '../src/server.js';
+
+const ENV_KEYS = [
+  'TEAMCLAUDE_OVERLOAD_RETRIES', 'TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS',
+  'TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS', 'TEAMCODEX_OVERLOAD_HOLD_MS',
+  'CODEX_PRESTREAM_STAGE_MAX_MS', 'CODEX_PRESTREAM_REASONING_MAX_MS',
+  'CODEX_PRESTREAM_STAGE_MAX_BYTES',
+];
+// Fast, bounded defaults: 2 fleet backoffs of ~50ms, 5s hold cap.
+const FAST_ENV = {
+  TEAMCLAUDE_OVERLOAD_RETRIES: '2',
+  TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS: '50',
+  TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS: '60',
+  TEAMCODEX_OVERLOAD_HOLD_MS: '5000',
+};
+
+function withEnv(values, fn) {
+  const saved = Object.fromEntries(ENV_KEYS.map(key => [key, process.env[key]]));
+  for (const key of ENV_KEYS) {
+    if (values[key] === undefined) delete process.env[key];
+    else process.env[key] = values[key];
+  }
+  return fn().finally(() => {
+    for (const key of ENV_KEYS) {
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    }
+  });
+}
+
+function listen(server) {
+  return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
+}
+
+function closeServer(server) {
+  if (!server?.listening) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    server.close(error => error ? reject(error) : resolve());
+    server.closeAllConnections();
+  });
+}
+
+async function waitFor(predicate, timeoutMs = 2000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  assert.fail('condition was not met before timeout');
+}
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+async function drainRequest(request) {
+  for await (const chunk of request) {
+    if (chunk.length === 0) continue;
+  }
+}
+
+function codexManager(names) {
+  return new AccountManager(names.map(name => ({
+    name,
+    provider: 'codex',
+    type: 'oauth',
+    accessToken: `pooled-access-token-${name}`,
+    accountId: `workspace-${name}`,
+    expiresAt: Date.now() + 3_600_000,
+  })));
+}
+
+function codexProxy(manager, upstreamPort) {
+  return createProxyServer(manager, {
+    provider: 'codex',
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false,
+    codexUsageRefresh: false,
+  });
+}
+
+function snapshotAccounts(manager) {
+  return manager.accounts.map(account => ({
+    status: account.status,
+    errorReason: account.errorReason ?? null,
+    rateLimitedUntil: account.rateLimitedUntil ?? null,
+  }));
+}
+
+// Count the peer's soft-avoid hook without changing what it does.
+function countUpstreamFailures(manager) {
+  let calls = 0;
+  const original = manager.noteUpstreamFailure.bind(manager);
+  manager.noteUpstreamFailure = (...args) => { calls += 1; return original(...args); };
+  return () => calls;
+}
+
+const CREATED = 'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}\n\n';
+const IN_PROGRESS = 'event: response.in_progress\ndata: {"type":"response.in_progress","response":{"id":"resp_1"}}\n\n';
+const PING = ': ping\n\n';
+const DELTA = 'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"hi"}\n\n';
+const COMPLETED = 'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}\n\n';
+const failedFrame = code => `event: response.failed\ndata: ${JSON.stringify({
+  type: 'response.failed',
+  response: { id: 'resp_1', status: 'failed', error: code ? { code, message: 'The server is currently overloaded.' } : null },
+})}\n\n`;
+const ERROR_NO_CODE = 'event: error\ndata: {"type":"error","message":"An error occurred while processing your request. request ID: abc"}\n\n';
+// Envelope/reasoning phase — measured frame order on a real turn is
+// created → in_progress → output_item.added → content_part.added → output_text.delta,
+// so the envelope arrives BEFORE anything the user can see.
+const REASONING_ITEM = 'event: response.output_item.added\ndata: {"type":"response.output_item.added","output_index":0,"item":{"id":"rs_1","type":"reasoning","summary":[]}}\n\n';
+const REASONING_PART = 'event: response.reasoning_summary_part.added\ndata: {"type":"response.reasoning_summary_part.added","part":{"type":"summary_text","text":""}}\n\n';
+const REASONING_DELTA = 'event: response.reasoning_summary_text.delta\ndata: {"type":"response.reasoning_summary_text.delta","delta":"weighing options"}\n\n';
+const MESSAGE_ITEM = 'event: response.output_item.added\ndata: {"type":"response.output_item.added","output_index":0,"item":{"id":"msg_1","type":"message","role":"assistant","content":[]}}\n\n';
+const TEXT_PART = 'event: response.content_part.added\ndata: {"type":"response.content_part.added","item_id":"msg_1","part":{"type":"output_text","text":""}}\n\n';
+const ITEM_NO_TYPE = 'event: response.output_item.added\ndata: {"type":"response.output_item.added","output_index":0,"item":{"id":"unknown_1"}}\n\n';
+const ITEM_UNPARSEABLE = 'event: response.output_item.added\ndata: not json at all\n\n';
+
+function sse(res, frames, headers = {}) {
+  res.writeHead(200, { 'content-type': 'text/event-stream', ...headers });
+  for (const frame of frames) res.write(frame);
+  res.end();
+}
+
+const count = (text, needle) => text.split(needle).length - 1;
+
+function captureConsole() {
+  const logs = [];
+  const original = console.log;
+  console.log = (...args) => { logs.push(args.map(String).join(' ')); };
+  return { logs, restore: () => { console.log = original; } };
+}
+
+// A production `response.created` echoes the request's instructions and tools,
+// so a real session's FIRST frame is hundreds of KiB (2026-09-17 live finding).
+const hugeCreatedFrame = bytes => {
+  const pad = 'y'.repeat(Math.max(0, bytes - 160));
+  return `event: response.created\ndata: ${JSON.stringify({
+    type: 'response.created',
+    response: { id: 'resp_1', status: 'in_progress', instructions: pad },
+  })}\n\n`;
+};
+
+// The Codex backend streams gzip in production: emit each frame sync-flushed so
+// the proxy's side decoder sees whole frames as they arrive.
+function gzipFrames(res, frames) {
+  res.writeHead(200, { 'content-type': 'text/event-stream', 'content-encoding': 'gzip' });
+  const gzip = createGzip({ flush: zlibConstants.Z_SYNC_FLUSH });
+  gzip.pipe(res);
+  for (const frame of frames.slice(0, -1)) gzip.write(frame);
+  gzip.end(frames[frames.length - 1]);
+}
+
+// Raw client: no automatic decompression, so encoded bytes can be compared.
+function rawPost(proxyPort, path = '/codex/responses') {
+  return new Promise((resolve, reject) => {
+    const request = http.request({
+      host: '127.0.0.1', port: proxyPort, path, method: 'POST',
+      headers: { 'content-type': 'application/json' },
+    }, res => {
+      const chunks = [];
+      res.on('data', chunk => chunks.push(chunk));
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, buffer: Buffer.concat(chunks) }));
+      res.on('error', reject);
+    });
+    request.on('error', reject);
+    request.end(JSON.stringify({ model: 'gpt-5.6', input: [], stream: true }));
+  });
+}
+
+async function postResponses(proxyPort, path = '/codex/responses') {
+  const response = await fetch(`http://127.0.0.1:${proxyPort}${path}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'gpt-5.6', input: [], stream: true }),
+  });
+  const text = await response.text();
+  return { status: response.status, headers: response.headers, text };
+}
+
+// (a) created + in_progress then `response.failed` (server_is_overloaded) is
+// replayed on the other account; the client sees ONE response.created and the
+// successful stream. No account state moves and the soft-avoid hook is silent.
+test('codex pre-output response.failed (server_is_overloaded) is replayed onto another account', () => withEnv(FAST_ENV, async () => {
+  let hits = 0;
+  const upstream = http.createServer(async (req, res) => {
+    await drainRequest(req);
+    hits += 1;
+    if (hits === 1) sse(res, [CREATED, IN_PROGRESS, failedFrame('server_is_overloaded')]);
+    else sse(res, [CREATED, DELTA, COMPLETED]);
+  });
+  const upstreamPort = await listen(upstream);
+  const manager = codexManager(['codex-a', 'codex-b']);
+  const before = snapshotAccounts(manager);
+  const failures = countUpstreamFailures(manager);
+  const proxy = codexProxy(manager, upstreamPort);
+  const proxyPort = await listen(proxy);
+  try {
+    const response = await postResponses(proxyPort);
+    assert.equal(response.status, 200);
+    assert.equal(hits, 2);
+    assert.equal(count(response.text, 'event: response.created'), 1, 'exactly one response.created');
+    assert.equal(count(response.text, 'event: response.failed'), 0, 'the failed attempt never reaches the client');
+    assert.ok(response.text.includes(DELTA));
+    assert.ok(response.text.includes(COMPLETED));
+    assert.equal(failures(), 0, 'a replayed attempt must not trigger the soft-avoid hook');
+    assert.deepEqual(snapshotAccounts(manager), before);
+    for (const account of manager.accounts) assert.equal(account.status, 'active');
+  } finally {
+    await closeServer(proxy);
+    await closeServer(upstream);
+  }
+}));
+
+// (a') an `error` event with no code (the backend's generic failure) is a
+// capacity failure too — single account, so recovery goes through the backoff.
+test('codex pre-output error event without a code is replayed after the fleet backoff', () => withEnv(FAST_ENV, async () => {
+  let hits = 0;
+  const upstream = http.createServer(async (req, res) => {
+    await drainRequest(req);
+    hits += 1;
+    if (hits === 1) sse(res, [CREATED, PING, ERROR_NO_CODE]);
+    else sse(res, [CREATED, DELTA, COMPLETED]);
+  });
+  const upstreamPort = await listen(upstream);
+  const manager = codexManager(['codex-solo']);
+  const proxy = codexProxy(manager, upstreamPort);
+  const proxyPort = await listen(proxy);
+  try {
+    const response = await postResponses(proxyPort);
+    assert.equal(response.status, 200);
+    assert.equal(hits, 2);
+    assert.equal(count(response.text, 'event: response.created'), 1);
+    assert.equal(count(response.text, 'event: error'), 0);
+    assert.ok(response.text.includes(COMPLETED));
+    assert.equal(manager.accounts[0].status, 'active');
+  } finally {
+    await closeServer(proxy);
+    await closeServer(upstream);
+  }
+}));
+
+// (b) every attempt fails pre-output: after the bounded budget the client gets
+// EXACTLY the legacy bytes (200 + staged frames + the failure frame, once each),
+// the soft-avoid hook fires once, and no account is throttled or errored.
+test('codex pre-output failure on every account exhausts the budget, then passes the legacy stream through', () => withEnv(FAST_ENV, async () => {
+  let hits = 0;
+  const upstream = http.createServer(async (req, res) => {
+    await drainRequest(req);
+    hits += 1;
+    sse(res, [CREATED, IN_PROGRESS, failedFrame('slow_down')]);
+  });
+  const upstreamPort = await listen(upstream);
+  const manager = codexManager(['codex-a', 'codex-b']);
+  const before = snapshotAccounts(manager);
+  const failures = countUpstreamFailures(manager);
+  const proxy = codexProxy(manager, upstreamPort);
+  const proxyPort = await listen(proxy);
+  try {
+    const response = await postResponses(proxyPort);
+    assert.equal(response.status, 200);
+    // 2 accounts × (1 initial round + 2 fleet backoffs)
+    assert.equal(hits, 6);
+    assert.equal(response.text, CREATED + IN_PROGRESS + failedFrame('slow_down'));
+    assert.equal(failures(), 1, 'the soft-avoid hook fires exactly once, on the final passthrough');
+    assert.deepEqual(snapshotAccounts(manager), before);
+  } finally {
+    await closeServer(proxy);
+    await closeServer(upstream);
+  }
+}));
+
+// (c) an output-bearing frame already went live: the later failure is relayed
+// as before (no replay, one hit) and the soft-avoid hook fires once.
+test('codex failure after response.output_text.delta keeps the legacy passthrough', () => withEnv(FAST_ENV, async () => {
+  let hits = 0;
+  const upstream = http.createServer(async (req, res) => {
+    await drainRequest(req);
+    hits += 1;
+    sse(res, [CREATED, DELTA, failedFrame('server_is_overloaded')]);
+  });
+  const upstreamPort = await listen(upstream);
+  const manager = codexManager(['codex-a', 'codex-b']);
+  const failures = countUpstreamFailures(manager);
+  const proxy = codexProxy(manager, upstreamPort);
+  const proxyPort = await listen(proxy);
+  try {
+    const response = await postResponses(proxyPort);
+    assert.equal(response.status, 200);
+    assert.equal(hits, 1);
+    assert.equal(response.text, CREATED + DELTA + failedFrame('server_is_overloaded'));
+    assert.equal(failures(), 1);
+  } finally {
+    await closeServer(proxy);
+    await closeServer(upstream);
+  }
+}));
+
+// (d) staging overflow (> 64 KiB of acknowledgement frames) flushes and goes
+// live; a failure after that is not replayed.
+// Pin the bound so this exercises the cumulative-overflow path regardless of the
+// default (which moved 64 KiB → 1 MiB on 2026-09-17).
+test('codex staging overflow goes live and is not replayed', () => withEnv({ ...FAST_ENV, CODEX_PRESTREAM_STAGE_MAX_BYTES: '65536' }, async () => {
+  const pad = 'x'.repeat(8 * 1024);
+  const bigAck = `event: response.in_progress\ndata: ${JSON.stringify({ type: 'response.in_progress', pad })}\n\n`;
+  let hits = 0;
+  const upstream = http.createServer(async (req, res) => {
+    await drainRequest(req);
+    hits += 1;
+    sse(res, [CREATED, ...Array(10).fill(bigAck), failedFrame('server_is_overloaded')]);
+  });
+  const upstreamPort = await listen(upstream);
+  const manager = codexManager(['codex-a', 'codex-b']);
+  const proxy = codexProxy(manager, upstreamPort);
+  const proxyPort = await listen(proxy);
+  try {
+    const response = await postResponses(proxyPort);
+    assert.equal(response.status, 200);
+    assert.equal(hits, 1);
+    assert.equal(count(response.text, 'event: response.in_progress'), 10);
+    assert.equal(count(response.text, 'event: response.failed'), 1);
+  } finally {
+    await closeServer(proxy);
+    await closeServer(upstream);
+  }
+}));
+
+// (e) an unsupported / multiple content-encoding is out of scope: legacy path,
+// raw bytes untouched, no staging, no replay.
+test('codex stream with an unsupported content-encoding keeps the legacy path (no staging, no replay)', () => withEnv(FAST_ENV, async () => {
+  const payload = gzipSync(Buffer.from(CREATED + failedFrame('server_is_overloaded')));
+  let hits = 0;
+  const upstream = http.createServer(async (req, res) => {
+    await drainRequest(req);
+    hits += 1;
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'content-encoding': 'gzip, br' });
+    res.end(payload);
+  });
+  const upstreamPort = await listen(upstream);
+  const manager = codexManager(['codex-a', 'codex-b']);
+  const proxy = codexProxy(manager, upstreamPort);
+  const proxyPort = await listen(proxy);
+  try {
+    const response = await rawPost(proxyPort);
+    assert.equal(response.status, 200);
+    assert.equal(hits, 1);
+    assert.equal(response.headers['content-encoding'], 'gzip, br');
+    assert.ok(response.buffer.equals(payload), 'raw bytes are relayed untouched');
+  } finally {
+    await closeServer(proxy);
+    await closeServer(upstream);
+  }
+}));
+
+// (g1) production shape: gzip stream, frames sync-flushed. A pre-output
+// response.failed is replayed on the other account; the client receives the
+// successful stream still gzip-encoded, with exactly one response.created.
+test('codex gzip pre-output response.failed is replayed onto another account, encoding preserved', () => withEnv(FAST_ENV, async () => {
+  let hits = 0;
+  const upstream = http.createServer(async (req, res) => {
+    await drainRequest(req);
+    hits += 1;
+    if (hits === 1) gzipFrames(res, [CREATED, IN_PROGRESS, failedFrame('server_is_overloaded')]);
+    else gzipFrames(res, [CREATED, DELTA, COMPLETED]);
+  });
+  const upstreamPort = await listen(upstream);
+  const manager = codexManager(['codex-a', 'codex-b']);
+  const failures = countUpstreamFailures(manager);
+  const proxy = codexProxy(manager, upstreamPort);
+  const proxyPort = await listen(proxy);
+  try {
+    const response = await rawPost(proxyPort);
+    assert.equal(response.status, 200);
+    assert.equal(hits, 2);
+    assert.equal(response.headers['content-encoding'], 'gzip');
+    const text = gunzipSync(response.buffer).toString('utf8');
+    assert.equal(count(text, 'event: response.created'), 1, 'exactly one response.created');
+    assert.equal(count(text, 'event: response.failed'), 0);
+    assert.ok(text.includes(DELTA) && text.includes(COMPLETED));
+    assert.equal(failures(), 0);
+    for (const account of manager.accounts) assert.equal(account.status, 'active');
+  } finally {
+    await closeServer(proxy);
+    await closeServer(upstream);
+  }
+}));
+
+// (g2) gzip failure after an output delta: legacy passthrough, bytes identical.
+test('codex gzip failure after an output delta keeps the legacy passthrough byte-for-byte', () => withEnv(FAST_ENV, async () => {
+  const payload = gzipSync(Buffer.from(CREATED + DELTA + failedFrame('server_is_overloaded')));
+  let hits = 0;
+  const upstream = http.createServer(async (req, res) => {
+    await drainRequest(req);
+    hits += 1;
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'content-encoding': 'gzip' });
+    res.end(payload);
+  });
+  const upstreamPort = await listen(upstream);
+  const manager = codexManager(['codex-a', 'codex-b']);
+  const failures = countUpstreamFailures(manager);
+  const proxy = codexProxy(manager, upstreamPort);
+  const proxyPort = await listen(proxy);
+  try {
+    const response = await rawPost(proxyPort);
+    assert.equal(response.status, 200);
+    assert.equal(hits, 1);
+    assert.equal(response.headers['content-encoding'], 'gzip');
+    assert.ok(response.buffer.equals(payload), 'raw gzip bytes are relayed untouched');
+    assert.equal(failures(), 1);
+  } finally {
+    await closeServer(proxy);
+    await closeServer(upstream);
+  }
+}));
+
+// (g3) a gzip stream the decoder cannot settle goes live: raw bytes relayed,
+// nothing replayed.
+test('codex undecodable gzip stream goes live without a replay', () => withEnv(FAST_ENV, async () => {
+  const payload = Buffer.concat([
+    Buffer.from([0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03]), // valid gzip header
+    Buffer.from('this is not a deflate stream at all '.repeat(16)),
+  ]);
+  let hits = 0;
+  const upstream = http.createServer(async (req, res) => {
+    await drainRequest(req);
+    hits += 1;
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'content-encoding': 'gzip' });
+    res.end(payload);
+  });
+  const upstreamPort = await listen(upstream);
+  const manager = codexManager(['codex-a', 'codex-b']);
+  const proxy = codexProxy(manager, upstreamPort);
+  const proxyPort = await listen(proxy);
+  try {
+    const response = await rawPost(proxyPort);
+    assert.equal(response.status, 200);
+    assert.equal(hits, 1);
+    assert.ok(response.buffer.equals(payload), 'raw bytes are relayed untouched');
+    for (const account of manager.accounts) assert.equal(account.status, 'active');
+  } finally {
+    await closeServer(proxy);
+    await closeServer(upstream);
+  }
+}));
+
+// (f) the client disconnects during the fleet backoff: the wait ends at once
+// and the upstream is never hit again.
+test('codex client abort during the pre-output backoff stops the replay', () => withEnv({ ...FAST_ENV, TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS: '300', TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS: '300' }, async () => {
+  let hits = 0;
+  const upstream = http.createServer(async (req, res) => {
+    await drainRequest(req);
+    hits += 1;
+    sse(res, [CREATED, failedFrame('server_is_overloaded')]);
+  });
+  const upstreamPort = await listen(upstream);
+  const manager = codexManager(['codex-solo']);
+  const proxy = codexProxy(manager, upstreamPort);
+  const proxyPort = await listen(proxy);
+  try {
+    const request = http.request({
+      host: '127.0.0.1', port: proxyPort, path: '/codex/responses', method: 'POST',
+      headers: { 'content-type': 'application/json' },
+    });
+    request.on('error', () => {});
+    request.on('response', res => res.resume());
+    request.end(JSON.stringify({ model: 'gpt-5.6', input: [], stream: true }));
+    await waitFor(() => hits === 1);
+    await sleep(80); // inside the 300ms backoff
+    request.destroy();
+    await sleep(700); // well past where the second attempt would have landed
+    assert.equal(hits, 1);
+    assert.equal(manager.accounts[0].inflight, 0, 'the slot was released');
+  } finally {
+    await closeServer(proxy);
+    await closeServer(upstream);
+  }
+}));
+
+// (g) a non-transient rejection (usage_limit_reached) is never replayed.
+test('codex pre-output response.failed with a non-transient code is passed through', () => withEnv(FAST_ENV, async () => {
+  let hits = 0;
+  const upstream = http.createServer(async (req, res) => {
+    await drainRequest(req);
+    hits += 1;
+    sse(res, [CREATED, failedFrame('usage_limit_reached')]);
+  });
+  const upstreamPort = await listen(upstream);
+  const manager = codexManager(['codex-a', 'codex-b']);
+  const failures = countUpstreamFailures(manager);
+  const proxy = codexProxy(manager, upstreamPort);
+  const proxyPort = await listen(proxy);
+  try {
+    const response = await postResponses(proxyPort);
+    assert.equal(response.status, 200);
+    assert.equal(hits, 1);
+    assert.equal(response.text, CREATED + failedFrame('usage_limit_reached'));
+    assert.equal(failures(), 1);
+  } finally {
+    await closeServer(proxy);
+    await closeServer(upstream);
+  }
+}));
+
+// Kill switch shared with B1: TEAMCODEX_OVERLOAD_HOLD_MS=0 disables staging.
+test('TEAMCODEX_OVERLOAD_HOLD_MS=0 disables the pre-output replay', () => withEnv({ ...FAST_ENV, TEAMCODEX_OVERLOAD_HOLD_MS: '0' }, async () => {
+  let hits = 0;
+  const upstream = http.createServer(async (req, res) => {
+    await drainRequest(req);
+    hits += 1;
+    sse(res, [CREATED, failedFrame('server_is_overloaded')]);
+  });
+  const upstreamPort = await listen(upstream);
+  const manager = codexManager(['codex-a', 'codex-b']);
+  const proxy = codexProxy(manager, upstreamPort);
+  const proxyPort = await listen(proxy);
+  try {
+    const response = await postResponses(proxyPort);
+    assert.equal(response.status, 200);
+    assert.equal(hits, 1);
+    assert.equal(response.text, CREATED + failedFrame('server_is_overloaded'));
+  } finally {
+    await closeServer(proxy);
+    await closeServer(upstream);
+  }
+}));
+
+// B1 diagnostic: a codex 503 that is not replayable says why.
+test('codex non-JSON 503 logs the not-replayable reason', () => withEnv(FAST_ENV, async () => {
+  const upstream = http.createServer(async (req, res) => {
+    await drainRequest(req);
+    res.writeHead(503, { 'content-type': 'text/html' });
+    res.end('<html>Service Unavailable</html>');
+  });
+  const upstreamPort = await listen(upstream);
+  const manager = codexManager(['codex-a']);
+  const proxy = codexProxy(manager, upstreamPort);
+  const proxyPort = await listen(proxy);
+  const lines = [];
+  const originalLog = console.log;
+  console.log = (...args) => { lines.push(args.join(' ')); };
+  try {
+    const response = await postResponses(proxyPort);
+    assert.equal(response.status, 503);
+    assert.ok(lines.some(line => line === '[TeamCodex] 503 not replayable: non-json-body'), lines.join('\n'));
+  } finally {
+    console.log = originalLog;
+    await closeServer(proxy);
+    await closeServer(upstream);
+  }
+}));
+
+// Total staging cap: an upstream that keeps trickling small acknowledgements
+// under the idle timeout must not hold the client's headers past the cap. At
+// the cap the staged acks are flushed, the stream goes live and continues;
+// nothing is replayed and the upstream is kept.
+test('codex staging total-time cap goes live with the staged acks and never replays', () => withEnv({ ...FAST_ENV, CODEX_PRESTREAM_STAGE_MAX_MS: '1000' }, async () => {
+  let hits = 0;
+  const upstream = http.createServer(async (req, res) => {
+    await drainRequest(req);
+    hits += 1;
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(CREATED);
+    const started = Date.now();
+    const tick = setInterval(() => {
+      if (Date.now() - started >= 1600) {
+        clearInterval(tick);
+        res.write(DELTA);
+        res.end(COMPLETED);
+        return;
+      }
+      res.write(IN_PROGRESS); // every 25ms: far under the idle timeout
+    }, 25);
+    res.on('close', () => clearInterval(tick));
+  });
+  const upstreamPort = await listen(upstream);
+  const manager = codexManager(['codex-a', 'codex-b']);
+  const failures = countUpstreamFailures(manager);
+  const proxy = codexProxy(manager, upstreamPort);
+  const proxyPort = await listen(proxy);
+  try {
+    const startedAt = Date.now();
+    const response = await fetch(`http://127.0.0.1:${proxyPort}/codex/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-5.6', input: [], stream: true }),
+    });
+    const headersAfterMs = Date.now() - startedAt; // fetch resolves on headers
+    assert.equal(response.status, 200);
+    assert.ok(headersAfterMs >= 900 && headersAfterMs < 1500,
+      `headers arrived after ${headersAfterMs}ms (cap 1000ms, first upstream output at 1600ms)`);
+    const text = await response.text();
+    assert.equal(hits, 1);
+    assert.equal(count(text, 'event: response.created'), 1);
+    assert.ok(count(text, 'event: response.in_progress') >= 20, 'the acks staged before the cap were flushed');
+    assert.ok(text.includes(DELTA) && text.includes(COMPLETED), 'the stream continued live after the cap');
+    assert.equal(failures(), 0);
+    for (const account of manager.accounts) assert.equal(account.status, 'active');
+  } finally {
+    await closeServer(proxy);
+    await closeServer(upstream);
+  }
+}));
+
+test('classifyCodexSseFrame separates acknowledgements, output and failures', () => {
+  assert.deepEqual(classifyCodexSseFrame(': ping'), { kind: 'ack', event: null, code: null, phase: 'pre' });
+  assert.deepEqual(classifyCodexSseFrame('event: response.created\ndata: {"type":"response.created"}'), { kind: 'ack', event: 'response.created', code: null, phase: 'pre' });
+  assert.deepEqual(classifyCodexSseFrame('data: {"type":"response.in_progress"}'), { kind: 'ack', event: 'response.in_progress', code: null, phase: 'pre' });
+  assert.equal(classifyCodexSseFrame('event: response.output_item.added\ndata: {}').kind, 'output');
+  assert.equal(classifyCodexSseFrame('event: response.completed\ndata: {"type":"response.completed"}').kind, 'output');
+  assert.equal(classifyCodexSseFrame('data: not json').kind, 'output');
+  assert.deepEqual(
+    classifyCodexSseFrame('event: response.failed\ndata: {"type":"response.failed","response":{"error":{"code":"server_is_overloaded"}}}'),
+    { kind: 'failure', event: 'response.failed', code: 'server_is_overloaded', phase: null },
+  );
+  assert.deepEqual(
+    classifyCodexSseFrame('event: error\ndata: {"type":"error","error":{"code":"unauthorized"}}'),
+    { kind: 'failure', event: 'error', code: 'unauthorized', phase: null },
+  );
+  assert.deepEqual(
+    classifyCodexSseFrame('event: error\ndata: {"type":"error","message":"boom"}'),
+    { kind: 'failure', event: 'error', code: null, phase: null },
+  );
+});
+
+// The envelope/reasoning allowlist is closed: reasoning items, `response.reasoning*`
+// events and reasoning content parts stage; a message envelope, an output_text
+// part, an unknown item type and an unparseable payload all go live.
+test('classifyCodexSseFrame stages the envelope/reasoning phase and nothing else', () => {
+  assert.deepEqual(
+    classifyCodexSseFrame(REASONING_ITEM.trim()),
+    { kind: 'ack', event: 'response.output_item.added', code: null, phase: 'reasoning' },
+  );
+  for (const frame of [REASONING_PART, REASONING_DELTA,
+    'event: response.reasoning_summary_part.done\ndata: {"type":"response.reasoning_summary_part.done"}',
+    'event: response.reasoning_text.delta\ndata: {"type":"response.reasoning_text.delta","delta":"x"}',
+    'event: response.reasoning_summary_text.done\ndata: {"type":"response.reasoning_summary_text.done"}']) {
+    const verdict = classifyCodexSseFrame(String(frame).trim());
+    assert.equal(verdict.kind, 'ack', `${verdict.event} should stage`);
+    assert.equal(verdict.phase, 'reasoning');
+  }
+  assert.deepEqual(
+    classifyCodexSseFrame('event: response.content_part.added\ndata: {"type":"response.content_part.added","part":{"type":"summary_text"}}'),
+    { kind: 'ack', event: 'response.content_part.added', code: null, phase: 'reasoning' },
+  );
+  for (const frame of [MESSAGE_ITEM, TEXT_PART, ITEM_NO_TYPE, ITEM_UNPARSEABLE,
+    'event: response.output_item.added\ndata: {"item":{"type":"function_call"}}',
+    'event: response.content_part.added\ndata: {"part":{}}',
+    'event: response.output_item.done\ndata: {"item":{"type":"reasoning"}}']) {
+    const verdict = classifyCodexSseFrame(String(frame).trim());
+    assert.equal(verdict.kind, 'output', `${JSON.stringify(frame).slice(0, 60)} should go live`);
+    assert.equal(verdict.phase, null);
+  }
+});
+
+// (a) the measured production shape: the capacity failure lands one frame after
+// the reasoning envelope, so staging has to survive the envelope to catch it.
+test('codex pre-output failure after the reasoning envelope is replayed onto another account', () => withEnv(FAST_ENV, async () => {
+  let hits = 0;
+  const upstream = http.createServer(async (req, res) => {
+    await drainRequest(req);
+    hits += 1;
+    if (hits === 1) sse(res, [CREATED, IN_PROGRESS, REASONING_ITEM, REASONING_DELTA, failedFrame('server_is_overloaded')]);
+    else sse(res, [CREATED, DELTA, COMPLETED]);
+  });
+  const upstreamPort = await listen(upstream);
+  const manager = codexManager(['codex-a', 'codex-b']);
+  const before = snapshotAccounts(manager);
+  const failures = countUpstreamFailures(manager);
+  const proxy = codexProxy(manager, upstreamPort);
+  const proxyPort = await listen(proxy);
+  try {
+    const response = await postResponses(proxyPort);
+    assert.equal(response.status, 200);
+    assert.equal(hits, 2);
+    assert.equal(count(response.text, 'event: response.created'), 1, 'exactly one response.created');
+    assert.equal(count(response.text, 'event: response.failed'), 0);
+    assert.equal(count(response.text, 'event: response.output_item.added'), 0, 'the staged envelope is dropped with the failed attempt');
+    assert.ok(response.text.includes(DELTA) && response.text.includes(COMPLETED));
+    assert.equal(failures(), 0, 'a replayed attempt must not trigger the soft-avoid hook');
+    assert.deepEqual(snapshotAccounts(manager), before);
+  } finally {
+    await closeServer(proxy);
+    await closeServer(upstream);
+  }
+}));
+
+// (b) an output_text content part IS user-visible: staging ends there and the
+// later failure is the legacy passthrough, byte for byte.
+test('codex failure after an output_text content part keeps the legacy passthrough', () => withEnv(FAST_ENV, async () => {
+  const frames = [CREATED, IN_PROGRESS, REASONING_ITEM, TEXT_PART, failedFrame('server_is_overloaded')];
+  let hits = 0;
+  const upstream = http.createServer(async (req, res) => {
+    await drainRequest(req);
+    hits += 1;
+    sse(res, frames);
+  });
+  const upstreamPort = await listen(upstream);
+  const manager = codexManager(['codex-a', 'codex-b']);
+  const proxy = codexProxy(manager, upstreamPort);
+  const proxyPort = await listen(proxy);
+  try {
+    const response = await postResponses(proxyPort);
+    assert.equal(response.status, 200);
+    assert.equal(hits, 1, 'an output-bearing frame ends staging: no replay');
+    assert.equal(response.text, frames.join(''), 'legacy bytes, unchanged');
+  } finally {
+    await closeServer(proxy);
+    await closeServer(upstream);
+  }
+}));
+
+// (c) a message envelope is NOT the reasoning phase — it opens visible output.
+test('codex failure after a message output_item.added keeps the legacy passthrough', () => withEnv(FAST_ENV, async () => {
+  const frames = [CREATED, MESSAGE_ITEM, failedFrame('server_is_overloaded')];
+  let hits = 0;
+  const upstream = http.createServer(async (req, res) => {
+    await drainRequest(req);
+    hits += 1;
+    sse(res, frames);
+  });
+  const upstreamPort = await listen(upstream);
+  const manager = codexManager(['codex-a', 'codex-b']);
+  const proxy = codexProxy(manager, upstreamPort);
+  const proxyPort = await listen(proxy);
+  try {
+    const response = await postResponses(proxyPort);
+    assert.equal(response.status, 200);
+    assert.equal(hits, 1);
+    assert.equal(response.text, frames.join(''));
+  } finally {
+    await closeServer(proxy);
+    await closeServer(upstream);
+  }
+}));
+
+// (d) fail safe to live: an absent or unparseable item.type is output, never ack.
+test('codex output_item.added with an unparseable or absent item.type is treated as output', () => withEnv(FAST_ENV, async () => {
+  for (const envelope of [ITEM_NO_TYPE, ITEM_UNPARSEABLE]) {
+    const frames = [CREATED, IN_PROGRESS, envelope, failedFrame('server_is_overloaded')];
+    let hits = 0;
+    const upstream = http.createServer(async (req, res) => {
+      await drainRequest(req);
+      hits += 1;
+      sse(res, frames);
+    });
+    const upstreamPort = await listen(upstream);
+    const manager = codexManager(['codex-a', 'codex-b']);
+    const proxy = codexProxy(manager, upstreamPort);
+    const proxyPort = await listen(proxy);
+    try {
+      const response = await postResponses(proxyPort);
+      assert.equal(response.status, 200);
+      assert.equal(hits, 1, `${envelope.slice(0, 40)} must not be staged as an ack`);
+      assert.equal(response.text, frames.join(''));
+    } finally {
+      await closeServer(proxy);
+      await closeServer(upstream);
+    }
+  }
+}));
+
+// (e) reasoning can outlast a capacity failure by minutes, so the reasoning
+// phase has its own short budget: flush the staged bytes and go live.
+test('codex reasoning past CODEX_PRESTREAM_REASONING_MAX_MS flushes and goes live', () => withEnv({ ...FAST_ENV, CODEX_PRESTREAM_REASONING_MAX_MS: '1000' }, async () => {
+  const REASONING_ROUNDS = 12;
+  let hits = 0;
+  const upstream = http.createServer(async (req, res) => {
+    await drainRequest(req);
+    hits += 1;
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(CREATED);
+    res.write(IN_PROGRESS);
+    res.write(REASONING_ITEM);
+    for (let i = 0; i < REASONING_ROUNDS; i += 1) {
+      await sleep(150);
+      if (res.writableEnded || res.destroyed) return;
+      res.write(REASONING_DELTA);
+    }
+    res.write(DELTA);
+    res.write(COMPLETED);
+    res.end();
+  });
+  const upstreamPort = await listen(upstream);
+  const manager = codexManager(['codex-a', 'codex-b']);
+  const failures = countUpstreamFailures(manager);
+  const proxy = codexProxy(manager, upstreamPort);
+  const proxyPort = await listen(proxy);
+  try {
+    const startedAt = Date.now();
+    const response = await fetch(`http://127.0.0.1:${proxyPort}/codex/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-5.6', input: [], stream: true }),
+    });
+    const headersAfterMs = Date.now() - startedAt; // fetch resolves on headers
+    assert.equal(response.status, 200);
+    assert.ok(headersAfterMs >= 900 && headersAfterMs < 1600,
+      `headers arrived after ${headersAfterMs}ms (reasoning cap 1000ms, first output frame at ~1800ms)`);
+    const text = await response.text();
+    assert.equal(hits, 1, 'the reasoning cap never replays');
+    assert.equal(
+      text,
+      CREATED + IN_PROGRESS + REASONING_ITEM + REASONING_DELTA.repeat(REASONING_ROUNDS) + DELTA + COMPLETED,
+      'every staged byte was flushed and the stream continued live',
+    );
+    assert.equal(failures(), 0);
+    for (const account of manager.accounts) assert.equal(account.status, 'active');
+  } finally {
+    await closeServer(proxy);
+    await closeServer(upstream);
+  }
+}));
+
+// (f) the production backend streams gzip: the same envelope-phase replay must
+// work through the side decoder, with the encoding preserved.
+test('codex gzip pre-output failure after the reasoning envelope is replayed, encoding preserved', () => withEnv(FAST_ENV, async () => {
+  let hits = 0;
+  const upstream = http.createServer(async (req, res) => {
+    await drainRequest(req);
+    hits += 1;
+    if (hits === 1) gzipFrames(res, [CREATED, IN_PROGRESS, REASONING_ITEM, REASONING_PART, REASONING_DELTA, failedFrame('server_is_overloaded')]);
+    else gzipFrames(res, [CREATED, DELTA, COMPLETED]);
+  });
+  const upstreamPort = await listen(upstream);
+  const manager = codexManager(['codex-a', 'codex-b']);
+  const failures = countUpstreamFailures(manager);
+  const proxy = codexProxy(manager, upstreamPort);
+  const proxyPort = await listen(proxy);
+  try {
+    const response = await rawPost(proxyPort);
+    assert.equal(response.status, 200);
+    assert.equal(hits, 2);
+    assert.equal(response.headers['content-encoding'], 'gzip');
+    const text = gunzipSync(response.buffer).toString('utf8');
+    assert.equal(count(text, 'event: response.created'), 1, 'exactly one response.created');
+    assert.equal(count(text, 'event: response.failed'), 0);
+    assert.equal(count(text, 'event: response.output_item.added'), 0);
+    assert.ok(text.includes(DELTA) && text.includes(COMPLETED));
+    assert.equal(failures(), 0);
+  } finally {
+    await closeServer(proxy);
+    await closeServer(upstream);
+  }
+}));
+
+// (g) the gate diagnostics: a staging reservation it cannot get must SAY so —
+// "never staged" and "staged then failed" used to look identical in the log.
+test('codex prestream logs a skip diagnostic when the auxiliary byte budget is unavailable', () => withEnv(FAST_ENV, async () => {
+  const frames = [CREATED, IN_PROGRESS, REASONING_ITEM, failedFrame('server_is_overloaded')];
+  let hits = 0;
+  const upstream = http.createServer(async (req, res) => {
+    await drainRequest(req);
+    hits += 1;
+    sse(res, frames);
+  });
+  const upstreamPort = await listen(upstream);
+  const manager = codexManager(['codex-a', 'codex-b']);
+  const proxy = createProxyServer(manager, {
+    provider: 'codex',
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false,
+    codexUsageRefresh: false,
+    maxBufferedResponseBytes: 1024, // below the 64 KiB staging reservation
+  });
+  const proxyPort = await listen(proxy);
+  const logs = [];
+  const originalLog = console.log;
+  console.log = (...args) => { logs.push(args.map(String).join(' ')); };
+  try {
+    const response = await postResponses(proxyPort);
+    assert.equal(response.status, 200);
+    assert.equal(hits, 1, 'no staging, so no replay');
+    assert.equal(response.text, frames.join(''), 'legacy bytes, unchanged');
+  } finally {
+    console.log = originalLog;
+    await closeServer(proxy);
+    await closeServer(upstream);
+  }
+  assert.ok(
+    logs.includes('[TeamCodex] prestream skip: aux-budget'),
+    `expected an aux-budget skip diagnostic, got ${JSON.stringify(logs)}`,
+  );
+  assert.equal(
+    logs.filter(line => line.startsWith('[TeamCodex] prestream live')).length, 0,
+    'nothing was staged, so nothing went live',
+  );
+}));
+
+// The diagnostics are codex-only: the Claude pool is a different product
+// surface and must not gain a `prestream skip` line on every stream.
+test('anthropic mode never logs a prestream diagnostic', () => withEnv(FAST_ENV, async () => {
+  const upstream = http.createServer(async (req, res) => {
+    await drainRequest(req);
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1"}}\n\n');
+    res.write('event: message_stop\ndata: {"type":"message_stop"}\n\n');
+    res.end();
+  });
+  const upstreamPort = await listen(upstream);
+  const manager = new AccountManager([{
+    name: 'claude-a',
+    type: 'oauth',
+    accessToken: 'pooled-access-token-claude-a',
+    expiresAt: Date.now() + 3_600_000,
+  }]);
+  const proxy = createProxyServer(manager, {
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false,
+  });
+  const proxyPort = await listen(proxy);
+  const logs = [];
+  const originalLog = console.log;
+  console.log = (...args) => { logs.push(args.map(String).join(' ')); };
+  try {
+    const response = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-sonnet-5', max_tokens: 16, stream: true, messages: [] }),
+    });
+    assert.equal(response.status, 200);
+    assert.ok((await response.text()).includes('event: message_stop'));
+  } finally {
+    console.log = originalLog;
+    await closeServer(proxy);
+    await closeServer(upstream);
+  }
+  assert.equal(
+    logs.filter(line => line.startsWith('[TeamCodex] prestream')).length, 0,
+    `anthropic mode must emit no B2 diagnostics, got ${JSON.stringify(logs)}`,
+  );
+}));
+
+// (a) The 2026-09-17 live finding: a real session's first `response.created`
+// echoes instructions + the whole tools array, so it blew the old 64 KiB bound,
+// SseFramer abandoned framing, and the stager judged ZERO frames — every such
+// turn fell through to legacy. At the 1 MiB default it stages and replays.
+test('codex 200 KiB first frame still stages: the pre-output failure is replayed', () => withEnv(FAST_ENV, async () => {
+  const bigCreated = hugeCreatedFrame(200 * 1024);
+  assert.ok(Buffer.byteLength(bigCreated) > 64 * 1024, 'must exceed the old 64 KiB bound');
+  assert.ok(Buffer.byteLength(bigCreated) < 1024 * 1024, 'must fit under the 1 MiB default');
+  let hits = 0;
+  const upstream = http.createServer(async (req, res) => {
+    await drainRequest(req);
+    hits += 1;
+    if (hits === 1) sse(res, [bigCreated, IN_PROGRESS, REASONING_ITEM, failedFrame('server_is_overloaded')]);
+    else sse(res, [CREATED, DELTA, COMPLETED]);
+  });
+  const upstreamPort = await listen(upstream);
+  const manager = codexManager(['codex-a', 'codex-b']);
+  const failures = countUpstreamFailures(manager);
+  const proxy = codexProxy(manager, upstreamPort);
+  const proxyPort = await listen(proxy);
+  const captured = captureConsole();
+  try {
+    const response = await postResponses(proxyPort);
+    assert.equal(response.status, 200);
+    assert.equal(hits, 2, 'a large first frame must not defeat staging');
+    assert.equal(count(response.text, 'event: response.created'), 1);
+    assert.equal(count(response.text, 'event: response.failed'), 0);
+    assert.ok(!response.text.includes('yyyy'), 'the staged oversized frame went with the failed attempt');
+    assert.ok(response.text.includes(DELTA) && response.text.includes(COMPLETED));
+    assert.equal(failures(), 0);
+  } finally {
+    captured.restore();
+    await closeServer(proxy);
+    await closeServer(upstream);
+  }
+  assert.equal(
+    captured.logs.filter(line => line.includes('frame-overflow')).length, 0,
+    `no frame overflow expected, got ${JSON.stringify(captured.logs)}`,
+  );
+}));
+
+// (b) A frame past the bound still degrades to raw passthrough — but now it SAYS
+// so, instead of the `none after 0 frames` that cost a live bisect.
+test('codex first frame above the staging bound goes live with a frame-overflow reason', () => withEnv(FAST_ENV, async () => {
+  const oversized = hugeCreatedFrame(1200 * 1024);
+  assert.ok(Buffer.byteLength(oversized) > 1024 * 1024, 'must exceed the 1 MiB default');
+  const frames = [oversized, IN_PROGRESS, failedFrame('server_is_overloaded')];
+  let hits = 0;
+  const upstream = http.createServer(async (req, res) => {
+    await drainRequest(req);
+    hits += 1;
+    sse(res, frames);
+  });
+  const upstreamPort = await listen(upstream);
+  const manager = codexManager(['codex-a', 'codex-b']);
+  const proxy = codexProxy(manager, upstreamPort);
+  const proxyPort = await listen(proxy);
+  const captured = captureConsole();
+  try {
+    const response = await postResponses(proxyPort);
+    assert.equal(response.status, 200);
+    assert.equal(hits, 1, 'framing was abandoned, so nothing is replayed');
+    assert.equal(response.text, frames.join(''), 'legacy bytes, unchanged');
+  } finally {
+    captured.restore();
+    await closeServer(proxy);
+    await closeServer(upstream);
+  }
+  assert.ok(
+    captured.logs.some(line => line.startsWith('[TeamCodex] prestream live on "codex-a"')
+      && line.includes(': frame-overflow after ')),
+    `expected a frame-overflow diagnostic, got ${JSON.stringify(captured.logs)}`,
+  );
+}));
+
+// (c) the bound is env-tunable: lowering it makes the (a) stream behave like (b).
+test('CODEX_PRESTREAM_STAGE_MAX_BYTES lowers the bound and the 200 KiB frame overflows', () => withEnv({ ...FAST_ENV, CODEX_PRESTREAM_STAGE_MAX_BYTES: '65536' }, async () => {
+  const frames = [hugeCreatedFrame(200 * 1024), IN_PROGRESS, failedFrame('server_is_overloaded')];
+  let hits = 0;
+  const upstream = http.createServer(async (req, res) => {
+    await drainRequest(req);
+    hits += 1;
+    sse(res, frames);
+  });
+  const upstreamPort = await listen(upstream);
+  const manager = codexManager(['codex-a', 'codex-b']);
+  const proxy = codexProxy(manager, upstreamPort);
+  const proxyPort = await listen(proxy);
+  const captured = captureConsole();
+  try {
+    const response = await postResponses(proxyPort);
+    assert.equal(response.status, 200);
+    assert.equal(hits, 1, 'the lowered bound must defeat staging again');
+    assert.equal(response.text, frames.join(''));
+  } finally {
+    captured.restore();
+    await closeServer(proxy);
+    await closeServer(upstream);
+  }
+  assert.ok(
+    captured.logs.some(line => line.includes(': frame-overflow after ')),
+    `expected a frame-overflow diagnostic, got ${JSON.stringify(captured.logs)}`,
+  );
+}));
+
+// The live diagnostic names WHY staging ended, not just "none".
+test('prestream live diagnostics name the reason (output / cap)', () => withEnv({ ...FAST_ENV, CODEX_PRESTREAM_STAGE_MAX_MS: '1000' }, async () => {
+  const upstream = http.createServer(async (req, res) => {
+    await drainRequest(req);
+    sse(res, [CREATED, IN_PROGRESS, DELTA, COMPLETED]);
+  });
+  const upstreamPort = await listen(upstream);
+  const manager = codexManager(['codex-a']);
+  const proxy = codexProxy(manager, upstreamPort);
+  const proxyPort = await listen(proxy);
+  const captured = captureConsole();
+  try {
+    assert.equal((await postResponses(proxyPort)).status, 200);
+  } finally {
+    captured.restore();
+    await closeServer(proxy);
+    await closeServer(upstream);
+  }
+  assert.ok(
+    // 3 = created + in_progress + the delta that ended staging (the terminating
+    // frame is counted too — `frames` is "frames classified", not "frames held").
+    captured.logs.some(line => line.includes(': output:response.output_text.delta after 3 frames,')),
+    `expected an output: reason, got ${JSON.stringify(captured.logs)}`,
+  );
+}));

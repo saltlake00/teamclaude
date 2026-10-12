@@ -37,6 +37,7 @@ import {
   rankCodexResetCreditCandidates,
   withinCodexResetCreditGrace,
 } from './codex-reset-credits.js';
+import { DEFAULT_CODEX_CREDIT_REFUSAL_MS, codexCreditRefusalEvidence } from './codex-credits.js';
 import {
   CODEX_INVOCATION_HEADER,
   CODEX_RECOVERY_SESSION_HEADER,
@@ -106,6 +107,36 @@ function requestUpstreamRaw(url, { method, headers, body, signal }) {
   });
 }
 
+// Request-scoped credit-gate scope (a Set of accounts this request may not
+// use) that also records whether the request's single reset-credit pass is
+// already charged. AccountManager only reads it through `has()`; the flag is
+// consumed by the server-installed creditDeferral.
+class CreditScope extends Set {
+  constructor(items, { resetCreditsSpent = false } = {}) {
+    super(items || []);
+    this.resetCreditsSpent = resetCreditsSpent;
+  }
+}
+
+// Credit-refusal evidence lives in the 429 body, which the codex path keeps
+// as raw (possibly gzip/br) bytes for the client. Inspect a bounded, decoded
+// COPY under the auxiliary memory budget; an undecodable or oversized body is
+// simply no evidence (never a hold, never a throw). A failed reservation is
+// logged: the long credit hold is then skipped and the account only takes the
+// short throttle, which an operator must be able to see under load.
+function creditRefusalInBody(ctx, body, contentEncoding, accountName = '') {
+  if (!ctx.reserveAuxiliaryResponseBytes(CODEX_ERROR_INSPECTION_MAX_BYTES)) {
+    console.log(`[TeamCodex] 429 on credit-backed "${accountName}": credit refusal check skipped — auxiliary response budget full, no credit hold applied`);
+    return false;
+  }
+  try {
+    const decoded = decodeBodyForInspection(body, contentEncoding, CODEX_ERROR_INSPECTION_MAX_BYTES);
+    return decoded != null && codexCreditRefusalEvidence({ bodyText: decoded.toString('utf8') });
+  } finally {
+    ctx.releaseAuxiliaryResponseBytes(CODEX_ERROR_INSPECTION_MAX_BYTES);
+  }
+}
+
 function decodeBodyForInspection(body, contentEncoding, maxBytes) {
   if (body.length > maxBytes) return null;
   const encodings = String(contentEncoding || '')
@@ -130,6 +161,437 @@ function decodeBodyForInspection(body, contentEncoding, maxBytes) {
     return decoded;
   } catch {
     return null;
+  }
+}
+
+// Codex-mode capacity replay (qjc fork, "B1"). The Codex backend answers a
+// capacity rejection with a COMPLETE HTTP 503 (or 529) whose body is a small
+// JSON error object. A complete JSON error means the request was refused
+// before inference started, so replaying it cannot duplicate inference, tool
+// side effects, or billing. Only that exact shape is replayable — see the
+// RETRYABLE_STATUS handler in forwardRequest. Anything else (HTML from a CDN,
+// a truncated body, an SSE stream, a body over the inspection bound) stays on
+// the legacy no-replay passthrough.
+const CODEX_CAPACITY_REPLAY_STATUS = new Set([503, 529]);
+
+// The admission predicate for that replay. Exported so the client-side
+// guards (`headersSent` / `writableEnded` / `destroyed`) can be pinned by a
+// unit test with a fake `res` — through the HTTP black box the proxy never
+// sends headers before the 5xx handler runs, so `headersSent` cannot be
+// exercised end-to-end. Pure: reads flags only, no side effects.
+export function codexCapacityReplayEligible({ replaySafe, provider, method, url, status, res }) {
+  return !replaySafe && provider === 'codex' && method === 'POST'
+    && isCodexResponsesPath(url) && CODEX_CAPACITY_REPLAY_STATUS.has(status)
+    && res != null && !res.headersSent && !res.writableEnded && !res.destroyed;
+}
+
+function isCodexCapacityRejectionBody(decoded) {
+  let parsed;
+  try {
+    parsed = JSON.parse(decoded.toString('utf8'));
+  } catch {
+    return false;
+  }
+  return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+    && (Object.hasOwn(parsed, 'error') || Object.hasOwn(parsed, 'detail'));
+}
+
+// Reads a codex 503/529 body under the auxiliary inspection budget and reports
+// WHY it is not a replayable capacity rejection (`null` = replayable). It
+// ALWAYS consumes or cancels the upstream body — the caller must not cancel it
+// again (the reader lock would make that throw). A read error (truncated/
+// aborted body) is not a complete rejection and is therefore not replayable.
+async function readCodexCapacityRejection(upstreamRes, ctx) {
+  if (!ctx.reserveAuxiliaryResponseBytes(CODEX_ERROR_INSPECTION_MAX_BYTES)) {
+    try { await upstreamRes.body?.cancel(); } catch { /* already errored/closed */ }
+    // Not the body's fault: the shared response budget is momentarily full.
+    return 'aux-budget';
+  }
+  try {
+    const raw = await readBodyBounded(upstreamRes.body, CODEX_ERROR_INSPECTION_MAX_BYTES);
+    if (raw === null) return 'oversize-body';
+    const decoded = decodeBodyForInspection(
+      raw,
+      upstreamRes.headers.get('content-encoding'),
+      CODEX_ERROR_INSPECTION_MAX_BYTES,
+    );
+    if (decoded == null) return 'non-json-body';
+    return isCodexCapacityRejectionBody(decoded) ? null : 'non-json-body';
+  } catch {
+    return 'read-error';
+  } finally {
+    ctx.releaseAuxiliaryResponseBytes(CODEX_ERROR_INSPECTION_MAX_BYTES);
+  }
+}
+
+// Codex-mode pre-output stream replay (qjc fork, "B2"). Under load the Codex
+// backend also rejects capacity INSIDE an HTTP 200 SSE stream: it acknowledges
+// the request (`response.created` / `response.in_progress`) and then ends with
+// a `response.failed` (error code `server_is_overloaded` / `slow_down`) or an
+// `error` event before producing a single output item — or the stream simply
+// dies. codex-rs maps that to "Selected model is at capacity" and never
+// retries. Nothing output-bearing was produced, so the request can be replayed
+// on another account without duplicating inference or tool side effects.
+//
+// The relay therefore STAGES whole SSE frames while every frame so far is
+// non-output (bounded by CODEX_PRESTREAM_STAGE_MAX_BYTES); the first
+// output-bearing frame sends the client headers, flushes the staged frames and
+// hands the stream to the ordinary live passthrough unchanged. A pre-output
+// failure is replayed through the same failover/backoff loop B1 uses; when
+// the budget or hold cap is spent, or the failure is not a capacity one, the
+// client receives EXACTLY what legacy delivered (200 + staged frames + the
+// failure frame, via the same streamResponse path — so the terminal-event
+// hook, usage parsing and request logging all run as before).
+// Staging byte bound. A real session's FIRST frame is NOT small: `response.created`
+// echoes the request's `instructions` and the whole `tools` array back, so a session
+// with ~14 MCP servers and a large skill set emits a `response.created` of several
+// hundred KiB. At the original 64 KiB bound `SseFramer` abandoned framing on that
+// very first frame, the stager judged ZERO frames, and every such turn fell through
+// to the legacy passthrough — measured live 2026-09-17 right after deploy c4ad3c37 as
+// `[TeamCodex] prestream live on "<acct>": none after 0 frames, 3ms` on the exact
+// turns that died in 3-8s, while a small-tools probe of the same model staged
+// normally and was replayed to success. That bound, not the classifier, was the
+// last piece of "only real sessions fail fast".
+// Default 1 MiB, override with env CODEX_PRESTREAM_STAGE_MAX_BYTES, clamped to
+// [64 KiB, 16 MiB]. The reservation is taken from the shared response budget
+// (DEFAULT_MAX_BUFFERED_RESPONSE_BYTES, 256 MiB), so the cost is
+// (concurrently staging streams × this bound).
+const CODEX_PRESTREAM_STAGE_DEFAULT_BYTES = 1024 * 1024;
+const CODEX_PRESTREAM_STAGE_MIN_BYTES = 64 * 1024;
+const CODEX_PRESTREAM_STAGE_CEILING_BYTES = 16 * 1024 * 1024;
+function codexPrestreamStageMaxBytes() {
+  return Math.min(CODEX_PRESTREAM_STAGE_CEILING_BYTES, Math.max(
+    CODEX_PRESTREAM_STAGE_MIN_BYTES,
+    envInt('CODEX_PRESTREAM_STAGE_MAX_BYTES', CODEX_PRESTREAM_STAGE_DEFAULT_BYTES),
+  ));
+}
+// Frames that only acknowledge the request — the backend has produced nothing.
+const CODEX_PRE_OUTPUT_EVENTS = new Set([
+  'response.created', 'response.queued', 'response.in_progress',
+]);
+// Envelope/reasoning frames: the backend has opened an item or is emitting a
+// reasoning summary, but NOTHING user-visible has streamed yet. A capacity
+// `response.failed` frequently lands one frame after `response.output_item.added`
+// (measured 2026-09-17: 3-8s turns failing with out_tokens=0), so staging has to
+// survive this phase or B2 only ever catches the rarest stream shape. Closed
+// allowlist — an unknown event name, an unparseable `data:` payload, or a missing
+// `item.type`/`part.type` is OUTPUT (fail safe to live, never to ack).
+const CODEX_REASONING_PART_TYPES = new Set(['summary_text', 'reasoning_text']);
+const CODEX_REASONING_EVENT_PREFIX = 'response.reasoning';
+// Pre-output failure codes that mean capacity, not a rejection of THIS request.
+// An absent code counts as capacity too (the backend's generic "An error
+// occurred while processing your request" carries none).
+const CODEX_PRESTREAM_REPLAYABLE_CODES = new Set(['server_is_overloaded', 'slow_down']);
+const CODEX_PRESTREAM_FAILURE_EVENTS = new Set(['response.failed', 'error']);
+// Total staging time cap, measured from the start of ONE staging attempt (env
+// CODEX_PRESTREAM_STAGE_MAX_MS; default = the TEAMCODEX_OVERLOAD_HOLD_MS value,
+// floor 1000). The idle timeout alone cannot bound a backend that keeps
+// trickling small acknowledgements under it; past this cap the staged bytes
+// are flushed and the stream goes live — no replay, upstream kept.
+const CODEX_PRESTREAM_STAGE_MIN_MS = 1000;
+const CODEX_PRESTREAM_CAP_MESSAGE = 'Codex pre-output staging cap reached';
+// Tighter cap for the reasoning phase (env CODEX_PRESTREAM_REASONING_MAX_MS,
+// floor 1000): measured from the FIRST staged envelope/reasoning frame.
+// Reasoning can run minutes while a capacity failure lands in seconds, and
+// holding reasoning back delays the visible "thinking" text, so the reasoning
+// phase gets its own short budget; on expiry the staged bytes flush and the
+// stream goes live (no replay, upstream kept) exactly like the total cap.
+const CODEX_PRESTREAM_REASONING_DEFAULT_MS = 20_000;
+const CODEX_PRESTREAM_REASONING_CAP_MESSAGE = 'Codex pre-output reasoning cap reached';
+// Per-account, per-reason throttle for the B2 diagnostics (gate skips and
+// "went live") so a busy pool cannot flood the log. Keyed by AccountManager so
+// each proxy instance (and each test server) has its own window.
+const CODEX_PRESTREAM_DIAG_THROTTLE_MS = 60_000;
+const codexPrestreamDiagSeen = new WeakMap();
+function codexPrestreamDiagAllowed(accountManager, account, reason) {
+  if (!accountManager) return true;
+  let seen = codexPrestreamDiagSeen.get(accountManager);
+  if (!seen) { seen = new Map(); codexPrestreamDiagSeen.set(accountManager, seen); }
+  const key = `${account?.name ?? '?'} ${reason}`;
+  const now = Date.now();
+  const last = seen.get(key);
+  if (last != null && now - last < CODEX_PRESTREAM_DIAG_THROTTLE_MS) return false;
+  seen.set(key, now);
+  return true;
+}
+// Encodings the stager can classify through a side decoder (the raw bytes are
+// what gets staged and forwarded; decoding is for classification only). A
+// missing/identity header is 'identity'; anything else or multiple encodings
+// returns null and keeps the legacy path. The production Codex backend streams
+// gzip, so identity-only staging never fired (2026-09-17 deployment).
+const CODEX_PRESTREAM_ENCODINGS = new Set(['identity', 'gzip', 'x-gzip', 'deflate', 'br']);
+export function codexPrestreamEncodingOf(contentEncoding) {
+  const encodings = String(contentEncoding || '')
+    .split(',')
+    .map(value => value.trim().toLowerCase())
+    .filter(Boolean);
+  if (encodings.length === 0) return 'identity';
+  if (encodings.length !== 1) return null;
+  return CODEX_PRESTREAM_ENCODINGS.has(encodings[0]) ? encodings[0] : null;
+}
+
+// Classify ONE whole SSE frame (the text between blank-line boundaries) for
+// the pre-output stager. Exported for unit tests. Returns
+//   { kind: 'ack' | 'output' | 'failure', event, code, phase }
+// `ack` = comment/ping, a pre-output acknowledgement, or an envelope/reasoning
+// frame that carries no user-visible content (keep staging); `output` =
+// anything else (go live); `failure` = `response.failed` / `error`.
+// `phase` is 'pre' for the acknowledgement phase and 'reasoning' for the
+// envelope/reasoning phase (which the tighter reasoning cap is measured from).
+export function classifyCodexSseFrame(block) {
+  const eventLines = [...block.matchAll(/^event:[ \t]?(.*)$/gm)];
+  const dataLines = [...block.matchAll(/^data:[ \t]?(.*)$/gm)].map(m => m[1]);
+  let event = eventLines.length ? eventLines[eventLines.length - 1][1].trim() : null;
+  let parsed = null;
+  if (dataLines.length) {
+    const data = dataLines.join('\n').trim();
+    if (data.startsWith('{')) {
+      try { parsed = JSON.parse(data); } catch { parsed = null; }
+    }
+    if (event == null && typeof parsed?.type === 'string') event = parsed.type;
+  }
+  if (event == null && !dataLines.length) return { kind: 'ack', event: null, code: null, phase: 'pre' };
+  if (event == null) return { kind: 'output', event: null, code: null, phase: null };
+  if (CODEX_PRE_OUTPUT_EVENTS.has(event)) return { kind: 'ack', event, code: null, phase: 'pre' };
+  if (CODEX_PRESTREAM_FAILURE_EVENTS.has(event)) {
+    const code = parsed?.response?.error?.code ?? parsed?.error?.code ?? parsed?.code ?? null;
+    return { kind: 'failure', event, code: typeof code === 'string' ? code : null, phase: null };
+  }
+  // Envelope/reasoning phase — still nothing user-visible on the wire.
+  if (event.startsWith(CODEX_REASONING_EVENT_PREFIX)) {
+    return { kind: 'ack', event, code: null, phase: 'reasoning' };
+  }
+  if (event === 'response.output_item.added') {
+    return parsed?.item?.type === 'reasoning'
+      ? { kind: 'ack', event, code: null, phase: 'reasoning' }
+      : { kind: 'output', event, code: null, phase: null };
+  }
+  if (event === 'response.content_part.added') {
+    const partType = parsed?.part?.type;
+    return typeof partType === 'string' && CODEX_REASONING_PART_TYPES.has(partType)
+      ? { kind: 'ack', event, code: null, phase: 'reasoning' }
+      : { kind: 'output', event, code: null, phase: null };
+  }
+  return { kind: 'output', event, code: null, phase: null };
+}
+
+// A duck-typed web stream that first yields `head` (the staged bytes) and then
+// either delegates to the real reader (`tail === 'delegate'`), ends
+// (`tail === 'done'`), or rethrows the stored upstream error — so the legacy
+// streamResponse path replays a staged attempt byte-for-byte, including how
+// it ended. Only the reader methods streamResponse uses are provided.
+function resumeStagedStream(reader, head, tail, pendingRead = null) {
+  let headPending = head.length > 0;
+  const wrapped = {
+    async read() {
+      if (headPending) {
+        headPending = false;
+        return { done: false, value: head };
+      }
+      if (tail === 'delegate') {
+        // A read still in flight when staging stopped (time cap) belongs to
+        // this stream now — consuming it here keeps its bytes.
+        if (pendingRead) {
+          const next = pendingRead;
+          pendingRead = null;
+          return next;
+        }
+        return reader.read();
+      }
+      if (tail === 'done') return { done: true, value: undefined };
+      throw tail;
+    },
+    cancel(reason) { return reader.cancel(reason); },
+    releaseLock() { reader.releaseLock(); },
+  };
+  return { getReader: () => wrapped };
+}
+
+// Stage whole SSE frames until the first output-bearing frame, a pre-output
+// failure, an abnormal end, or the total staging cap. `encoding` is the single
+// content-encoding (codexPrestreamEncodingOf): an encoded stream is staged as
+// its RAW bytes (byte fidelity for the client, content-encoding forwarded as
+// is) and decoded on the side purely to classify frames. The backend may not
+// sync-flush per frame, so a raw chunk that decodes to no whole frame simply
+// keeps staging (the time and byte caps bound it); frames that only settle at
+// EOF are judged then. Anything the decoder cannot settle (decoder error,
+// oversized frame) goes live without a replay. Returns
+//   { verdict: 'live', capped, resume }               — go live, nothing failed
+//   { verdict: 'failed', failure, cancel, resume }    — pre-output failure
+// where failure = { kind: 'terminal'|'eof'|'error'|'timeout', event, code,
+// replayable }. `resume()` rebuilds the legacy passthrough (staged bytes +
+// the original ending); `cancel()` drops the upstream body for a replay.
+async function stageCodexPreOutput(webStream, {
+  idleTimeoutMs, maxBytes, maxMs, encoding = 'identity',
+  reasoningMaxMs = CODEX_PRESTREAM_REASONING_DEFAULT_MS,
+}) {
+  const reader = webStream.getReader();
+  const encoded = encoding !== 'identity';
+  const rawFramer = encoded ? null : new SseFramer({ maxBufferedBytes: maxBytes });
+  const staged = [];
+  let stagedBytes = 0;
+  let framesStaged = 0;
+  // Set when the first envelope/reasoning frame is staged — the tighter
+  // reasoning budget is measured from there, not from the start of staging.
+  let reasoningStartedAt = null;
+  const startedAt = Date.now();
+  // The read that was in flight when the time cap fired: still owned by the
+  // reader, so the resumed live stream consumes it first (no byte loss).
+  let inflightRead = null;
+
+  // Side decoder for an encoded stream: raw chunks in, decoded whole frames
+  // out (collected in decodedFrames). Never forwarded — classification only.
+  let decoder = null;
+  let decodeFramer = null;
+  let decodeFailed = false;
+  let flagDecodeFailed = () => {};
+  const decodeFailedP = new Promise(resolve => {
+    flagDecodeFailed = () => { decodeFailed = true; resolve(); };
+  });
+  const decodedFrames = [];
+  if (encoded) {
+    decoder = encoding === 'deflate' ? createInflate()
+      : encoding === 'br' ? createBrotliDecompress()
+        : createGunzip();
+    decodeFramer = new SseFramer({ maxBufferedBytes: maxBytes });
+    decoder.on('error', flagDecodeFailed);
+    decoder.on('data', chunk => {
+      if (decodeFailed) return;
+      const out = decodeFramer.push(chunk);
+      if (decodeFramer.passthrough) { flagDecodeFailed(); return; }
+      if (out?.length) decodedFrames.push(out);
+    });
+  }
+  // Write one raw chunk and wait until the decoder has processed it (zlib
+  // emits its output before the write callback; the extra tick covers a
+  // deferred 'data' emission), so frames it produced can be judged now.
+  const feedDecoder = chunk => Promise.race([
+    decodeFailedP,
+    new Promise(resolve => {
+      if (decodeFailed || decoder.destroyed || decoder.writableEnded) return resolve();
+      decoder.write(chunk, () => resolve());
+    }),
+  ]).then(() => new Promise(resolve => setImmediate(resolve)));
+  const finishDecoder = () => new Promise(resolve => {
+    if (decodeFailed || decoder.destroyed || decoder.writableEnded) return resolve();
+    decoder.once('end', resolve);
+    decoder.once('error', resolve);
+    decoder.once('close', resolve);
+    decoder.end();
+  });
+  const takeDecodedText = () => decodedFrames.splice(0).map(frame => frame.toString('utf8')).join('');
+  const cleanup = () => { decoder?.destroy(); decodeFramer?.dispose(); };
+
+  const head = () => (encoded ? Buffer.concat(staged) : Buffer.concat([...staged, rawFramer.pending]));
+  // `reason` is WHY staging ended — logged verbatim so the next investigation
+  // does not have to re-derive it from a null event (2026-09-17: `none after 0
+  // frames` had exactly one possible cause and it still cost a live bisect):
+  //   'output'           an output-bearing frame (`event` names it)
+  //   'frame-overflow'   ONE frame exceeded maxBytes; SseFramer gave up framing
+  //   'staging-overflow' cumulative staged bytes exceeded maxBytes
+  //   'decode-failed'    the side decoder could not settle the frames
+  //   'cap' / 'reasoning-cap'  the total / reasoning time budget expired
+  const live = (reason, event = null) => {
+    cleanup();
+    return {
+      verdict: 'live',
+      reason,
+      capped: reason === 'cap',
+      reasoningCapped: reason === 'reasoning-cap',
+      event,
+      frames: framesStaged,
+      elapsedMs: Date.now() - startedAt,
+      resume: () => resumeStagedStream(reader, head(), 'delegate', inflightRead),
+    };
+  };
+  const failed = (failure, tail) => {
+    cleanup();
+    return {
+      verdict: 'failed',
+      failure,
+      cancel: () => reader.cancel().catch(() => {}),
+      resume: () => resumeStagedStream(reader, head(), tail),
+    };
+  };
+  // Walk whole frames in order so the verdict is independent of how upstream
+  // chunked them: an overflow reached BEFORE a failure frame still goes live.
+  // Returns a verdict, or null to keep staging. `countBytes` is the identity
+  // path (staged bytes ARE the frames); an encoded path counts raw bytes.
+  const judge = (text, countBytes) => {
+    for (const block of text.split(/\r?\n\r?\n/)) {
+      if (countBytes) stagedBytes += Buffer.byteLength(block) + 2;
+      if (!block) continue;
+      const frame = classifyCodexSseFrame(block);
+      framesStaged += 1;
+      if (frame.kind === 'output') return live('output', frame.event);
+      if (frame.kind === 'failure') {
+        const replayable = frame.code == null || CODEX_PRESTREAM_REPLAYABLE_CODES.has(frame.code);
+        return failed({ kind: 'terminal', event: frame.event, code: frame.code, replayable }, 'delegate');
+      }
+      if (frame.phase === 'reasoning' && reasoningStartedAt == null) reasoningStartedAt = Date.now();
+      if (stagedBytes > maxBytes) return live('staging-overflow'); // flush and go live
+    }
+    return null;
+  };
+
+  while (true) {
+    const totalRemainingMs = maxMs - (Date.now() - startedAt);
+    // Once reasoning has started, whichever budget expires first ends staging.
+    const reasoningRemainingMs = reasoningStartedAt == null
+      ? Infinity
+      : reasoningMaxMs - (Date.now() - reasoningStartedAt);
+    const reasoningIsSooner = reasoningRemainingMs < totalRemainingMs;
+    const remainingMs = reasoningIsSooner ? reasoningRemainingMs : totalRemainingMs;
+    if (remainingMs <= 0) return live(reasoningIsSooner ? 'reasoning-cap' : 'cap');
+    const capIsSooner = remainingMs <= idleTimeoutMs;
+    const capMessage = reasoningIsSooner
+      ? CODEX_PRESTREAM_REASONING_CAP_MESSAGE : CODEX_PRESTREAM_CAP_MESSAGE;
+    let step;
+    try {
+      inflightRead = inflightRead ?? reader.read();
+      step = await raceTimeout(
+        inflightRead,
+        Math.max(1, Math.min(idleTimeoutMs, remainingMs)),
+        capIsSooner ? capMessage : `Upstream SSE idle timeout after ${idleTimeoutMs}ms`,
+      );
+      inflightRead = null;
+    } catch (err) {
+      if (err?.code === 'ETIMEDOUT' && err?.message === CODEX_PRESTREAM_REASONING_CAP_MESSAGE) {
+        return live('reasoning-cap'); // flush, go live, never replay
+      }
+      if (err?.code === 'ETIMEDOUT' && err?.message === CODEX_PRESTREAM_CAP_MESSAGE) {
+        return live('cap'); // flush what was staged, keep upstream, never replay
+      }
+      const timedOut = err?.code === 'ETIMEDOUT' && /^Upstream SSE idle timeout/.test(err?.message || '');
+      return failed({ kind: timedOut ? 'timeout' : 'error', event: null, code: null, replayable: true }, err);
+    }
+    if (step.done) {
+      if (encoded) {
+        // Frames may only decode at EOF (no sync flush upstream): settle them.
+        await finishDecoder();
+        if (decodeFailed) return live('decode-failed'); // cannot judge: legacy bytes
+        const verdict = judge(takeDecodedText(), false);
+        if (verdict) return verdict;
+      }
+      return failed({ kind: 'eof', event: null, code: null, replayable: true }, 'done');
+    }
+    if (encoded) {
+      const chunk = Buffer.from(step.value); // own copy: staged raw bytes outlive the reader's buffer
+      staged.push(chunk);
+      stagedBytes += chunk.length;
+      await feedDecoder(chunk);
+      if (decodeFailed) return live('decode-failed'); // decoder error / oversized frame
+      const verdict = judge(takeDecodedText(), false);
+      if (verdict) return verdict;
+      if (stagedBytes > maxBytes) return live('staging-overflow'); // raw staging overflow
+      continue; // no whole frame settled yet: keep staging (caps bound it)
+    }
+    const out = rawFramer.push(step.value);
+    if (!out || out.length === 0) continue; // partial frame still buffering
+    staged.push(out);
+    if (rawFramer.passthrough) return live('frame-overflow'); // framing abandoned
+    const verdict = judge(out.toString('utf8'), true);
+    if (verdict) return verdict;
   }
 }
 
@@ -187,6 +649,12 @@ function createEncodedSseObserver(contentEncoding, reserveBytes, releaseBytes) {
     },
     get sawResponseCompleted() {
       return !failed && framer.sawResponseCompleted;
+    },
+    // Which terminal event ended the decoded stream (see SseFramer.terminalEvent),
+    // so an encoded codex stream that ends with an upstream `error` /
+    // `response.failed` is recognised exactly like an identity-encoded one.
+    get terminalEvent() {
+      return failed ? null : framer.terminalEvent;
     },
     dispose() {
       decoder.destroy();
@@ -332,6 +800,12 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       ? sessionAffinityKeys.keyFor(sessionId)
       : req.socket;
   };
+  // After an upstream failure is passed through unreplayed, steer the client's
+  // own retry to a different account for this long (0 disables). See
+  // AccountManager.noteUpstreamFailure.
+  const upstreamFailureAvoidMs = Number.isFinite(config.upstreamFailureAvoidMs)
+    ? Math.max(0, config.upstreamFailureAvoidMs)
+    : DEFAULT_UPSTREAM_FAILURE_AVOID_MS;
   // Continuity mode keeps Claude Code requests inside the proxy while capacity
   // or upstream rate limits recover, instead of surfacing a terminal-stopping
   // 429. Unit tests can leave it off; the CLI server enables it by default.
@@ -484,6 +958,28 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   // the automatic triggers; the local operator endpoint always works in codex
   // mode. See src/codex-reset-credits.js + docs/specs/2026-09-05-codex-reset-credits.md.
   const resetCredits = normalizeCodexResetCreditsConfig(config, provider);
+  // Credits (codex): once an account's included quota is spent it stays
+  // routable on its credit balance, ranked after every account with included
+  // quota left (AccountManager._creditRoutable). Default on in codex mode;
+  // `codexUseCredits: false` restores "exhausted = unavailable".
+  accountManager.codexUseCredits = provider === 'codex' && config.codexUseCredits !== false;
+  const codexCreditRefusalMs = Number.isFinite(config.codexCreditRefusalMs) && config.codexCreditRefusalMs > 0
+    ? config.codexCreditRefusalMs
+    : DEFAULT_CODEX_CREDIT_REFUSAL_MS;
+  // Free reset credits come before paid credits: while an automatic
+  // redemption is possible, credit accounts stay out of selection so the
+  // request reaches the reset-credit dead end below first. The candidate
+  // check never calls back into _isAvailable (no recursion).
+  accountManager.creditDeferral = accountManager.codexUseCredits && resetCredits.enabled
+    // `scope` = accounts this request may not use; their reset credits cannot
+    // serve it, so they must not defer it either.
+    // A request whose reset-credit pass is already charged cannot redeem
+    // again, so nothing is left to defer to.
+    ? (model, scope = null) => scope?.resetCreditsSpent !== true
+      && rankCodexResetCreditCandidates(
+        accountManager.accounts.filter(a => !(scope && scope.has(a))),
+        resetCreditEligibilityOptions(model)).length > 0
+    : null;
   // Auto-quarantine (codex): consecutive terminal (401/403) auth failures on
   // the wham/usage poll before the proxy escalates to a forced token refresh
   // plus a confirm re-poll. In-memory streak; the poll cadence is the pacing.
@@ -1551,6 +2047,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
                   cooldownMs: resetCredits.cooldownMs,
                   reserve: resetCredits.reserve,
                 },
+                codexCredits: { enabled: accountManager.codexUseCredits },
               }
             : {}),
           ...(includeIdentity ? { lifecycleId: config.lifecycleId || null } : {}),
@@ -1732,7 +2229,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         // auth401 = accounts that answered 401 after their refresh chance (cascade
         // guard input + per-request exclusion); authParked = what THIS request parked,
         // kept so a cascade can put it back.
-        const ctx = { account: null, status: null, model: null, provider, authRetried: new Set(), auth401: new Set(), authParked: [], authCascade: false, tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, capacityWaits: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: affinityKeyFor(req), preferredAccountUuid: recoveryAccountUuid, sawModelWeekly: false, byok: byokMatch != null, continuity, continuityDeadlineAt: null, failedFast: false, last429: null, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined, streamRecovery, maxResponseBytes, reserveResponseBytes, releaseReservedResponseBytes, reserveAuxiliaryResponseBytes, releaseAuxiliaryResponseBytes, reserveLogResponseBytes, releaseLogResponseBytes, registerIdleLogReservation, upstreamResponseTimeoutMs, streamIdleTimeoutMs, streamTotalTimeoutMs, subscriptionRecheckIntervalMs, resetCredits: resetCreditController, resetCreditAttempts: 0, resetCreditRetried: new Set(), resetCreditBackstopYielded: false };
+        const ctx = { account: null, status: null, model: null, provider, authRetried: new Set(), auth401: new Set(), authParked: [], authCascade: false, tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, capacityWaits: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: affinityKeyFor(req), upstreamFailureAvoidMs, codexCreditRefusalMs, preferredAccountUuid: recoveryAccountUuid, sawModelWeekly: false, byok: byokMatch != null, continuity, continuityDeadlineAt: null, failedFast: false, last429: null, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined, streamRecovery, maxResponseBytes, reserveResponseBytes, releaseReservedResponseBytes, reserveAuxiliaryResponseBytes, releaseAuxiliaryResponseBytes, reserveLogResponseBytes, releaseLogResponseBytes, registerIdleLogReservation, upstreamResponseTimeoutMs, streamIdleTimeoutMs, streamTotalTimeoutMs, subscriptionRecheckIntervalMs, resetCredits: resetCreditController, resetCreditAttempts: 0, resetCreditRetried: new Set(), resetCreditBackstopYielded: false, codexOverloadHeldSince: null };
         try {
           if (isStatusRequest) {
             res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -2310,6 +2807,11 @@ function formatRequestUrlForLog(url, metadataOnly = false) {
 // failover/backoff only for replay-safe requests; an ambiguous POST passes
 // through because a 5xx does not prove the upstream skipped its execution.
 const RETRYABLE_STATUS = new Set([500, 502, 503, 504, 507, 529]);
+// Default steer-away window after an unreplayed upstream failure (config
+// `upstreamFailureAvoidMs`). Long enough to cover a client's own reconnect
+// burst (Codex CLI: 5 attempts with backoff), short enough that a healthy
+// account is back in rotation well within one warm-up interval.
+const DEFAULT_UPSTREAM_FAILURE_AVOID_MS = 30_000;
 // Sleep that also resolves immediately if `signal` aborts — so a client that
 // disconnects during an overload backoff doesn't keep its account slot reserved
 // for the whole (up to multi-second) wait. Cleans up its timer/listener either way.
@@ -2559,8 +3061,20 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     }
     return excluded.size > 0 ? excluded : null;
   };
-  const hasUsable = extra => accountManager.anyUsable(requestExclusions(extra), ctx.model);
-  const hasCapped = extra => accountManager.anyCapped(requestExclusions(extra), ctx.model);
+  // Paid-credit gate scope: only accounts that cannot serve this request at
+  // all (credential-type filter, auth-failed). Accounts merely TRIED by this
+  // request (transient 429 / 5xx) keep their included quota, so they still
+  // hold the request off paid credits — it retries/waits instead.
+  // Once this request has charged its single reset-credit pass (fleet or
+  // account policy), no further redemption can serve it, so a reset credit
+  // still held by another account must not keep it off paid credits: the
+  // scope carries that fact to the creditDeferral check.
+  const creditScope = () => {
+    const scope = requestExclusions(ctx.auth401);
+    return ctx.resetCreditAttempts >= 1 ? new CreditScope(scope, { resetCreditsSpent: true }) : scope;
+  };
+  const hasUsable = extra => accountManager.anyUsable(requestExclusions(extra), ctx.model, creditScope());
+  const hasCapped = extra => accountManager.anyCapped(requestExclusions(extra), ctx.model, creditScope());
   // An account that already answered 401 to THIS request is auth-failed FOR this
   // request even when the cascade guard deliberately left its status intact.
   // Both fleet-wide "everyone failed auth" checks below must see that, or a
@@ -2620,12 +3134,12 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         : null;
       const selectionHasUsable = ctx.preferredAccountUuid == null
         ? hasUsable(excludeForSelect)
-        : preferred && accountManager._isAvailable(preferred, ctx.model)
+        : preferred && accountManager._isAvailable(preferred, ctx.model, { scope: creditScope() })
           && accountManager._hasCapacity(preferred)
           && !(excludeForSelect && excludeForSelect.has(preferred));
       const selectionHasCapped = ctx.preferredAccountUuid == null
         ? hasCapped(excludeForSelect)
-        : preferred && accountManager._isAvailable(preferred, ctx.model)
+        : preferred && accountManager._isAvailable(preferred, ctx.model, { scope: creditScope() })
           && !accountManager._hasCapacity(preferred)
           && !(excludeForSelect && excludeForSelect.has(preferred));
       if (acquireTimeoutMs > 0 && ctx.continuity.enabled && ctx.continuity.maxWaitMs > 0
@@ -2639,6 +3153,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         ctx.affinityKey,
         ctx.model,
         ctx.preferredAccountUuid,
+        creditScope(),
       );
       if (account) {
         ctx.held = account;
@@ -2676,6 +3191,15 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       if (pass.redeemed) {
         ctx.tried429.clear();
         ctx.tried5xx.clear();
+        restartRetryCycle();
+        continue;
+      }
+      // The pass freed nothing, but by consuming the redemption chance it
+      // may have unlocked the paid-credit tier (AccountManager.creditDeferral).
+      // Re-acquire once so this request is served on credits instead of
+      // failing at a dead end that no longer exists.
+      if (!ctx.creditUnlockRetried && (hasUsable(null) || hasCapped(null))) {
+        ctx.creditUnlockRetried = true;
         restartRetryCycle();
         continue;
       }
@@ -2871,6 +3395,10 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     ctx.credentialType = account.type;
   }
   ctx.account = account.name;
+  // Was THIS dispatch served on paid credits? The 429 handler only applies
+  // the long credit hold to such a dispatch, and only on explicit evidence.
+  ctx.creditBackedDispatch = ctx.provider === 'codex' && accountManager.codexUseCredits
+    && accountManager.routedOnCredits(account, ctx.model);
   hooks.onRequestRouted?.(reqId, { account: account.name });
 
   // Refresh OAuth token if needed. Stop waiting if the client disconnects (the
@@ -3545,6 +4073,17 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         // re-dispatch to another available account — never sleep holding the
         // client. When every account is throttled, getActiveAccount returns
         // null and the client gets a 429 to back off on its own.
+        // A credit-backed account that still gets a limit 429 was NOT served
+        // from credits: hold it off the credit tier as well, so the short
+        // throttle lapsing cannot bring it straight back into a refusal loop.
+        // A transient 429 (no usage-limit signal) takes only the bounded
+        // Retry-After throttle below.
+        // The reached-type header is NOT evidence: it means "included quota
+        // reached", the premise of every credit-backed dispatch.
+        if (ctx.creditBackedDispatch && creditRefusalInBody(ctx, responseBody,
+          upstreamRes.headers.get('content-encoding'), account.name)) {
+          accountManager.noteCreditRefusal(account, ctx.codexCreditRefusalMs, ctx.model);
+        }
         console.log(`[TeamClaude] 429 (quota exhausted) on "${account.name}" — throttling ${retryAfter}s, switching accounts`);
         accountManager.markRateLimited(account, retryAfter);
         if (logDir) {
@@ -3673,15 +4212,59 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     // not a bad account.
     if (RETRYABLE_STATUS.has(upstreamRes.status)) {
       const code = upstreamRes.status;
-      await upstreamRes.body?.cancel();
 
       // A 5xx only proves the response failed, not that the upstream skipped
       // the request. Replaying a POST here can duplicate inference, tool side
       // effects, and billing. Complete 503/507 responses are still ambiguous:
       // the provider may have accepted the request before the error surfaced.
       // Only exact-session TUI continuation may recover an unsafe POST.
-      if (!replaySafe) {
+      //
+      // Narrow codex-mode exception (qjc fork, B1): a complete 503/529 whose
+      // body is a JSON error object, received before a single byte reached the
+      // client, is a capacity rejection issued BEFORE inference. The Codex CLI
+      // renders the passthrough as "model is at capacity" and never retries by
+      // itself, so that one shape is replayed through the same failover/backoff
+      // loop a replay-safe request uses — bounded by the existing retry budget
+      // and by TEAMCODEX_OVERLOAD_HOLD_MS (total hold per client request; 0
+      // disables the exception). No account state is mutated on this path.
+      let codexReplayable = false;
+      // Why a codex POST 503/529 was NOT replayed — logged so a silent
+      // "passing through without replay" can be explained from the log alone.
+      let codexNotReplayable = null;
+      const codexCandidate = !replaySafe && ctx.provider === 'codex' && method === 'POST'
+        && CODEX_CAPACITY_REPLAY_STATUS.has(code);
+      if (codexCapacityReplayEligible({
+        replaySafe, provider: ctx.provider, method, url: req.url, status: code, res,
+      })) {
+        codexNotReplayable = await readCodexCapacityRejection(upstreamRes, ctx);
+        codexReplayable = codexNotReplayable == null;
+      } else {
+        if (codexCandidate) {
+          codexNotReplayable = !isCodexResponsesPath(req.url) ? 'not-responses-path'
+            : res.headersSent ? 'headers-sent'
+              : 'client-gone';
+        }
+        await upstreamRes.body?.cancel();
+      }
+
+      const codexHoldMs = Math.max(0, envInt('TEAMCODEX_OVERLOAD_HOLD_MS', 90_000));
+      if (codexReplayable && codexHoldMs === 0) codexNotReplayable = 'hold-disabled';
+      if (codexCandidate && codexNotReplayable) {
+        console.log(`[TeamCodex] ${code} not replayable: ${codexNotReplayable}`);
+      }
+      let codexHeldMs = 0;
+      if (codexReplayable) {
+        if (ctx.codexOverloadHeldSince == null) ctx.codexOverloadHeldSince = Date.now();
+        codexHeldMs = Date.now() - ctx.codexOverloadHeldSince;
+      }
+      const codexHoldOpen = codexReplayable && codexHeldMs < codexHoldMs;
+
+      // Legacy unsafe-POST passthrough. Its shape (status, recovery header,
+      // message) is a wrapper recovery signal — keep it byte-identical, and
+      // reuse it when the codex replay runs out of budget or hold time.
+      const passThroughUnsafe = () => {
         console.log(`[TeamClaude] ${code} after ${method} dispatch on "${account.name}" — passing through without replay`);
+        accountManager.noteUpstreamFailure(account, ctx.affinityKey, ctx.upstreamFailureAvoidMs, `HTTP ${code} after dispatch`);
         ctx.status = code;
         if (logDir) {
           appendLogSection(`=== RESPONSE ${code} — unsafe request was not replayed ===\n${formatHeaders(upstreamRes.headers, metadataOnlyLog)}`);
@@ -3704,12 +4287,23 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
             },
           }));
         }
+      };
+
+      if (!replaySafe && !codexHoldOpen) {
+        if (codexReplayable) {
+          console.log(`[TeamCodex] ${code} capacity on "${account.name}" — hold cap ${codexHoldMs}ms reached (held ${codexHeldMs}ms, ${ctx.overloadRetries} backoffs), passing through`);
+        }
+        passThroughUnsafe();
         return;
       }
 
       const maxOverload = Math.max(0, envInt('TEAMCLAUDE_OVERLOAD_RETRIES', 6));
       const backoffBase = Math.max(50, envInt('TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS', 1000));
       const backoffCap = Math.max(backoffBase, envInt('TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS', 10000));
+
+      if (codexReplayable) {
+        console.log(`[TeamCodex] ${code} capacity on "${account.name}" — JSON error before any client bytes, retrying (${ctx.overloadRetries}/${maxOverload}, held ${codexHeldMs}ms)`);
+      }
 
       // (1) Per-request failover to an account not yet 5xx'd (or 429'd) this
       // request.
@@ -3736,6 +4330,13 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
           backoffCap,
         );
         const waitMs = Math.max(retryAfterMs, backoffMs);
+        // codex: a wait that would overrun the hold cap only delays the same
+        // passthrough — surface it now instead of parking the client.
+        if (codexReplayable && codexHeldMs + waitMs > codexHoldMs) {
+          console.log(`[TeamCodex] ${code} capacity on "${account.name}" — backoff ${waitMs}ms would exceed hold cap ${codexHoldMs}ms (held ${codexHeldMs}ms), passing through`);
+          passThroughUnsafe();
+          return;
+        }
         ctx.overloadRetries += 1;
         const retryBudget = `${ctx.overloadRetries}/${maxOverload}`;
         console.log(`[TeamClaude] ${code} on every account — upstream overloaded, backing off ${waitMs}ms (retry ${ctx.overloadRetries}, ${retryBudget})`);
@@ -3751,6 +4352,11 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       }
 
       // (3) Backoff budget spent — surface the 5xx rather than hold the client forever.
+      if (codexReplayable) {
+        console.log(`[TeamCodex] ${code} capacity on "${account.name}" — retry budget spent after ${ctx.overloadRetries} backoffs (held ${codexHeldMs}ms), passing through`);
+        passThroughUnsafe();
+        return;
+      }
       console.log(`[TeamClaude] ${code} on "${account.name}" — overload persisted after ${ctx.overloadRetries} backoffs, passing through`);
       ctx.status = code;
       if (logDir) {
@@ -3821,9 +4427,136 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       const ensureHeaders = () => {
         if (!res.headersSent) res.writeHead(upstreamRes.status, responseHeaders);
       };
+      // Codex-mode pre-output staging (B2, see stageCodexPreOutput). Scope:
+      // POST /codex/responses, a single identity/gzip/x-gzip/deflate/br
+      // encoding (raw bytes staged, decoded on the side to classify), 2xx,
+      // nothing sent yet, and the hold cap enabled (TEAMCODEX_OVERLOAD_HOLD_MS=0
+      // disables B1 and B2 alike). streamRecovery stays anthropic-only — codex
+      // never gets the anthropic-shaped error injection.
+      let streamBody = upstreamRes.body;
+      const codexPrestreamEncoding = codexPrestreamEncodingOf(upstreamRes.headers.get('content-encoding'));
+      const codexEncodingTag = codexPrestreamEncoding && codexPrestreamEncoding !== 'identity'
+        ? `, ${codexPrestreamEncoding}` : '';
+      const codexPrestreamHoldMs = Math.max(0, envInt('TEAMCODEX_OVERLOAD_HOLD_MS', 90_000));
+      const codexPrestreamMaxMs = Math.max(
+        CODEX_PRESTREAM_STAGE_MIN_MS,
+        envInt('CODEX_PRESTREAM_STAGE_MAX_MS', codexPrestreamHoldMs),
+      );
+      const codexPrestreamReasoningMaxMs = Math.max(
+        CODEX_PRESTREAM_STAGE_MIN_MS,
+        envInt('CODEX_PRESTREAM_REASONING_MAX_MS', CODEX_PRESTREAM_REASONING_DEFAULT_MS),
+      );
+      // Why the gate did NOT stage — without this, a turn that fails in 3s and
+      // one that never entered B2 look identical in the log (2026-09-17). The
+      // diagnostics are CODEX-ONLY: anthropic mode never enters B2, and saying
+      // so on every stream would put new noise in a different product surface
+      // (the Claude pool's log), so a non-codex provider is skipped silently and
+      // there is no `not-codex` reason at all.
+      const codexPrestreamEligible = ctx.provider === 'codex';
+      const codexPrestreamSkip = !codexPrestreamEligible ? null
+        : (method !== 'POST' || replaySafe) ? 'not-post'
+          : !isCodexResponsesPath(req.url) ? 'not-responses-path'
+            : !(upstreamRes.status >= 200 && upstreamRes.status < 300) ? 'non-2xx'
+              : (res.headersSent || res.destroyed) ? 'headers-sent'
+                : codexPrestreamHoldMs <= 0 ? 'hold-disabled'
+                  : codexPrestreamEncoding == null ? 'unsupported-encoding'
+                    : null;
+      const codexPrestreamStageBytes = codexPrestreamStageMaxBytes();
+      const codexPrestreamReserved = codexPrestreamEligible && codexPrestreamSkip == null
+        && ctx.reserveAuxiliaryResponseBytes(codexPrestreamStageBytes);
+      if (codexPrestreamEligible && (codexPrestreamSkip != null || !codexPrestreamReserved)) {
+        const reason = codexPrestreamSkip ?? 'aux-budget';
+        if (codexPrestreamDiagAllowed(accountManager, account, reason)) {
+          console.log(`[TeamCodex] prestream skip: ${reason}`);
+        }
+      } else if (codexPrestreamReserved) {
+        let stage;
+        try {
+          stage = await stageCodexPreOutput(upstreamRes.body, {
+            idleTimeoutMs: ctx.streamIdleTimeoutMs,
+            maxBytes: codexPrestreamStageBytes,
+            maxMs: codexPrestreamMaxMs,
+            encoding: codexPrestreamEncoding,
+            reasoningMaxMs: codexPrestreamReasoningMaxMs,
+          });
+        } finally {
+          ctx.releaseAuxiliaryResponseBytes(codexPrestreamStageBytes);
+        }
+        if (stage.verdict === 'failed') {
+          if (res.destroyed || ctx.abortSignal?.aborted) {
+            // Client left during staging: drop upstream, no further hits. The
+            // request's finally releases the slot.
+            await stage.cancel();
+            return;
+          }
+          const { failure } = stage;
+          const label = `${failure.code ? `${failure.kind} ${failure.code}` : failure.kind}${codexEncodingTag}`;
+          const replayable = failure.replayable && !res.headersSent;
+          let codexHeldMs = 0;
+          if (replayable) {
+            if (ctx.codexOverloadHeldSince == null) ctx.codexOverloadHeldSince = Date.now();
+            codexHeldMs = Date.now() - ctx.codexOverloadHeldSince;
+          }
+          const maxOverload = Math.max(0, envInt('TEAMCLAUDE_OVERLOAD_RETRIES', 6));
+          const backoffBase = Math.max(50, envInt('TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS', 1000));
+          const backoffCap = Math.max(backoffBase, envInt('TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS', 10000));
+          // Same budget and hold cap as B1: (1) per-request failover to an
+          // account not yet tried, (2) bounded fleet backoff, (3) passthrough.
+          let plan = null;
+          let waitMs = 0;
+          if (replayable && codexHeldMs < codexPrestreamHoldMs) {
+            ctx.tried5xx.add(account);
+            const excludeStage = new Set([...ctx.tried429, ...ctx.tried5xx]);
+            if (retryCount < maxRetries && (hasUsable(excludeStage) || hasCapped(excludeStage))) {
+              plan = 'failover';
+            } else if (ctx.overloadRetries < maxOverload) {
+              waitMs = Math.min(backoffBase * 2 ** Math.min(ctx.overloadRetries, 30), backoffCap);
+              if (codexHeldMs + waitMs <= codexPrestreamHoldMs) plan = 'backoff';
+            }
+          }
+          if (plan) {
+            console.log(`[TeamCodex] pre-output stream failure on "${account.name}" (${label}) — replaying (${ctx.overloadRetries}/${maxOverload}, held ${codexHeldMs}ms)`);
+            if (logDir) {
+              appendLogSection(`=== STREAM pre-output ${label} — replaying (${plan}) ===`);
+              flushRequestLog(logDir, reqId, logSections, hooks);
+            }
+            await stage.cancel(); // no account state mutated — capacity, not a bad credential
+            releaseHeld(); // free this account's slot before trying another / waiting
+            if (plan === 'failover') {
+              return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+            }
+            ctx.overloadRetries += 1;
+            console.log(`[TeamCodex] pre-output stream failure on every account — backing off ${waitMs}ms (retry ${ctx.overloadRetries}/${maxOverload}, held ${codexHeldMs}ms)`);
+            await sleepOrAbort(waitMs, ctx.abortSignal);
+            if (res.destroyed || ctx.abortSignal?.aborted) return;
+            ctx.tried5xx.clear();
+            return forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
+          }
+          console.log(replayable
+            ? `[TeamCodex] pre-output stream failure on "${account.name}" (${label}) — budget spent (${ctx.overloadRetries} backoffs, held ${codexHeldMs}ms), passing through`
+            : `[TeamCodex] pre-output stream failure on "${account.name}" (${label}) — not replayable, passing through`);
+          if (logDir) {
+            appendLogSection(`=== STREAM pre-output ${label} — passed through ===`);
+            flushRequestLog(logDir, reqId, logSections, hooks);
+          }
+        }
+        if (stage.capped) {
+          console.log(`[TeamCodex] pre-output staging cap ${codexPrestreamMaxMs}ms reached on "${account.name}"${codexEncodingTag ? ` (${codexPrestreamEncoding})` : ''} — going live`);
+        } else if (stage.reasoningCapped) {
+          console.log(`[TeamCodex] pre-output reasoning cap ${codexPrestreamReasoningMaxMs}ms reached on "${account.name}"${codexEncodingTag} — going live`);
+        }
+        if (stage.verdict === 'live'
+            && codexPrestreamDiagAllowed(accountManager, account, `live:${stage.reason}`)) {
+          const why = stage.reason === 'output' ? `output:${stage.event || 'unknown'}` : stage.reason;
+          console.log(`[TeamCodex] prestream live on "${account.name}"${codexEncodingTag}: ${why} after ${stage.frames} frames, ${stage.elapsedMs}ms`);
+        }
+        // Live or passthrough: replay the staged bytes through the legacy
+        // path so the client sees exactly what it always did, just later.
+        streamBody = stage.resume();
+      }
       if (!ctx.streamRecovery) ensureHeaders(); // legacy: headers first, bytes as they come
       const outcome = await streamResponse(
-        upstreamRes.body,
+        streamBody,
         res,
         account,
         accountManager,
@@ -3865,6 +4598,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         // decide, avoiding a hidden duplicate execution inside the proxy.
         if (!replaySafe) {
           console.log(`[TeamClaude] Upstream stream ${outcome.preStreamFailure} after ${method} dispatch on "${account.name}" — not replaying`);
+          accountManager.noteUpstreamFailure(account, ctx.affinityKey, ctx.upstreamFailureAvoidMs, `Stream ${outcome.preStreamFailure} after dispatch`);
           if (logDir) {
             appendLogSection(`=== STREAM ${outcome.preStreamFailure} — unsafe request was not replayed ===`);
             flushRequestLog(logDir, reqId, logSections, hooks);
@@ -3928,6 +4662,13 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         // so the only recovery that helps is the CLIENT retrying — which the
         // injected error event triggers. No account state is mutated.
         console.log(`[TeamClaude] Upstream stream ${outcome.reason} on "${account.name}" — appended retryable error event for client-side retry`);
+      }
+      if (!outcome.injected && (outcome.terminalEvent === 'error' || outcome.terminalEvent === 'response.failed')) {
+        // The upstream itself ended the stream with an error event (e.g. the
+        // Codex backend's "An error occurred while processing your request …
+        // request ID …"). It was relayed verbatim — nothing to replay — but the
+        // client's own reconnect must not be pinned to the failing account.
+        accountManager.noteUpstreamFailure(account, ctx.affinityKey, ctx.upstreamFailureAvoidMs, `Upstream ${outcome.terminalEvent} event`);
       }
       if (ctx.provider === 'codex' && isCodexInferenceRequest(req)
           && upstreamRes.status >= 200 && upstreamRes.status < 300
@@ -4023,8 +4764,8 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
 
       ctx.tried5xx.add(account);
       if (!continuityBoundedTimeout && replaySafe && retryCount < maxRetries
-          && (accountManager.anyUsable(ctx.tried5xx, ctx.model)
-            || accountManager.anyCapped(ctx.tried5xx, ctx.model))) {
+          && (accountManager.anyUsable(ctx.tried5xx, ctx.model, creditScope())
+            || accountManager.anyCapped(ctx.tried5xx, ctx.model, creditScope()))) {
         console.log(`[TeamClaude] Response timeout on "${account.name}" — switching account for this request`);
         releaseHeld();
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
@@ -4076,14 +4817,15 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     if (isTransient) {
       if (replaySafe && !res.headersSent && !res.destroyed && retryCount < maxRetries) {
         ctx.tried5xx.add(account);
-        if (accountManager.anyUsable(ctx.tried5xx, ctx.model)
-          || accountManager.anyCapped(ctx.tried5xx, ctx.model)) {
+        if (accountManager.anyUsable(ctx.tried5xx, ctx.model, creditScope())
+          || accountManager.anyCapped(ctx.tried5xx, ctx.model, creditScope())) {
           console.log(`[TeamClaude] Network error on "${account.name}" — switching account for this request`);
           releaseHeld();
           return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
         }
       }
       if (!replaySafe && !res.headersSent && !res.destroyed) {
+        accountManager.noteUpstreamFailure(account, ctx.affinityKey, ctx.upstreamFailureAvoidMs, 'Network error after dispatch');
         ctx.status = 502;
         const responseHeaders = codexRecoveryResponseHeaders(
           req,
@@ -4217,6 +4959,7 @@ async function streamResponse(
     limitExceeded: false,
     completed: false,
     responseCompleted: false,
+    terminalEvent: null,
   };
 
   // Append a well-formed retryable error frame and end. Only called when every
@@ -4496,6 +5239,8 @@ async function streamResponse(
     outcome.responseCompleted = endedNormally
       && (terminalObserver?.sawResponseCompleted || encodedTerminalObserver?.sawResponseCompleted || false);
   } finally {
+    outcome.terminalEvent = framer?.terminalEvent || terminalObserver?.terminalEvent
+      || encodedTerminalObserver?.terminalEvent || null;
     // Cancel upstream reader to stop consuming data nobody needs
     reader.cancel().catch(() => {});
     if (spillFile) await spillFile.close().catch(() => {});
@@ -4646,6 +5391,17 @@ function fleetRecovery(accounts, threshold = 0.98, model = null) {
     if (q.requestsLimit != null && q.requestsRemaining != null && requestsReset
         && 1 - q.requestsRemaining / q.requestsLimit >= threshold)
       freeAt = Math.max(freeAt, new Date(requestsReset).getTime());
+    // Credit path (codex): an account whose included quota is spent but that
+    // can serve on its credit balance is back as soon as its throttle and any
+    // credit-refusal hold lapse — not at the (days-away) included reset. The
+    // status snapshot carries `creditRecoverable` (credits on, usable balance,
+    // reserve not exceeded) and `creditRefusedUntil`; take the earlier path.
+    if (freeAt > 0 && acct.creditRecoverable === true) {
+      let creditFreeAt = now;
+      if (acct.rateLimitedUntil) creditFreeAt = Math.max(creditFreeAt, new Date(acct.rateLimitedUntil).getTime());
+      if (acct.creditRefusedUntil) creditFreeAt = Math.max(creditFreeAt, new Date(acct.creditRefusedUntil).getTime());
+      freeAt = Math.min(freeAt, Math.max(creditFreeAt, now + 1000));
+    }
     if (freeAt > 0) consider(freeAt - now, acct.name, true);
     else consider(60_000); // quota-healthy (merely capped/queued): a slot frees in seconds — cap the fleet wait at the short fallback
   }

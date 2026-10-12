@@ -61,6 +61,14 @@ for (const scenario of [
 }
 
 test('Codex missing MIME forwards the first frame before the upstream finishes', async () => {
+  // B2 (pre-output stream replay, TEAMCODEX_OVERLOAD_HOLD_MS) deliberately
+  // stages the response.created envelope until the first output event so a
+  // pre-output failure can be replayed; the frame then reaches the client only
+  // together with the terminal. This test pins the LEGACY first-frame pass-
+  // through of a MIME-less SSE body, so it runs with the shared B1/B2 kill switch
+  // off. (MIME-less token counting with B2 on is covered by the suite above.)
+  const savedHold = process.env.TEAMCODEX_OVERLOAD_HOLD_MS;
+  process.env.TEAMCODEX_OVERLOAD_HOLD_MS = '0';
   let finish;
   let fallback;
   const upstream = http.createServer((_req, res) => {
@@ -84,6 +92,8 @@ test('Codex missing MIME forwards the first frame before the upstream finishes',
     assert.equal(manager.accounts[0].usage.totalInputTokens, 21);
     assert.equal(manager.accounts[0].usage.totalOutputTokens, 7);
   } finally {
+    if (savedHold === undefined) delete process.env.TEAMCODEX_OVERLOAD_HOLD_MS;
+    else process.env.TEAMCODEX_OVERLOAD_HOLD_MS = savedHold;
     clearTimeout(fallback);
     finish?.();
     proxy.closeAllConnections(); upstream.closeAllConnections();

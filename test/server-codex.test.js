@@ -689,6 +689,22 @@ async function observeCodexSseSubscriptionRecovery(frame) {
 }
 
 test('Codex SSE recovery requires response.completed rather than any terminal marker', async () => {
+  // B2 (pre-output stream replay, TEAMCODEX_OVERLOAD_HOLD_MS) replays a
+  // created-then-terminal stream inside the proxy instead of relaying it, so the
+  // single ended account would surface a 401 instead of the relayed 200. This
+  // test pins the subscription-recovery predicate on the LEGACY verbatim relay,
+  // so it runs with the shared B1/B2 kill switch off.
+  const savedHold = process.env.TEAMCODEX_OVERLOAD_HOLD_MS;
+  process.env.TEAMCODEX_OVERLOAD_HOLD_MS = '0';
+  try {
+    await assertSseRecoveryRequiresCompleted();
+  } finally {
+    if (savedHold === undefined) delete process.env.TEAMCODEX_OVERLOAD_HOLD_MS;
+    else process.env.TEAMCODEX_OVERLOAD_HOLD_MS = savedHold;
+  }
+});
+
+async function assertSseRecoveryRequiresCompleted() {
   const terminals = [
     ['response.failed', 'event: response.failed\ndata: {"type":"response.failed","response":{}}\n\n'],
     ['response.incomplete', 'event: response.incomplete\ndata: {"type":"response.incomplete","response":{}}\n\n'],
@@ -713,7 +729,7 @@ test('Codex SSE recovery requires response.completed rather than any terminal ma
       statusCode: 200, status: 'active', errorReason: null, subscription: 'scheduled',
     }],
   ]);
-});
+}
 
 async function observeCodexJsonSubscriptionRecovery({ statusCode = 200, body = '', headers = {} }) {
   let reportRequest;
