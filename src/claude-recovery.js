@@ -72,24 +72,30 @@ function accountGeneralQuotaBlocked(account, threshold) {
   return false;
 }
 
-function accountModelQuotaBlocked(account, threshold) {
+function blockedModelLabels(account, threshold) {
   const windows = account?.quota?.modelWeekly;
-  if (!windows || typeof windows !== 'object') return false;
-  return Object.values(windows).some(win => freshBlocked(win?.utilization, win?.reset, threshold));
+  if (!windows || typeof windows !== 'object') return [];
+  return Object.entries(windows)
+    .filter(([, win]) => freshBlocked(win?.utilization, win?.reset, threshold))
+    .map(([label]) => label);
 }
 
-// With `includeModelWindows`, an account that still has general quota but whose
-// model-scoped weekly window (e.g. the Fable tier) is full also counts as
-// exhausted. Callers pass it only when the proxy itself reported that every
-// account is exhausted for the session's request (a fleet-exhaustion error),
-// so a model-only shortage can hand off instead of resuming into it again.
+// With `includeModelWindows`, the fleet also counts as exhausted when every
+// account that still has general quota is blocked on the SAME model-scoped
+// weekly window (e.g. all on the Fable tier): that one tier is what the
+// session's requests hit. Accounts full on different tiers do not combine.
+// Callers pass it only when the proxy itself reported that every account is
+// exhausted for the session's request (a fleet-exhaustion error).
 export function isClaudeFleetExhausted(status, threshold = 0.98, { includeModelWindows = false } = {}) {
   const accounts = Array.isArray(status?.accounts)
     ? status.accounts.filter(account => account?.enabled !== false)
     : [];
-  return accounts.length > 0
-    && accounts.every(account => accountGeneralQuotaBlocked(account, threshold)
-      || (includeModelWindows && accountModelQuotaBlocked(account, threshold)));
+  if (accounts.length === 0) return false;
+  const open = accounts.filter(account => !accountGeneralQuotaBlocked(account, threshold));
+  if (open.length === 0) return true;
+  if (!includeModelWindows) return false;
+  const [first, ...rest] = open.map(account => new Set(blockedModelLabels(account, threshold)));
+  return [...first].some(label => rest.every(labels => labels.has(label)));
 }
 
 function textBlocks(content) {

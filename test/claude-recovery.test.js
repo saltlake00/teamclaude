@@ -2972,6 +2972,23 @@ test('model-scoped windows count only when the proxy reported fleet exhaustion',
   const expired = structuredClone(status);
   expired.accounts[0].quota.modelWeekly['7d_oi'].reset = Date.now() - 1000;
   assert.equal(isClaudeFleetExhausted(expired, 0.98, { includeModelWindows: true }), false, 'an expired window is not blocking');
+
+  // Accounts full on DIFFERENT model tiers do not add up to an exhausted fleet.
+  const account = modelWeekly => ({ enabled: true, quota: {
+    unified5h: 0.2, unified5hReset: reset, unified7d: 0.3, unified7dReset: reset, modelWeekly,
+  } });
+  const crossTier = { accounts: [
+    account({ '7d_oi': { utilization: 1, reset } }),
+    account({ '7d_xx': { utilization: 1, reset } }),
+  ] };
+  assert.equal(isClaudeFleetExhausted(crossTier, 0.98, { includeModelWindows: true }), false, 'different tiers');
+  const sameTier = { accounts: [
+    account({ '7d_oi': { utilization: 1, reset } }),
+    account({ '7d_oi': { utilization: 0.99, reset }, '7d_xx': { utilization: 0.1, reset } }),
+  ] };
+  assert.equal(isClaudeFleetExhausted(sameTier, 0.98, { includeModelWindows: true }), true, 'every open account on the same tier');
+  const oneFree = { accounts: [account({ '7d_oi': { utilization: 1, reset } }), account({})] };
+  assert.equal(isClaudeFleetExhausted(oneFree, 0.98, { includeModelWindows: true }), false, 'an account with no full tier');
 });
 
 // A Fable-only shortage across the fleet arrives as a fleet-exhaustion error
