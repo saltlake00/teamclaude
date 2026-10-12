@@ -2961,34 +2961,20 @@ test('the live monitor scans a multi-MiB burst in chunks', async () => {
     'an oversized record after the error resolves it');
 });
 
-test('model-scoped windows count only when the proxy reported fleet exhaustion', () => {
+test('model-scoped windows count only for the session model when the proxy reported fleet exhaustion', () => {
   const reset = new Date(Date.now() + 3600_000).getTime();
-  const status = { accounts: [{ enabled: true, quota: {
-    unified5h: 0.2, unified5hReset: reset, unified7d: 0.3, unified7dReset: reset,
-    modelWeekly: { '7d_oi': { utilization: 1, reset } },
-  } }] };
-  assert.equal(isClaudeFleetExhausted(status, 0.98), false, 'general quota remains');
-  assert.equal(isClaudeFleetExhausted(status, 0.98, { includeModelWindows: true }), true, 'the Fable tier is full');
-  const expired = structuredClone(status);
-  expired.accounts[0].quota.modelWeekly['7d_oi'].reset = Date.now() - 1000;
-  assert.equal(isClaudeFleetExhausted(expired, 0.98, { includeModelWindows: true }), false, 'an expired window is not blocking');
-
-  // Accounts full on DIFFERENT model tiers do not add up to an exhausted fleet.
   const account = modelWeekly => ({ enabled: true, quota: {
     unified5h: 0.2, unified5hReset: reset, unified7d: 0.3, unified7dReset: reset, modelWeekly,
   } });
-  const crossTier = { accounts: [
-    account({ '7d_oi': { utilization: 1, reset } }),
-    account({ '7d_xx': { utilization: 1, reset } }),
-  ] };
-  assert.equal(isClaudeFleetExhausted(crossTier, 0.98, { includeModelWindows: true }), false, 'different tiers');
-  const sameTier = { accounts: [
-    account({ '7d_oi': { utilization: 1, reset } }),
-    account({ '7d_oi': { utilization: 0.99, reset }, '7d_xx': { utilization: 0.1, reset } }),
-  ] };
-  assert.equal(isClaudeFleetExhausted(sameTier, 0.98, { includeModelWindows: true }), true, 'every open account on the same tier');
-  const oneFree = { accounts: [account({ '7d_oi': { utilization: 1, reset } }), account({})] };
-  assert.equal(isClaudeFleetExhausted(oneFree, 0.98, { includeModelWindows: true }), false, 'an account with no full tier');
+  const fableFull = { accounts: [account({ '7d_oi': { utilization: 1, reset } })] };
+  assert.equal(isClaudeFleetExhausted(fableFull, 0.98), false, 'general quota remains');
+  assert.equal(isClaudeFleetExhausted(fableFull, 0.98, { modelLabel: '7d_oi' }), true, 'the session model tier is full');
+  assert.equal(isClaudeFleetExhausted(fableFull, 0.98, { modelLabel: '7d_xx' }), false, 'another model tier');
+  assert.equal(isClaudeFleetExhausted(fableFull, 0.98, { modelLabel: null }), false, 'unknown session model');
+  const expired = { accounts: [account({ '7d_oi': { utilization: 1, reset: Date.now() - 1000 } })] };
+  assert.equal(isClaudeFleetExhausted(expired, 0.98, { modelLabel: '7d_oi' }), false, 'an expired window is not blocking');
+  const mixed = { accounts: [account({ '7d_oi': { utilization: 1, reset } }), account({})] };
+  assert.equal(isClaudeFleetExhausted(mixed, 0.98, { modelLabel: '7d_oi' }), false, 'an account with that tier free');
 });
 
 // A Fable-only shortage across the fleet arrives as a fleet-exhaustion error
@@ -3006,7 +2992,7 @@ test('fleet exhaustion with only the model tier full hands off when Codex fallba
 
   await runClaudeWithRecovery({
     claudeArgs: [],
-    childEnv: {},
+    childEnv: { ANTHROPIC_MODEL: 'claude-fable-5' },
     config: { autoResumeClaude: true, codexFallbackOnExhaustion: true },
     cwd,
     transcriptRoot,
@@ -3034,6 +3020,49 @@ test('fleet exhaustion with only the model tier full hands off when Codex fallba
 
   assert.equal(codexCalls, 1);
   assert.equal(calls.length, 1);
+});
+
+test('a session on another model is not handed off for a Fable-only shortage', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-fleet-model-'));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  const handoffRoot = join(root, 'handoffs');
+  await mkdir(cwd);
+  const calls = [];
+  let codexCalls = 0;
+  const reset = new Date(Date.now() + 3600_000).getTime();
+
+  await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: { ANTHROPIC_MODEL: 'claude-opus-4-8' },
+    config: { autoResumeClaude: true, codexFallbackOnExhaustion: true },
+    cwd,
+    transcriptRoot,
+    handoffRoot,
+    pollIntervalMs: 5,
+    fetchStatus: async () => ({ accounts: [{ enabled: true, quota: {
+      unified5h: 0.2, unified5hReset: reset, unified7d: 0.3, unified7dReset: reset,
+      modelWeekly: { '7d_oi': { utilization: 1, reset } },
+    } }] }),
+    wait: async () => {},
+    spawnClaude(args) {
+      const child = fakeChild();
+      calls.push([...args]);
+      const sessionId = args[args.indexOf('--session-id') + 1];
+      setTimeout(async () => {
+        const dir = join(transcriptRoot, 'project');
+        await mkdir(dir, { recursive: true });
+        await writeFile(join(dir, `${sessionId}.jsonl`), `${fleetExhaustedRecord(cwd, 3600)}\n`);
+      }, 10);
+      if (calls.length > 1) setTimeout(() => child.finish(0), 10);
+      return child;
+    },
+    launchCodex: async () => { codexCalls += 1; return { status: 0, signal: null }; },
+    log() {},
+  });
+
+  assert.equal(codexCalls, 0, 'no handoff: the Fable tier is not this session\'s model');
+  assert.equal(calls.length, 2, 'the session waits and resumes instead');
 });
 
 test('ambiguous Claude session selectors never monitor or recover another session', async t => {

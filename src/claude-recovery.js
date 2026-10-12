@@ -10,6 +10,7 @@ import {
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 import { parseClaudeRecoveryAccount } from './claude-auth.js';
+import { modelQuotaLabel } from './account-manager.js';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -72,30 +73,35 @@ function accountGeneralQuotaBlocked(account, threshold) {
   return false;
 }
 
-function blockedModelLabels(account, threshold) {
-  const windows = account?.quota?.modelWeekly;
-  if (!windows || typeof windows !== 'object') return [];
-  return Object.entries(windows)
-    .filter(([, win]) => freshBlocked(win?.utilization, win?.reset, threshold))
-    .map(([label]) => label);
+function modelWindowBlocked(account, label, threshold) {
+  const win = account?.quota?.modelWeekly?.[label];
+  return freshBlocked(win?.utilization, win?.reset, threshold);
 }
 
-// With `includeModelWindows`, the fleet also counts as exhausted when every
-// account that still has general quota is blocked on the SAME model-scoped
-// weekly window (e.g. all on the Fable tier): that one tier is what the
-// session's requests hit. Accounts full on different tiers do not combine.
-// Callers pass it only when the proxy itself reported that every account is
-// exhausted for the session's request (a fleet-exhaustion error).
-export function isClaudeFleetExhausted(status, threshold = 0.98, { includeModelWindows = false } = {}) {
+// With `modelLabel` (the model-scoped weekly window of the session's model,
+// e.g. the Fable tier), an account that still has general quota but whose
+// window for THAT model is full also counts as exhausted. Callers pass it only
+// when the proxy itself reported that every account is exhausted for the
+// session's request (a fleet-exhaustion error); windows of other models never
+// count, and without a known session model only general quota decides.
+export function isClaudeFleetExhausted(status, threshold = 0.98, { modelLabel = null } = {}) {
   const accounts = Array.isArray(status?.accounts)
     ? status.accounts.filter(account => account?.enabled !== false)
     : [];
-  if (accounts.length === 0) return false;
-  const open = accounts.filter(account => !accountGeneralQuotaBlocked(account, threshold));
-  if (open.length === 0) return true;
-  if (!includeModelWindows) return false;
-  const [first, ...rest] = open.map(account => new Set(blockedModelLabels(account, threshold)));
-  return [...first].some(label => rest.every(labels => labels.has(label)));
+  return accounts.length > 0
+    && accounts.every(account => accountGeneralQuotaBlocked(account, threshold)
+      || (typeof modelLabel === 'string' && modelWindowBlocked(account, modelLabel, threshold)));
+}
+
+// The model the session runs with: an explicit --model argument wins over the
+// environment the launcher prepared.
+function sessionModel(claudeArgs, childEnv) {
+  const args = Array.isArray(claudeArgs) ? claudeArgs : [];
+  for (let i = 0; i < args.length; i += 1) {
+    if (args[i] === '--model' && typeof args[i + 1] === 'string') return args[i + 1];
+    if (typeof args[i] === 'string' && args[i].startsWith('--model=')) return args[i].slice('--model='.length);
+  }
+  return typeof childEnv?.ANTHROPIC_MODEL === 'string' ? childEnv.ANTHROPIC_MODEL : null;
 }
 
 function textBlocks(content) {
@@ -1043,7 +1049,9 @@ export async function runClaudeWithRecovery({
 
     if (config.codexFallbackOnExhaustion === true
         && isClaudeFleetExhausted(status, config.switchThreshold ?? 0.98, {
-          includeModelWindows: outcome.event.kind === 'fleet_exhausted',
+          modelLabel: outcome.event.kind === 'fleet_exhausted'
+            ? modelQuotaLabel(sessionModel(claudeArgs, nextEnv ?? childEnv))
+            : null,
         })) {
       const handoff = await writeHandoff({
         transcriptPath,

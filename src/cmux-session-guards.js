@@ -102,21 +102,20 @@ async function unresolvedApiError(path, transcriptRoot, sessionId, recoverableKi
     const { handle, info } = await openPrivateFile(resolvedPath);
     try {
       if (await realpath(path) !== resolvedPath) return false;
-      // Read the last 256 KiB, widened back to the preceding newline so the
-      // first record in the window is whole (bounded at 16 MiB); a record cut
-      // in half would otherwise be dropped and an unresolved error missed.
-      let start = Math.max(0, info.size - 256 * 1024);
-      const floor = Math.max(0, start - 16 * 1024 * 1024);
-      const probe = Buffer.alloc(64 * 1024);
-      while (start > floor) {
-        const from = Math.max(floor, start - probe.length);
-        const { bytesRead } = await handle.read(probe, 0, start - from, from);
+      // Read the last 256 KiB. When its start cuts a record, look back at most
+      // another 256 KiB for that record's beginning: an API-error record is
+      // small, so an error cut by the window is always recovered whole. A cut
+      // record longer than that is a conversation record (it would resolve any
+      // earlier error); it is skipped as before, keeping each pass bounded.
+      const windowStart = Math.max(0, info.size - 256 * 1024);
+      let start = windowStart;
+      if (start > 0) {
+        const from = Math.max(0, start - 256 * 1024);
+        const probe = Buffer.alloc(start - from);
+        const { bytesRead } = await handle.read(probe, 0, probe.length, from);
         const newline = probe.subarray(0, bytesRead).lastIndexOf(10);
-        if (newline !== -1) {
-          start = from + newline + 1;
-          break;
-        }
-        start = from;
+        if (newline !== -1) start = from + newline + 1;
+        else if (from === 0) start = 0; // the file's first byte begins a record
       }
       const buffer = Buffer.alloc(info.size - start);
       await handle.read(buffer, 0, buffer.length, start);

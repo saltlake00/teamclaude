@@ -1895,6 +1895,19 @@ test('an error record straddling the tail window is still seen as unresolved', a
   assert.equal(state?.kind, 'fleet_exhausted');
 });
 
+// The look-back is bounded: a final record far larger than the window is a
+// conversation record, so an older error before it counts as resolved instead
+// of the scan reading back through megabytes on every rescue pass.
+test('a huge final record resolves an older error without unbounded look-back', async t => {
+  const fx = await fixture(t);
+  const huge = `${JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: 'z'.repeat(8 * 1024 * 1024) } })}\n`;
+  await writeFile(fx.transcriptPath, `${fleetExhaustedRecord(fx.cwd, 60)}\n${huge}`);
+  const started = Date.now();
+  const state = await unresolvedRecoverableApiErrorState(fx.transcriptPath, fx.transcriptRoot, SESSION_ID);
+  assert.equal(state, null, 'the error is resolved by the conversation record after it');
+  assert.ok(Date.now() - started < 1000, 'bounded work');
+});
+
 test('a process whose cwd could not be read is never treated as the session process', async t => {
   const fx = await fixture(t);
   assert.equal(await sameClaudeProcess(fx.session, processInfo(fx, { cwd: null }), fx.executablePath), false);
