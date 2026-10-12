@@ -2204,3 +2204,21 @@ test('an ambiguous launch failure keeps the event claim', async t => {
   assert.equal((await run()).failed, 0, 'the claimed event is not relaunched');
   assert.equal(attempts, 1);
 });
+
+test('a claim swapped in between the check and the removal is restored, not deleted', async t => {
+  const fx = await fixture(t);
+  const claimDir = `${fx.storePath}.recovery-claims`;
+  const claimPath = join(claimDir, SESSION_ID);
+  const claim = await claimSessionOnce(fx.storePath, SESSION_ID);
+  const released = await releaseSessionClaim(fx.storePath, SESSION_ID, claim, {
+    afterCheck: async () => {
+      await rename(claimPath, `${claimPath}.old`);
+      await writeFile(claimPath, 'another recovery\n', { mode: 0o600 });
+    },
+  });
+  assert.equal(released, false);
+  assert.equal(await readFile(claimPath, 'utf8'), 'another recovery\n', 'the other claim survives');
+  const { readdir } = await import('node:fs/promises');
+  assert.deepEqual((await readdir(claimDir)).filter(name => name.includes('releasing')), [],
+    'no detached claim is left behind');
+});

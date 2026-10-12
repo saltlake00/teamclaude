@@ -389,7 +389,12 @@ export async function claimSessionOnce(
   }
 }
 
-export async function releaseSessionClaim(storePath, sessionId, expectedIdentity = null) {
+export async function releaseSessionClaim(
+  storePath,
+  sessionId,
+  expectedIdentity = null,
+  { afterCheck = null } = {},
+) {
   assertRecoveryClaimKey(sessionId);
   const claimDir = `${storePath}.recovery-claims`;
   let directoryHandle;
@@ -403,7 +408,26 @@ export async function releaseSessionClaim(storePath, sessionId, expectedIdentity
     }
     if (expectedIdentity
         && !sameIdentity(claimInfo, expectedIdentity)) return false;
-    await unlink(claimPath);
+    await afterCheck?.();
+    // Detach the claim with an atomic rename to a hidden unique name and
+    // verify what was detached: a claim swapped in after the check above is
+    // put back instead of deleted. If a newer claim already took the name
+    // (EEXIST), the detached one is superseded and only it is removed.
+    const detached = join(claimDir, `.${sessionId}.releasing-${randomUUID()}`);
+    await rename(claimPath, detached);
+    const detachedInfo = await lstat(detached);
+    if (!ownedPrivate(detachedInfo, 'isFile')
+        || (expectedIdentity && !sameIdentity(detachedInfo, expectedIdentity))) {
+      try {
+        await link(detached, claimPath);
+      } catch (err) {
+        if (err.code !== 'EEXIST') throw err;
+      }
+      await unlink(detached);
+      await directoryHandle.sync();
+      return false;
+    }
+    await unlink(detached);
     await directoryHandle.sync();
     return true;
   } catch (err) {
