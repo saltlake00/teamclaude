@@ -332,6 +332,12 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       ? sessionAffinityKeys.keyFor(sessionId)
       : req.socket;
   };
+  // After an upstream failure is passed through unreplayed, steer the client's
+  // own retry to a different account for this long (0 disables). See
+  // AccountManager.noteUpstreamFailure.
+  const upstreamFailureAvoidMs = Number.isFinite(config.upstreamFailureAvoidMs)
+    ? Math.max(0, config.upstreamFailureAvoidMs)
+    : DEFAULT_UPSTREAM_FAILURE_AVOID_MS;
   // Continuity mode keeps Claude Code requests inside the proxy while capacity
   // or upstream rate limits recover, instead of surfacing a terminal-stopping
   // 429. Unit tests can leave it off; the CLI server enables it by default.
@@ -1732,7 +1738,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         // auth401 = accounts that answered 401 after their refresh chance (cascade
         // guard input + per-request exclusion); authParked = what THIS request parked,
         // kept so a cascade can put it back.
-        const ctx = { account: null, status: null, model: null, provider, authRetried: new Set(), auth401: new Set(), authParked: [], authCascade: false, tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, capacityWaits: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: affinityKeyFor(req), preferredAccountUuid: recoveryAccountUuid, sawModelWeekly: false, byok: byokMatch != null, continuity, continuityDeadlineAt: null, failedFast: false, last429: null, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined, streamRecovery, maxResponseBytes, reserveResponseBytes, releaseReservedResponseBytes, reserveAuxiliaryResponseBytes, releaseAuxiliaryResponseBytes, reserveLogResponseBytes, releaseLogResponseBytes, registerIdleLogReservation, upstreamResponseTimeoutMs, streamIdleTimeoutMs, streamTotalTimeoutMs, subscriptionRecheckIntervalMs, resetCredits: resetCreditController, resetCreditAttempts: 0, resetCreditRetried: new Set(), resetCreditBackstopYielded: false };
+        const ctx = { account: null, status: null, model: null, provider, authRetried: new Set(), auth401: new Set(), authParked: [], authCascade: false, tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, capacityWaits: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: affinityKeyFor(req), upstreamFailureAvoidMs, preferredAccountUuid: recoveryAccountUuid, sawModelWeekly: false, byok: byokMatch != null, continuity, continuityDeadlineAt: null, failedFast: false, last429: null, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined, streamRecovery, maxResponseBytes, reserveResponseBytes, releaseReservedResponseBytes, reserveAuxiliaryResponseBytes, releaseAuxiliaryResponseBytes, reserveLogResponseBytes, releaseLogResponseBytes, registerIdleLogReservation, upstreamResponseTimeoutMs, streamIdleTimeoutMs, streamTotalTimeoutMs, subscriptionRecheckIntervalMs, resetCredits: resetCreditController, resetCreditAttempts: 0, resetCreditRetried: new Set(), resetCreditBackstopYielded: false };
         try {
           if (isStatusRequest) {
             res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -2310,6 +2316,11 @@ function formatRequestUrlForLog(url, metadataOnly = false) {
 // failover/backoff only for replay-safe requests; an ambiguous POST passes
 // through because a 5xx does not prove the upstream skipped its execution.
 const RETRYABLE_STATUS = new Set([500, 502, 503, 504, 507, 529]);
+// Default steer-away window after an unreplayed upstream failure (config
+// `upstreamFailureAvoidMs`). Long enough to cover a client's own reconnect
+// burst (Codex CLI: 5 attempts with backoff), short enough that a healthy
+// account is back in rotation well within one warm-up interval.
+const DEFAULT_UPSTREAM_FAILURE_AVOID_MS = 30_000;
 // Sleep that also resolves immediately if `signal` aborts — so a client that
 // disconnects during an overload backoff doesn't keep its account slot reserved
 // for the whole (up to multi-second) wait. Cleans up its timer/listener either way.
@@ -3682,6 +3693,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       // Only exact-session TUI continuation may recover an unsafe POST.
       if (!replaySafe) {
         console.log(`[TeamClaude] ${code} after ${method} dispatch on "${account.name}" — passing through without replay`);
+        accountManager.noteUpstreamFailure(account, ctx.affinityKey, ctx.upstreamFailureAvoidMs, `HTTP ${code} after dispatch`);
         ctx.status = code;
         if (logDir) {
           appendLogSection(`=== RESPONSE ${code} — unsafe request was not replayed ===\n${formatHeaders(upstreamRes.headers, metadataOnlyLog)}`);
@@ -3865,6 +3877,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         // decide, avoiding a hidden duplicate execution inside the proxy.
         if (!replaySafe) {
           console.log(`[TeamClaude] Upstream stream ${outcome.preStreamFailure} after ${method} dispatch on "${account.name}" — not replaying`);
+          accountManager.noteUpstreamFailure(account, ctx.affinityKey, ctx.upstreamFailureAvoidMs, `Stream ${outcome.preStreamFailure} after dispatch`);
           if (logDir) {
             appendLogSection(`=== STREAM ${outcome.preStreamFailure} — unsafe request was not replayed ===`);
             flushRequestLog(logDir, reqId, logSections, hooks);
@@ -3928,6 +3941,13 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         // so the only recovery that helps is the CLIENT retrying — which the
         // injected error event triggers. No account state is mutated.
         console.log(`[TeamClaude] Upstream stream ${outcome.reason} on "${account.name}" — appended retryable error event for client-side retry`);
+      }
+      if (!outcome.injected && (outcome.terminalEvent === 'error' || outcome.terminalEvent === 'response.failed')) {
+        // The upstream itself ended the stream with an error event (e.g. the
+        // Codex backend's "An error occurred while processing your request …
+        // request ID …"). It was relayed verbatim — nothing to replay — but the
+        // client's own reconnect must not be pinned to the failing account.
+        accountManager.noteUpstreamFailure(account, ctx.affinityKey, ctx.upstreamFailureAvoidMs, `Upstream ${outcome.terminalEvent} event`);
       }
       if (ctx.provider === 'codex' && isCodexInferenceRequest(req)
           && upstreamRes.status >= 200 && upstreamRes.status < 300
@@ -4084,6 +4104,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         }
       }
       if (!replaySafe && !res.headersSent && !res.destroyed) {
+        accountManager.noteUpstreamFailure(account, ctx.affinityKey, ctx.upstreamFailureAvoidMs, 'Network error after dispatch');
         ctx.status = 502;
         const responseHeaders = codexRecoveryResponseHeaders(
           req,
@@ -4217,6 +4238,7 @@ async function streamResponse(
     limitExceeded: false,
     completed: false,
     responseCompleted: false,
+    terminalEvent: null,
   };
 
   // Append a well-formed retryable error frame and end. Only called when every
@@ -4496,6 +4518,7 @@ async function streamResponse(
     outcome.responseCompleted = endedNormally
       && (terminalObserver?.sawResponseCompleted || encodedTerminalObserver?.sawResponseCompleted || false);
   } finally {
+    outcome.terminalEvent = framer?.terminalEvent || terminalObserver?.terminalEvent || null;
     // Cancel upstream reader to stop consuming data nobody needs
     reader.cancel().catch(() => {});
     if (spillFile) await spillFile.close().catch(() => {});
