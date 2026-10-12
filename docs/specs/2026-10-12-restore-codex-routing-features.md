@@ -57,3 +57,25 @@ manual-rollout 자동 롤백 + rollback_hash 454a80aa.
   claude-wrapper.js, codex-reset-credits.js, reauth.js, config.js (5e47d84 대비 diff 없음).
 - CLI 스모크: 임시 설정·미사용 포트로 `node src/index.js codex status` 정상 출력.
 - 미확인(배포 후 항목): `/teamclaude/status`의 codexCredits 갱신, 라이브 로그의 회피·pre-output 재생 발동.
+
+### 적대 리뷰 1차(REQUEST_CHANGES) 수정 후 재검증
+- I2: 요청의 리셋권 1회 패스가 소진되면(`resetCreditAttempts >= 1`) creditScope가 그 사실을 싣고
+  creditDeferral이 false가 된다. getActiveAccount 무제외 경로도 scope를 넘긴다.
+  회귀 테스트 `a charged reset-credit pass unlocks paid credits even while another account still holds a reset credit`:
+  수정 전 429(`All 2 accounts exhausted`), 수정 후 200, consume 1회.
+- M1: addAccount에 `_reserveHeld: false` 초기화. 테스트 1건(수정 전 실패).
+- M2: 보조 예산 예약 실패를 `aux-budget` 사유로 분리, 크레딧 거절 판정 생략 시 로그 1줄. 테스트 2건(수정 전 실패).
+- M3: readOnly(status) 경로는 send-failed 쿨다운을 해제하지도, 해제된 것으로 보지도 않는다.
+  `status:'error'` + `creditBacked:true` 행이 나오지 않는다. 테스트 1건(수정 전 실패). 해시 핀·증거 발췌 재갱신.
+- 전체 스위트(qgate): 기준 tests 1040 / fail 50(이름 42종) → 수정 후 tests 1164 / fail 50(이름 42종),
+  실패 이름 집합 완전 일치(신규 0, 해소 0). 이번 실행에서는 첫 프레임 테스트 고정분과 flaky 1건 모두 기준과 같았다.
+- fleet-final 보존 지정 실행 10개 파일(send-failure-cooldown, server-send-failed-recovery, server-401,
+  server-supervisor, subscription-supervisor, supervisor-midstream, claude-recovery, cmux-session-lease,
+  cmux-session-rescue, run-recovery): 284건 중 21건 실패. 전부 run-recovery·claude-recovery의 실프로세스 계열이고,
+  기준에도 없던 이름 3건은 같은 시각 기준(5e47d84)에서도 같은 11건이 실패해 환경(고부하) 의존으로 판단했다.
+- `python3 -m pytest test/test_model_recovery_gate.py`: HEAD·기준 모두 3 failed / 2 passed. 해시 핀 테스트는 통과.
+  게이트 내부 node 실패 이름은 HEAD가 기준의 부분집합. watchdog 운영 사본 불일치는 기준도 같다.
+- `npm run lint`: 워크트리에 node_modules가 없어 `eslint: command not found`. `npx --no-install eslint .`는 exit 0.
+- 이식 기능 9개 파일(quota-reserve, account-manager-avoid, server-upstream-failure-avoid, server-codex-503-replay,
+  server-codex-prestream-replay, codex-credits, server-codex, server-usage-tracking, sse): 164/164 통과.
+- 출력 원문: 세션 scratchpad `evidence-r2.txt`(로컬, 저장소 밖).
