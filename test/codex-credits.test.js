@@ -668,6 +668,26 @@ test('server: a genuine limit 429 despite credits falls back to the old throttle
   }
 });
 
+test('server: a credit refusal whose body cannot be inspected for lack of auxiliary budget is logged', async () => {
+  // The response budget (8 KiB) is below the 16 KiB inspection reservation, so
+  // the refusal evidence cannot be read. That must not pass silently: the
+  // operator needs to know the 30-minute credit hold was skipped.
+  const logs = [];
+  const original = console.log;
+  console.log = (...args) => { logs.push(args.join(' ')); original(...args); };
+  const h = await startCreditHarness({ maxBufferedResponseBytes: 8 * 1024 });
+  try {
+    h.state.richMode = 'reject';
+    const res = await h.send();
+    assert.equal(res.status, 429);
+    assert.ok(logs.some(line => /credit refusal check skipped/.test(line) && /auxiliary/.test(line)),
+      `expected an aux-budget log line, got: ${logs.join(' | ')}`);
+  } finally {
+    console.log = original;
+    await h.close();
+  }
+});
+
 test('server: a transient 429 on a credit-backed dispatch is not a credit refusal', async () => {
   const h = await startCreditHarness();
   try {

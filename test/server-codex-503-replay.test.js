@@ -475,3 +475,42 @@ test('codexCapacityReplayEligible refuses once headers were sent, the response e
   assert.equal(codexCapacityReplayEligible({ ...base, method: 'GET', replaySafe: true }), false, 'replay-safe methods use the normal path');
   assert.equal(codexCapacityReplayEligible({ ...base, url: '/codex/other' }), false, 'responses path only');
 });
+
+test('a codex 503 that cannot reserve the auxiliary inspection budget is reported as aux-budget, not oversize-body', () => withEnv(FAST_ENV, async () => {
+  const logs = [];
+  const original = console.log;
+  console.log = (...args) => { logs.push(args.join(' ')); };
+  const upstream = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      res.writeHead(503, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { type: 'overloaded_error', message: 'capacity' } }));
+    });
+  });
+  const upstreamPort = await listen(upstream);
+  const manager = new AccountManager([{
+    name: 'codex-a', provider: 'codex', type: 'oauth',
+    accessToken: 'pooled-access-token-a', accountId: 'workspace-a',
+    expiresAt: Date.now() + 3_600_000,
+  }]);
+  // 8 KiB response budget < the 16 KiB inspection reservation.
+  const proxy = createProxyServer(manager, {
+    provider: 'codex', upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false, codexUsageRefresh: false, maxBufferedResponseBytes: 8 * 1024,
+  });
+  const proxyPort = await listen(proxy);
+  try {
+    const response = await fetch(`http://127.0.0.1:${proxyPort}/codex/responses`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-5.6', input: [] }),
+    });
+    assert.equal(response.status, 503);
+    await response.text();
+    assert.ok(logs.some(line => /not replayable: aux-budget/.test(line)),
+      `expected aux-budget reason, got: ${logs.join(' | ')}`);
+    assert.ok(!logs.some(line => /not replayable: oversize-body/.test(line)));
+  } finally {
+    console.log = original;
+    await Promise.all([closeServer(proxy), closeServer(upstream)]);
+  }
+}));

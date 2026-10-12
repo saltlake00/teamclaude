@@ -121,9 +121,14 @@ class CreditScope extends Set {
 // Credit-refusal evidence lives in the 429 body, which the codex path keeps
 // as raw (possibly gzip/br) bytes for the client. Inspect a bounded, decoded
 // COPY under the auxiliary memory budget; an undecodable or oversized body is
-// simply no evidence (never a hold, never a throw).
-function creditRefusalInBody(ctx, body, contentEncoding) {
-  if (!ctx.reserveAuxiliaryResponseBytes(CODEX_ERROR_INSPECTION_MAX_BYTES)) return false;
+// simply no evidence (never a hold, never a throw). A failed reservation is
+// logged: the long credit hold is then skipped and the account only takes the
+// short throttle, which an operator must be able to see under load.
+function creditRefusalInBody(ctx, body, contentEncoding, accountName = '') {
+  if (!ctx.reserveAuxiliaryResponseBytes(CODEX_ERROR_INSPECTION_MAX_BYTES)) {
+    console.log(`[TeamCodex] 429 on credit-backed "${accountName}": credit refusal check skipped — auxiliary response budget full, no credit hold applied`);
+    return false;
+  }
   try {
     const decoded = decodeBodyForInspection(body, contentEncoding, CODEX_ERROR_INSPECTION_MAX_BYTES);
     return decoded != null && codexCreditRefusalEvidence({ bodyText: decoded.toString('utf8') });
@@ -199,7 +204,8 @@ function isCodexCapacityRejectionBody(decoded) {
 async function readCodexCapacityRejection(upstreamRes, ctx) {
   if (!ctx.reserveAuxiliaryResponseBytes(CODEX_ERROR_INSPECTION_MAX_BYTES)) {
     try { await upstreamRes.body?.cancel(); } catch { /* already errored/closed */ }
-    return 'oversize-body';
+    // Not the body's fault: the shared response budget is momentarily full.
+    return 'aux-budget';
   }
   try {
     const raw = await readBodyBounded(upstreamRes.body, CODEX_ERROR_INSPECTION_MAX_BYTES);
@@ -4075,7 +4081,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         // The reached-type header is NOT evidence: it means "included quota
         // reached", the premise of every credit-backed dispatch.
         if (ctx.creditBackedDispatch && creditRefusalInBody(ctx, responseBody,
-          upstreamRes.headers.get('content-encoding'))) {
+          upstreamRes.headers.get('content-encoding'), account.name)) {
           accountManager.noteCreditRefusal(account, ctx.codexCreditRefusalMs, ctx.model);
         }
         console.log(`[TeamClaude] 429 (quota exhausted) on "${account.name}" — throttling ${retryAfter}s, switching accounts`);
