@@ -19,6 +19,7 @@ import { join } from 'node:path';
 import {
   createCmuxSessionRescuer,
   rescueCmuxSessionsOnce,
+  resolveCmuxBinary,
   resolveRecoveryWindowId,
   stopExistingSessionProcess,
 } from '../src/cmux-session-rescue.js';
@@ -2513,4 +2514,20 @@ test('stop sends nothing when a PID changes identity or cannot be re-inspected b
     await stopExistingSessionProcess(info, parentPid, { inspectProcess });
     assert.deepEqual(signalled, [], failure);
   }
+});
+
+test('cmux binary resolution never consults PATH and honours only an absolute override', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-cmux-bin-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const bin = join(dir, 'cmux');
+  await writeFile(bin, '#!/bin/sh\n', { mode: 0o755 });
+  const plain = join(dir, 'not-executable');
+  await writeFile(plain, '', { mode: 0o644 });
+
+  assert.equal(await resolveCmuxBinary({ TEAMCLAUDE_CMUX_BIN: bin }), bin);
+  await assert.rejects(resolveCmuxBinary({ TEAMCLAUDE_CMUX_BIN: 'cmux' }), /absolute/);
+  await assert.rejects(resolveCmuxBinary({ TEAMCLAUDE_CMUX_BIN: plain }), /absolute path to an executable/);
+  // A cmux on PATH alone is never picked up.
+  const result = await resolveCmuxBinary({ PATH: dir }).catch(err => err);
+  assert.notEqual(result, bin);
 });
