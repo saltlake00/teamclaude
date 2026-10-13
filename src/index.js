@@ -219,7 +219,7 @@ switch (command) {
     break;
   case 'status':
     await statusCommand();
-    process.exit(0);
+    process.exitCode = 0;
     break;
   case 'accounts':
     await accountsCommand();
