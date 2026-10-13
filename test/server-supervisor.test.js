@@ -707,16 +707,14 @@ test('CLI remove reloads the live worker while preserving the public supervisor'
       timeout: 10_000,
     });
     assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /Applied to the running server/);
 
-    const reloaded = await waitUntil(async () => {
-      const response = await status(port);
-      if (!response) return null;
-      const body = await response.json();
-      const state = await readState(statePath);
-      return body.accounts.length === 1
-        ? { body, state }
-        : null;
-    }, 'live worker did not apply the removed account', 8000);
+    // The CLI only reports success after the worker confirmed the reload, so
+    // the change must already be live the moment the command returns.
+    const response = await status(port);
+    assert.ok(response, 'proxy must still answer after the reload');
+    const reloaded = { body: await response.json(), state: await readState(statePath) };
+    assert.equal(reloaded.body.accounts.length, 1, 'removal must be live when the CLI returns');
 
     assert.equal(reloaded.state.pid, initial.pid, 'public supervisor PID must stay stable');
     assert.equal(reloaded.state.pid, child.pid);
@@ -745,6 +743,55 @@ test('CLI remove reloads the live worker while preserving the public supervisor'
     assert.equal((await readState(statePath)).workerPid, initial.workerPid);
   } finally {
     await stopChild(child);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('CLI account change against a worker that never confirms exits non-zero and says it is not applied', { timeout: 15000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-live-unconfirmed-'));
+  const configPath = join(dir, 'config.json');
+  const statePath = join(dir, 'config.server.json');
+  // A TeamClaude-shaped status endpoint owned by this test process stands in
+  // for the supervisor; the "worker" is an old build that accepts SIGHUP but
+  // knows nothing about reload confirmation.
+  const fakeSupervisor = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ accounts: [], switchThreshold: 0.98 }));
+  });
+  const port = await listen(fakeSupervisor);
+  const oldWorker = spawn(process.execPath, ['-e',
+    "process.on('SIGHUP', () => { process.stdout.write('hup\\n'); }); setInterval(() => {}, 1000);"], {
+    stdio: ['ignore', 'pipe', 'ignore'],
+  });
+  let hups = '';
+  oldWorker.stdout.on('data', chunk => { hups += chunk; });
+  await delay(200);
+  await writeFile(configPath, JSON.stringify({
+    proxy: { port },
+    accounts: [{ name: 'acct', type: 'apikey', apiKey: 'key-a' }],
+  }));
+  await writeFile(statePath, JSON.stringify({ pid: process.pid, workerPid: oldWorker.pid, port }));
+  const env = { ...process.env, TEAMCLAUDE_CONFIG: configPath, TEAMCLAUDE_RELOAD_TIMEOUT_MS: '400' };
+
+  try {
+    const cli = spawn(process.execPath, [entry, 'disable', 'acct'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    cli.stdout.on('data', chunk => { stdout += chunk; });
+    cli.stderr.on('data', chunk => { stderr += chunk; });
+    const [code] = await once(cli, 'exit');
+
+    assert.notEqual(code, 0, `CLI must fail when the reload is unconfirmed\n${stdout}\n${stderr}`);
+    assert.doesNotMatch(stdout, /Applied to the running server/);
+    assert.match(stderr, /saved/i);
+    assert.match(stderr, /not (yet )?(been )?(confirmed|applied)/i);
+    assert.match(hups, /hup/, 'the old worker still received the reload signal');
+    const persisted = JSON.parse(await readFile(configPath, 'utf8'));
+    assert.equal(persisted.accounts[0].enabled, false, 'the change is still saved to disk');
+    assert.ok(isPidAlive(oldWorker.pid), 'an unconfirmed reload must not stop the worker');
+  } finally {
+    oldWorker.kill('SIGKILL');
+    await close(fakeSupervisor);
     await rm(dir, { recursive: true, force: true });
   }
 });
