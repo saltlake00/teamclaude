@@ -200,7 +200,10 @@ test('config/quota writes are atomic: valid content, 0600, no temp leftovers', a
     await saveConfig({ proxy: { port: 1 }, accounts: [{ name: 'A', type: 'apikey', apiKey: 'a' }] });
     const cfg = JSON.parse(await readFile(cfgPath, 'utf8'));
     assert.equal(cfg.accounts[0].name, 'A');
-    assert.equal((await stat(cfgPath)).mode & 0o777, 0o600, 'config stays private');
+    // Windows has no POSIX mode bits; the file reports 0666 regardless of the mode passed.
+    if (process.platform !== 'win32') {
+      assert.equal((await stat(cfgPath)).mode & 0o777, 0o600, 'config stays private');
+    }
 
     writeQuotaCacheSync({ savedAt: 1, accounts: [] });
     assert.deepEqual(await readQuotaCache(), { savedAt: 1, accounts: [] });
@@ -274,8 +277,11 @@ test('atomic config and quota renames fsync their parent directory', async () =>
         }
       });
     });
-    assert.ok(result.asyncDirectorySyncs > 0, 'async rename must fsync its directory');
-    assert.ok(result.syncDirectorySyncs > 0, 'sync rename must fsync its directory');
+    // config.js skips the directory fsync on win32 (a directory cannot be opened for fsync there).
+    if (process.platform !== 'win32') {
+      assert.ok(result.asyncDirectorySyncs > 0, 'async rename must fsync its directory');
+      assert.ok(result.syncDirectorySyncs > 0, 'sync rename must fsync its directory');
+    }
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

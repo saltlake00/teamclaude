@@ -1,4 +1,9 @@
-import { test } from 'node:test';
+import { test as nodeTest } from 'node:test';
+
+// These features have no Windows counterpart, so report every case as skipped there.
+const test = process.platform === 'win32'
+  ? name => nodeTest(name, { skip: 'POSIX-only: the claude wrapper is a shell launcher installed over symlinks' }, () => {})
+  : nodeTest;
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';

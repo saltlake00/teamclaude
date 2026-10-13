@@ -6,7 +6,7 @@ import { spawn } from 'node:child_process';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
@@ -167,7 +167,7 @@ if (process.env.TEAMCLAUDE_SUPERVISED_WORKER === '1') {
   const child = spawn(process.execPath, [entry, 'server'], {
     env: {
       ...process.env,
-      NODE_OPTIONS: `${process.env.NODE_OPTIONS || ''} --import=${preloadPath}`.trim(),
+      NODE_OPTIONS: `${process.env.NODE_OPTIONS || ''} --import=${pathToFileURL(preloadPath).href}`.trim(),
       TEAMCLAUDE_CONFIG: configPath,
       TEAMCLAUDE_PROVIDER: 'anthropic',
       FORWARDED_HEADER_MARKER: markerPath,

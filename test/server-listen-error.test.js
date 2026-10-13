@@ -6,7 +6,7 @@ import { once } from 'node:events';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const cliPath = fileURLToPath(new URL('../src/index.js', import.meta.url));
 
@@ -107,7 +107,7 @@ if (process.env.TEAMCLAUDE_SUPERVISED_WORKER !== '1') {
       ...process.env,
       TEAMCLAUDE_PROVIDER: 'anthropic',
       TEAMCLAUDE_CONFIG: configPath,
-      NODE_OPTIONS: `${process.env.NODE_OPTIONS || ''} --import=${preloadPath}`.trim(),
+      NODE_OPTIONS: `${process.env.NODE_OPTIONS || ''} --import=${pathToFileURL(preloadPath).href}`.trim(),
     },
     stdio: ['ignore', 'ignore', 'pipe'],
   });

@@ -4,7 +4,7 @@ import http from 'node:http';
 import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { networkInterfaces, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { once } from 'node:events';
 import { spawn, spawnSync } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -1562,7 +1562,7 @@ globalThis.fetch = async (input, init) => {
   const env = {
     ...process.env,
     TEAMCLAUDE_CONFIG: configPath,
-    NODE_OPTIONS: `${process.env.NODE_OPTIONS || ''} --import=${preloadPath}`.trim(),
+    NODE_OPTIONS: `${process.env.NODE_OPTIONS || ''} --import=${pathToFileURL(preloadPath).href}`.trim(),
   };
   const listing = spawn(process.execPath, [entry, 'accounts'], {
     env,

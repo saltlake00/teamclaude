@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -8,7 +9,7 @@ import { applyReauthToConfig, findReauthTarget, reauthenticateAccount } from '..
 import { AccountManager } from '../src/account-manager.js';
 import { TUI } from '../src/tui.js';
 
-const entry = new URL('../src/index.js', import.meta.url).pathname;
+const entry = fileURLToPath(new URL('../src/index.js', import.meta.url));
 const anthropicEnv = { ...process.env };
 delete anthropicEnv.TEAMCLAUDE_PROVIDER;
 
