@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readdirSync, writeFileSync } from 'node:fs';
 import { chmod, mkdtemp, readdir, readFile, rm, stat, writeFile, mkdir } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -10,12 +11,36 @@ import {
   runConfirmedReload,
   createReloadQueue,
   MAX_CLAIMS_PER_STEP,
+  SWEEP_MAX_ENTRIES,
+  reloadRequestPath,
+  reloadResultPath,
   normalizeReloadTimeoutMs,
   DEFAULT_RELOAD_CONFIRM_TIMEOUT_MS,
 } from '../src/reload-ack.js';
 
 async function tempDir() {
   return mkdtemp(join(tmpdir(), 'teamclaude-reload-ack-'));
+}
+
+const reqFile = reloadRequestPath;
+const resFile = reloadResultPath;
+
+async function postRequest(dir, nonce) {
+  await mkdir(join(dir, 'req'), { recursive: true });
+  await writeFile(reqFile(dir, nonce), '');
+}
+
+// Every request/result file under the reload directory, as `req/<name>` / `res/<name>`.
+async function listing(dir) {
+  const names = [];
+  for (const sub of ['req', 'res']) {
+    try {
+      for (const name of await readdir(join(dir, sub))) names.push(`${sub}/${name}`);
+    } catch (err) {
+      if (err.code !== 'ENOENT') throw err;
+    }
+  }
+  return names.sort();
 }
 
 // A stand-in for the worker's SIGHUP handler: the CLI "signal" schedules the
@@ -43,7 +68,7 @@ test('success: the CLI reports applied only after the worker finished its reload
     assert.equal(outcome.status, 'applied');
     assert.equal(applied, true, 'applied must not be reported before the reload ran');
     await worker.finished();
-    assert.deepEqual(await readdir(dir), [], 'request and result files are consumed');
+    assert.deepEqual(await listing(dir), [], 'request and result files are consumed');
   } finally {
     await rm(join(dir, '..'), { recursive: true, force: true });
   }
@@ -77,7 +102,7 @@ test('timeout: no confirmation within the limit is unconfirmed and withdraws the
     assert.equal(outcome.status, 'unconfirmed');
     assert.equal(outcome.reason, 'timeout');
     assert.ok(Date.now() - started >= 150, 'waits for the full limit');
-    assert.deepEqual(await readdir(dir), [], 'the abandoned request is removed');
+    assert.deepEqual(await listing(dir), [], 'the abandoned request is removed');
   } finally {
     await rm(join(dir, '..'), { recursive: true, force: true });
   }
@@ -122,7 +147,7 @@ test('signal failure: an undeliverable signal is unconfirmed and withdraws the r
     });
     assert.equal(outcome.status, 'unconfirmed');
     assert.match(outcome.reason, /ESRCH/);
-    assert.deepEqual(await readdir(dir), []);
+    assert.deepEqual(await listing(dir), []);
   } finally {
     await rm(join(dir, '..'), { recursive: true, force: true });
   }
@@ -132,13 +157,13 @@ test('other requests: a result for a different nonce is ignored and left for its
   const dir = join(await tempDir(), 'config.reload');
   const other = newReloadNonce();
   try {
-    await mkdir(dir, { recursive: true });
-    await writeFile(join(dir, `${other}.res`), JSON.stringify({ ok: true }));
+    await mkdir(join(dir, 'res'), { recursive: true });
+    await writeFile(resFile(dir, other), JSON.stringify({ ok: true }));
     const outcome = await requestConfirmedReload({
       dir, signal: () => {}, timeoutMs: 120, pollMs: 10,
     });
     assert.equal(outcome.status, 'unconfirmed', 'another request\'s success must not count as ours');
-    assert.deepEqual(await readdir(dir), [`${other}.res`]);
+    assert.deepEqual(await listing(dir), [`res/${other}.res`]);
   } finally {
     await rm(join(dir, '..'), { recursive: true, force: true });
   }
@@ -149,11 +174,10 @@ test('other requests: a reload that claimed only another nonce does not answer o
   const mine = newReloadNonce();
   const other = newReloadNonce();
   try {
-    await mkdir(dir, { recursive: true });
-    await writeFile(join(dir, `${other}.req`), '');
+    await postRequest(dir, other);
     // The worker claims and answers `other` before our request exists.
     await runConfirmedReload({ dir, reload: async () => {} });
-    assert.deepEqual(await readdir(dir), [`${other}.res`]);
+    assert.deepEqual(await listing(dir), [`res/${other}.res`]);
     const outcome = await requestConfirmedReload({
       dir, nonce: mine, signal: () => {}, timeoutMs: 120, pollMs: 10,
     });
@@ -170,8 +194,8 @@ test('malformed result: an unreadable result for our nonce is a failure, not a s
     const outcome = await requestConfirmedReload({
       dir,
       signal: () => {
-        nonce = readdirSync(dir).find(name => name.endsWith('.req')).slice(0, -'.req'.length);
-        writeFileSync(join(dir, `${nonce}.res`), '{not json');
+        nonce = readdirSync(join(dir, 'req')).find(name => name.endsWith('.req')).slice(0, -'.req'.length);
+        writeFileSync(resFile(dir, nonce), '{not json');
       },
       timeoutMs: 1000,
       pollMs: 10,
@@ -200,16 +224,14 @@ test('one reload answers every request it claimed, and only those', async () => 
   const a = newReloadNonce();
   const b = newReloadNonce();
   try {
-    await mkdir(dir, { recursive: true });
-    await writeFile(join(dir, `${a}.req`), '');
-    await writeFile(join(dir, `${b}.req`), '');
-    await writeFile(join(dir, 'not-a-nonce.req'), '');
+    await postRequest(dir, a);
+    await postRequest(dir, b);
+    await writeFile(join(dir, 'req', 'not-a-nonce.req'), '');
     const result = await runConfirmedReload({ dir, reload: async () => {} });
     assert.equal(result.ok, true);
     assert.deepEqual(result.claimed.sort(), [a, b].sort());
-    const files = (await readdir(dir)).sort();
-    assert.deepEqual(files, [`${a}.res`, `${b}.res`, 'not-a-nonce.req'].sort());
-    const body = JSON.parse(await readFile(join(dir, `${a}.res`), 'utf8'));
+    assert.deepEqual(await listing(dir), [`res/${a}.res`, `res/${b}.res`, 'req/not-a-nonce.req'].sort());
+    const body = JSON.parse(await readFile(resFile(dir, a), 'utf8'));
     assert.equal(body.ok, true);
     assert.equal(body.nonce, a);
   } finally {
@@ -225,8 +247,7 @@ test('late request: a request posted after the claim is answered by a follow-up 
   let reloads = 0;
   const results = [];
   try {
-    await mkdir(dir, { recursive: true });
-    await writeFile(join(dir, `${first}.req`), '');
+    await postRequest(dir, first);
     const queue = createReloadQueue({
       dir,
       reload: async () => {
@@ -237,7 +258,7 @@ test('late request: a request posted after the claim is answered by a follow-up 
     });
     queue.trigger();
     // The first step has claimed `first` and is still reloading.
-    while ((await readdir(dir)).includes(`${first}.req`)) await new Promise(r => setTimeout(r, 5));
+    while ((await listing(dir)).includes(`req/${first}.req`)) await new Promise(r => setTimeout(r, 5));
     let posted = false;
     const late = requestConfirmedReload({
       dir,
@@ -252,7 +273,7 @@ test('late request: a request posted after the claim is answered by a follow-up 
     await queue.whenIdle();
     assert.equal(reloads, 2, 'the late request gets its own reload after its save');
     assert.deepEqual(results.map(r => r.claimed.length), [1, 1]);
-    const leftovers = (await readdir(dir)).filter(name => name !== `${first}.res`);
+    const leftovers = (await listing(dir)).filter(name => name !== `res/${first}.res`);
     assert.deepEqual(leftovers, []);
   } finally {
     await rm(join(dir, '..'), { recursive: true, force: true });
@@ -278,7 +299,7 @@ test('late requests: requests that keep arriving during each step are all answer
         for (let i = 0; i < burst; i++) {
           const nonce = newReloadNonce();
           posted.push(nonce);
-          await writeFile(join(dir, `${nonce}.req`), '');
+          await postRequest(dir, nonce);
         }
       },
       onResult: result => claimed.push(...result.claimed),
@@ -287,8 +308,7 @@ test('late requests: requests that keep arriving during each step are all answer
     await queue.whenIdle();
     assert.equal(posted.length, arrivals + 2);
     assert.deepEqual(claimed.sort(), [...posted].sort(), 'every late request is claimed and answered');
-    const files = (await readdir(dir)).sort();
-    assert.deepEqual(files, posted.map(nonce => `${nonce}.res`).sort(), 'no request is left behind');
+    assert.deepEqual(await listing(dir), posted.map(nonce => `res/${nonce}.res`).sort(), 'no request is left behind');
   } finally {
     await rm(join(dir, '..'), { recursive: true, force: true });
   }
@@ -300,7 +320,7 @@ test('bounded steps: a burst larger than the per-step limit is served in several
   const batches = [];
   try {
     await mkdir(dir, { recursive: true });
-    for (const nonce of nonces) await writeFile(join(dir, `${nonce}.req`), '');
+    for (const nonce of nonces) await postRequest(dir, nonce);
     const queue = createReloadQueue({
       dir,
       reload: async () => {},
@@ -323,7 +343,7 @@ test('no spin: a request file that cannot be claimed does not keep the queue ste
   let reloads = 0;
   try {
     // A directory under a valid request name cannot be unlinked as a file.
-    await mkdir(join(dir, `${stuck}.req`, 'x'), { recursive: true });
+    await mkdir(join(reqFile(dir, stuck), 'x'), { recursive: true });
     const queue = createReloadQueue({ dir, reload: async () => { reloads += 1; } });
     queue.trigger();
     await queue.whenIdle();
@@ -338,16 +358,71 @@ test('ack failure: a reload that succeeded but could not record a result reports
   const nonce = newReloadNonce();
   const errors = [];
   try {
-    await mkdir(dir, { recursive: true });
-    await writeFile(join(dir, `${nonce}.req`), '');
+    await postRequest(dir, nonce);
     // A directory squatting on the result path makes the final rename fail.
-    await mkdir(join(dir, `${nonce}.res`, 'blocker'), { recursive: true });
+    await mkdir(join(resFile(dir, nonce), 'blocker'), { recursive: true });
     const result = await runConfirmedReload({
       dir, reload: async () => {}, onResultError: err => errors.push(err),
     });
     assert.equal(result.ok, true, 'the config itself was applied');
     assert.ok(result.ackError, 'the missing confirmation is reported separately');
     assert.equal(errors.length, 1);
+  } finally {
+    await rm(join(dir, '..'), { recursive: true, force: true });
+  }
+});
+
+test('large result directory: tens of thousands of stale results keep a confirmation prompt and each sweep bounded', { skip: process.platform === 'win32' }, async () => {
+  const dir = join(await tempDir(), 'config.reload');
+  const fixtureSize = 20_000;
+  try {
+    await mkdir(join(dir, 'res'), { recursive: true });
+    // One `xargs touch` creates the fixture far faster than 20k writeFile calls.
+    const names = Array.from({ length: fixtureSize }, () => `${newReloadNonce()}.res`);
+    execFileSync('xargs', ['touch'], { cwd: join(dir, 'res'), input: names.join('\n') });
+    const steps = [];
+    const signal = () => {
+      setImmediate(() => {
+        steps.push(runConfirmedReload({ dir, reload: async () => {}, staleResultMs: 0 }));
+      });
+    };
+
+    // 1) Count cap: one step removes at most SWEEP_MAX_ENTRIES stale results,
+    //    and the CLI (which reads only its own result path) is answered promptly.
+    const started = Date.now();
+    const outcome = await requestConfirmedReload({ dir, signal, timeoutMs: 5000, pollMs: 5 });
+    const elapsed = Date.now() - started;
+    const step = await steps[0];
+    assert.equal(outcome.status, 'applied');
+    assert.ok(elapsed < 2000, `confirmation took ${elapsed}ms with ${fixtureSize} files present`);
+    assert.ok(step.swept > 0 && step.swept <= SWEEP_MAX_ENTRIES, `swept ${step.swept}`);
+
+    // 2) Time cap: with the entry cap lifted, a tiny budget still stops the sweep
+    //    long before it reaches every file.
+    const budgeted = Date.now();
+    const timed = await runConfirmedReload({
+      dir, reload: async () => {}, staleResultMs: 0, sweepMaxEntries: Infinity, sweepBudgetMs: 5,
+    });
+    const timedElapsed = Date.now() - budgeted;
+    assert.ok(timed.swept < fixtureSize - SWEEP_MAX_ENTRIES, `budgeted sweep removed ${timed.swept}`);
+    assert.ok(timedElapsed < 1500, `budgeted step took ${timedElapsed}ms`);
+  } finally {
+    await rm(join(dir, '..'), { recursive: true, force: true });
+  }
+});
+
+test('sweep: fresh results are kept and stale ones are removed', async () => {
+  const dir = join(await tempDir(), 'config.reload');
+  const fresh = newReloadNonce();
+  try {
+    await mkdir(join(dir, 'res'), { recursive: true });
+    await writeFile(resFile(dir, fresh), '{}');
+    const kept = await runConfirmedReload({ dir, reload: async () => {} });
+    assert.equal(kept.swept, 0);
+    assert.deepEqual(await listing(dir), [`res/${fresh}.res`]);
+    const removed = await runConfirmedReload({ dir, reload: async () => {}, staleResultMs: 0 });
+    assert.equal(removed.swept, 1);
+    assert.deepEqual(await listing(dir), []);
   } finally {
     await rm(join(dir, '..'), { recursive: true, force: true });
   }

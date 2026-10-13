@@ -1,14 +1,15 @@
 // Confirmed account reload between the CLI and the running proxy worker.
 //
 // SIGHUP carries no payload, so the request identity travels through a small
-// per-config directory next to the config file (`<config>.reload/`):
+// per-config directory next to the config file (`<config>.reload/`), split into
+// `req/` (pending requests) and `res/` (results):
 //
-//   1. The CLI saves the config, writes `<nonce>.req`, then sends SIGHUP.
-//   2. The worker, when its reload step actually starts, claims (unlinks) every
-//      pending `<nonce>.req`, re-reads the config from disk, applies it, and
-//      writes `<nonce>.res` with the outcome for each nonce it claimed.
-//   3. The CLI waits for ITS `<nonce>.res` only and reports success only on
-//      `{ ok: true }`.
+//   1. The CLI saves the config, writes `req/<nonce>.req`, then sends SIGHUP.
+//   2. The worker, when its reload step actually starts, claims (unlinks) a
+//      bounded batch of pending requests, re-reads the config from disk,
+//      applies it, and writes `res/<nonce>.res` for each nonce it claimed.
+//   3. The CLI reads ITS `res/<nonce>.res` by exact path (never a directory
+//      scan) and reports success only on `{ ok: true }`.
 //
 // Correctness: a request file is written after the config save, and the worker
 // claims it before it re-reads the config, so a result for that nonce always
@@ -23,9 +24,14 @@
 // matching would instead fail the earlier CLI although nothing is wrong. A worker
 // that predates this protocol never writes a result, which the CLI reports as
 // "unconfirmed" after the timeout.
+//
+// Cost bounds: uncollected results pile up only in `res/`, so they never slow
+// down request handling (`req/` holds just the requests of live CLIs). The CLI
+// looks up its own result by path, and the worker's stale-result sweep walks
+// `res/` with an `opendir` iterator capped by entry count and time.
 
 import { randomBytes } from 'node:crypto';
-import { chmod, mkdir, open, readdir, readFile, rename, rm, stat } from 'node:fs/promises';
+import { chmod, mkdir, open, opendir, readFile, rename, rm, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
@@ -33,6 +39,9 @@ export const DEFAULT_RELOAD_CONFIRM_TIMEOUT_MS = 10_000;
 const NONCE_RE = /^[0-9a-f]{32}$/;
 // Results nobody collected (the CLI gave up or died) are swept on later reloads.
 const STALE_RESULT_MS = 5 * 60_000;
+// Per-step bounds of the stale-result sweep: entries examined and wall time.
+export const SWEEP_MAX_ENTRIES = 200;
+export const SWEEP_BUDGET_MS = 50;
 
 export function newReloadNonce() {
   return randomBytes(16).toString('hex');
@@ -43,8 +52,10 @@ export function normalizeReloadTimeoutMs(value) {
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : DEFAULT_RELOAD_CONFIRM_TIMEOUT_MS;
 }
 
-const requestPath = (dir, nonce) => join(dir, `${nonce}.req`);
-const resultPath = (dir, nonce) => join(dir, `${nonce}.res`);
+const requestDir = dir => join(dir, 'req');
+const resultDir = dir => join(dir, 'res');
+export const reloadRequestPath = (dir, nonce) => join(requestDir(dir), `${nonce}.req`);
+export const reloadResultPath = (dir, nonce) => join(resultDir(dir), `${nonce}.res`);
 
 async function writeExclusive(path, data) {
   const fh = await open(path, 'wx', 0o600);
@@ -55,36 +66,62 @@ async function writeExclusive(path, data) {
   }
 }
 
+/** Iterate entry names of `path` lazily; a missing directory yields nothing. */
+async function* entryNames(path) {
+  let dirHandle;
+  try {
+    dirHandle = await opendir(path);
+  } catch (err) {
+    if (err.code === 'ENOENT') return;
+    throw err;
+  }
+  // The async iterator closes the handle when the loop ends or breaks.
+  for await (const entry of dirHandle) yield entry.name;
+}
+
 // ── worker side ─────────────────────────────────────────────
 
 // Requests claimed (and results written) per reload step. A burst larger than
 // this is served by follow-up steps instead of one unbounded fan-out.
 export const MAX_CLAIMS_PER_STEP = 64;
 
-async function sweepStaleResults(dir, names) {
-  const cutoff = Date.now() - STALE_RESULT_MS;
-  for (const name of names) {
+/**
+ * Remove uncollected results older than `staleMs`, examining at most
+ * `maxEntries` entries of `res/` and stopping once `budgetMs` has elapsed.
+ * Returns how many files were removed.
+ */
+async function sweepStaleResults(dir, { staleMs, maxEntries, budgetMs }) {
+  const started = Date.now();
+  const cutoff = started - staleMs;
+  let examined = 0;
+  let removed = 0;
+  for await (const name of entryNames(resultDir(dir))) {
+    if (examined >= maxEntries || Date.now() - started >= budgetMs) break;
+    examined += 1;
     if (!name.endsWith('.res') && !name.includes('.res.tmp-')) continue;
-    const path = join(dir, name);
+    const path = join(resultDir(dir), name);
     try {
-      if ((await stat(path)).mtimeMs < cutoff) await rm(path, { force: true });
+      if ((await stat(path)).mtimeMs <= cutoff) {
+        await rm(path, { force: true });
+        removed += 1;
+      }
     } catch { /* already gone */ }
   }
+  return removed;
 }
 
-async function listRequestNonces(dir, { sweep = false } = {}) {
-  let names;
-  try {
-    names = await readdir(dir);
-  } catch (err) {
-    if (err.code === 'ENOENT') return [];
-    throw err;
+/** Up to `limit` valid request nonces from `req/`, skipping `exclude`. */
+async function listRequestNonces(dir, limit, exclude = new Set()) {
+  const nonces = [];
+  if (limit <= 0) return nonces;
+  for await (const name of entryNames(requestDir(dir))) {
+    if (!name.endsWith('.req')) continue;
+    const nonce = name.slice(0, -'.req'.length);
+    if (!NONCE_RE.test(nonce) || exclude.has(nonce)) continue;
+    nonces.push(nonce);
+    if (nonces.length >= limit) break;
   }
-  if (sweep) await sweepStaleResults(dir, names);
-  return names
-    .filter(name => name.endsWith('.req'))
-    .map(name => name.slice(0, -'.req'.length))
-    .filter(nonce => NONCE_RE.test(nonce));
+  return nonces;
 }
 
 /**
@@ -93,11 +130,11 @@ async function listRequestNonces(dir, { sweep = false } = {}) {
  * lists every nonce tried, claimed or not.
  */
 async function claimReloadRequests(dir, limit) {
-  const attempted = (await listRequestNonces(dir, { sweep: true })).slice(0, limit);
+  const attempted = await listRequestNonces(dir, limit);
   const claimed = [];
   for (const nonce of attempted) {
     try {
-      await rm(requestPath(dir, nonce));
+      await rm(reloadRequestPath(dir, nonce));
       claimed.push(nonce);
     } catch { /* withdrawn meanwhile, or not removable */ }
   }
@@ -105,9 +142,10 @@ async function claimReloadRequests(dir, limit) {
 }
 
 async function writeReloadResult(dir, nonce, result) {
-  const path = resultPath(dir, nonce);
+  const path = reloadResultPath(dir, nonce);
   const tmp = `${path}.tmp-${process.pid}-${randomBytes(4).toString('hex')}`;
   try {
+    await mkdir(resultDir(dir), { recursive: true, mode: 0o700 });
     await writeExclusive(tmp, JSON.stringify({ ...result, nonce }) + '\n');
     await rename(tmp, path);
   } catch (err) {
@@ -117,18 +155,25 @@ async function writeReloadResult(dir, nonce, result) {
 }
 
 /**
- * One reload step: claim a bounded batch of pending requests, run `reload`,
- * and answer every claimed request. Never throws — a failed reload is returned
- * (and reported to the waiting CLIs) so the caller keeps the worker running.
- * `ackError` reports a claim/result-write failure separately: the reload may
- * have applied while a waiting CLI never learns of it. `pending` is true when a
- * request this step did not try is waiting (batch overflow, or posted during
- * the reload — its SIGHUP may have been coalesced with the one being handled).
- * A request that was tried but could not be claimed does not count, so an
- * unremovable file cannot make the caller spin.
+ * One reload step: sweep a bounded slice of stale results, claim a bounded
+ * batch of pending requests, run `reload`, and answer every claimed request.
+ * Never throws — a failed reload is returned (and reported to the waiting
+ * CLIs) so the caller keeps the worker running. `ackError` reports a
+ * claim/result-write failure separately: the reload may have applied while a
+ * waiting CLI never learns of it. `pending` is true when a request this step
+ * did not try is waiting (batch overflow, or posted during the reload — its
+ * SIGHUP may have been coalesced with the one being handled). A request that
+ * was tried but could not be claimed does not count, so an unremovable file
+ * cannot make the caller spin.
  */
 export async function runConfirmedReload({
-  dir, reload, onResultError = () => {}, maxClaims = MAX_CLAIMS_PER_STEP,
+  dir,
+  reload,
+  onResultError = () => {},
+  maxClaims = MAX_CLAIMS_PER_STEP,
+  staleResultMs = STALE_RESULT_MS,
+  sweepMaxEntries = SWEEP_MAX_ENTRIES,
+  sweepBudgetMs = SWEEP_BUDGET_MS,
 }) {
   let ackError = null;
   const noteAckError = err => {
@@ -136,6 +181,14 @@ export async function runConfirmedReload({
     onResultError(err);
   };
 
+  let swept = 0;
+  try {
+    swept = await sweepStaleResults(dir, {
+      staleMs: staleResultMs, maxEntries: sweepMaxEntries, budgetMs: sweepBudgetMs,
+    });
+  } catch (err) {
+    onResultError(err); // housekeeping only; no waiting CLI depends on it
+  }
   let claimed = [];
   let attempted = [];
   try {
@@ -156,12 +209,11 @@ export async function runConfirmedReload({
   }
   let pending = false;
   try {
-    const tried = new Set(attempted);
-    pending = (await listRequestNonces(dir)).some(nonce => !tried.has(nonce));
+    pending = (await listRequestNonces(dir, 1, new Set(attempted))).length > 0;
   } catch (err) {
     noteAckError(err);
   }
-  return { ...outcome, claimed, ackError, pending };
+  return { ...outcome, claimed, ackError, pending, swept };
 }
 
 /**
@@ -171,11 +223,11 @@ export async function runConfirmedReload({
  * same FIFO chain, so a step for a fresh SIGHUP is never starved by follow-ups;
  * every step is a full reload of the current config either way.
  */
-export function createReloadQueue({ dir, reload, onResult = () => {}, onResultError, maxClaims }) {
+export function createReloadQueue({ dir, reload, onResult = () => {}, ...stepOptions }) {
   let chain = Promise.resolve();
   const trigger = () => {
     chain = chain
-      .then(() => runConfirmedReload({ dir, reload, onResultError, maxClaims }))
+      .then(() => runConfirmedReload({ dir, reload, ...stepOptions }))
       .then(result => {
         onResult(result);
         if (result.pending) trigger();
@@ -196,8 +248,9 @@ export function createReloadQueue({ dir, reload, onResult = () => {}, onResultEr
 
 // ── CLI side ────────────────────────────────────────────────
 
+/** Read and consume this request's result by exact path — never a directory scan. */
 async function takeResult(dir, nonce) {
-  const path = resultPath(dir, nonce);
+  const path = reloadResultPath(dir, nonce);
   let raw;
   try {
     raw = await readFile(path, 'utf8');
@@ -234,8 +287,10 @@ export async function requestConfirmedReload({
   await mkdir(dir, { recursive: true, mode: 0o700 });
   // mkdir's mode only applies on creation; tighten a pre-existing directory too.
   if (process.platform !== 'win32') await chmod(dir, 0o700);
-  await writeExclusive(requestPath(dir, nonce), '');
-  const withdraw = () => rm(requestPath(dir, nonce), { force: true }).catch(() => {});
+  await mkdir(requestDir(dir), { recursive: true, mode: 0o700 });
+  await mkdir(resultDir(dir), { recursive: true, mode: 0o700 });
+  await writeExclusive(reloadRequestPath(dir, nonce), '');
+  const withdraw = () => rm(reloadRequestPath(dir, nonce), { force: true }).catch(() => {});
 
   try {
     signal();
