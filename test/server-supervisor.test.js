@@ -784,7 +784,11 @@ test('CLI account change against a worker that never confirms exits non-zero and
     assert.notEqual(code, 0, `CLI must fail when the reload is unconfirmed\n${stdout}\n${stderr}`);
     assert.doesNotMatch(stdout, /Applied to the running server/);
     assert.match(stderr, /saved/i);
-    assert.match(stderr, /not (yet )?(been )?(confirmed|applied)/i);
+    assert.match(stderr, /NOT confirmed as applied to the running server/);
+    // A timeout cannot tell "still reloading" from "never will": point at the
+    // log instead of recommending a restart that would cut in-flight requests.
+    assert.match(stderr, /may still be in progress/);
+    assert.doesNotMatch(stderr, /schedule a restart|teamcodex restart/i);
     assert.match(hups, /hup/, 'the old worker still received the reload signal');
     const persisted = JSON.parse(await readFile(configPath, 'utf8'));
     assert.equal(persisted.accounts[0].enabled, false, 'the change is still saved to disk');

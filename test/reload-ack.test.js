@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readdir, readFile, rm, writeFile, mkdir } from 'node:fs/promises';
+import { readdirSync, writeFileSync } from 'node:fs';
+import { chmod, mkdtemp, readdir, readFile, rm, stat, writeFile, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -155,6 +156,38 @@ test('other requests: a reload that claimed only another nonce does not answer o
       dir, nonce: mine, signal: () => {}, timeoutMs: 120, pollMs: 10,
     });
     assert.equal(outcome.status, 'unconfirmed');
+  } finally {
+    await rm(join(dir, '..'), { recursive: true, force: true });
+  }
+});
+
+test('malformed result: an unreadable result for our nonce is a failure, not a success', async () => {
+  const dir = join(await tempDir(), 'config.reload');
+  try {
+    let nonce = null;
+    const outcome = await requestConfirmedReload({
+      dir,
+      signal: () => {
+        nonce = readdirSync(dir).find(name => name.endsWith('.req')).slice(0, -'.req'.length);
+        writeFileSync(join(dir, `${nonce}.res`), '{not json');
+      },
+      timeoutMs: 1000,
+      pollMs: 10,
+    });
+    assert.equal(outcome.status, 'failed');
+    assert.match(outcome.error, /unreadable/);
+  } finally {
+    await rm(join(dir, '..'), { recursive: true, force: true });
+  }
+});
+
+test('request directory is private even when it already existed with wider permissions', { skip: process.platform === 'win32' }, async () => {
+  const dir = join(await tempDir(), 'config.reload');
+  try {
+    await mkdir(dir, { mode: 0o755 });
+    await chmod(dir, 0o755);
+    await requestConfirmedReload({ dir, signal: () => {}, timeoutMs: 20, pollMs: 5 });
+    assert.equal((await stat(dir)).mode & 0o777, 0o700);
   } finally {
     await rm(join(dir, '..'), { recursive: true, force: true });
   }

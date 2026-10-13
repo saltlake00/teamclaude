@@ -2316,10 +2316,17 @@ async function removeCommand() {
  * restarted from here.
  */
 async function noteRunningServerReload(config) {
-  const notApplied = reason => {
+  const notApplied = (reason, { maybeInProgress = false } = {}) => {
     console.error(`Saved to ${getConfigPath()}, but NOT confirmed as applied to the running server: ${reason}.`);
-    console.error('The running server keeps its previous accounts until a reload succeeds or it restarts.');
-    console.error('Retry the command, or schedule a restart for an idle moment (a restart ends in-flight requests).');
+    if (maybeInProgress) {
+      // The worker may have claimed the request and still be reloading; do not
+      // recommend a restart that would cut in-flight requests for nothing.
+      console.error('The reload may still be in progress. Check the server log for');
+      console.error('"Applied account config without restarting the worker" before retrying the command.');
+    } else {
+      console.error('The running server keeps its previous accounts until a reload succeeds or it restarts.');
+      console.error('Retry the command, or schedule a restart for an idle moment (a restart ends in-flight requests).');
+    }
     process.exitCode = 1;
     return false;
   };
@@ -2345,7 +2352,8 @@ async function noteRunningServerReload(config) {
     }
     if (outcome.status === 'failed') return notApplied(`the reload failed (${outcome.error})`);
     if (outcome.reason === 'timeout') {
-      return notApplied(`no confirmation within ${timeoutMs / 1000}s (an older server never confirms)`);
+      return notApplied(`no confirmation within ${timeoutMs / 1000}s (an older server never confirms)`,
+        { maybeInProgress: true });
     }
     if (outcome.reason === 'worker-exited') return notApplied('the worker exited before confirming');
     return notApplied(outcome.reason);

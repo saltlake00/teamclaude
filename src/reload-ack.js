@@ -18,7 +18,7 @@
 // "unconfirmed" after the timeout.
 
 import { randomBytes } from 'node:crypto';
-import { mkdir, open, readdir, readFile, rename, rm, stat } from 'node:fs/promises';
+import { chmod, mkdir, open, readdir, readFile, rename, rm, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
@@ -159,6 +159,8 @@ export async function requestConfirmedReload({
   nonce = newReloadNonce(),
 }) {
   await mkdir(dir, { recursive: true, mode: 0o700 });
+  // mkdir's mode only applies on creation; tighten a pre-existing directory too.
+  if (process.platform !== 'win32') await chmod(dir, 0o700);
   await writeExclusive(requestPath(dir, nonce), '');
   const withdraw = () => rm(requestPath(dir, nonce), { force: true }).catch(() => {});
 
