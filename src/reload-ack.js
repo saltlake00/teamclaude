@@ -13,7 +13,14 @@
 // Correctness: a request file is written after the config save, and the worker
 // claims it before it re-reads the config, so a result for that nonce always
 // comes from a reload that saw the CLI's change. Several requests may be
-// answered by one reload; a result for another nonce never counts. A worker
+// answered by one reload; a result for another nonce never counts.
+//
+// "Applied" therefore means "the running server re-read the config at or after
+// this CLI's save" — the same last-writer-wins contract as the config file. If
+// another CLI saved a conflicting change later (`disable` racing `enable`), the
+// live state ends equal to the disk state, which is also what serialized
+// one-reload-per-request processing would end with. Per-request revision
+// matching would instead fail the earlier CLI although nothing is wrong. A worker
 // that predates this protocol never writes a result, which the CLI reports as
 // "unconfirmed" after the timeout.
 

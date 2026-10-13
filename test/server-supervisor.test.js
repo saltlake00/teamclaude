@@ -747,6 +747,69 @@ test('CLI remove reloads the live worker while preserving the public supervisor'
   }
 });
 
+function runCli(argv, env, input) {
+  return new Promise(resolve => {
+    const cli = spawn(process.execPath, [entry, ...argv], { env, stdio: ['pipe', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    cli.stdout.on('data', chunk => { stdout += chunk; });
+    cli.stderr.on('data', chunk => { stderr += chunk; });
+    cli.stdin.end(input ?? '');
+    cli.once('exit', code => resolve({ code, stdout, stderr }));
+  });
+}
+
+test('every account CLI command confirms its live reload, and concurrent conflicting changes end live as on disk', { timeout: 30000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-live-commands-'));
+  const configPath = join(dir, 'config.json');
+  const port = await unusedPort();
+  await writeFile(configPath, JSON.stringify({
+    proxy: { port, apiKey: 'tc-test' },
+    upstream: 'http://127.0.0.1:9',
+    activeWarmup: false,
+    accounts: [{ name: 'keep', type: 'apikey', apiKey: 'key-a' }],
+  }));
+  const env = { ...process.env, TEAMCLAUDE_CONFIG: configPath };
+  const child = spawn(process.execPath, [entry, 'server'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+  const live = async () => (await (await status(port)).json()).accounts;
+  const confirmed = (result, label) => {
+    assert.equal(result.code, 0, `${label}: ${result.stdout}\n${result.stderr}`);
+    assert.match(result.stdout, /Applied to the running server/, label);
+  };
+
+  try {
+    await waitUntil(() => status(port), 'proxy did not start');
+
+    confirmed(await runCli(['login', '--api', '--name', 'added'], env, 'key-b\n'), 'login --api');
+    assert.deepEqual((await live()).map(a => a.name).sort(), ['added', 'keep'], 'login is live on return');
+
+    confirmed(await runCli(['priority', 'added', '1'], env), 'priority');
+    assert.equal((await live()).find(a => a.name === 'added').priority, 1, 'priority is live on return');
+
+    confirmed(await runCli(['disable', 'added'], env), 'disable');
+    assert.equal((await live()).find(a => a.name === 'added').enabled, false, 'disable is live on return');
+
+    confirmed(await runCli(['enable', 'added'], env), 'enable');
+    assert.equal((await live()).find(a => a.name === 'added').enabled, true, 'enable is live on return');
+
+    // Two CLIs flip the same account at once. Config writes are serialized, so
+    // the later save wins on disk; each confirmation means the server re-read
+    // the config at or after that CLI's save, so the live state must equal disk.
+    const [off, on] = await Promise.all([
+      runCli(['disable', 'keep'], env),
+      runCli(['enable', 'keep'], env),
+    ]);
+    confirmed(off, 'concurrent disable');
+    confirmed(on, 'concurrent enable');
+    const disk = JSON.parse(await readFile(configPath, 'utf8')).accounts.find(a => a.name === 'keep');
+    assert.equal((await live()).find(a => a.name === 'keep').enabled, disk.enabled !== false,
+      'live state matches the last saved config after concurrent confirmed reloads');
+  } finally {
+    await stopChild(child);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('CLI account change against a worker that never confirms exits non-zero and says it is not applied', { timeout: 15000 }, async () => {
   const dir = await mkdtemp(join(tmpdir(), 'teamclaude-live-unconfirmed-'));
   const configPath = join(dir, 'config.json');
