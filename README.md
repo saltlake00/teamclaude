@@ -156,20 +156,20 @@ cannot read that path.
 
 ## Features
 
-- **Use-or-lose account priority** — measures each account once at startup, then prioritizes the account whose weekly (7d) quota resets soonest (then soonest session reset, then lowest usage), so quota about to renew unused is drained first; re-evaluates every 5 minutes and switches immediately when the active account reaches the quota threshold (default 98%). Pin explicit ranks in the TUI (`o`) or via `teamclaude priority` for the accounts you want first — everything unranked stays on this automatic (`auto`) ordering
+- **Use-or-lose account priority** — measures each account once at startup, then prioritizes the account whose weekly (7d) quota resets soonest (then soonest session reset, then lowest usage), so quota about to renew unused is drained first; re-evaluates every 5 minutes and switches immediately when the active account reaches the quota threshold (default 98%). Pin explicit ranks in the TUI (`o`) or via `teamcodex priority` for the accounts you want first — everything unranked stays on this automatic (`auto`) ordering
 - **Codex subscription pooling** — `teamcodex codex ...` manages a separate ChatGPT OAuth account pool, injects each account's bearer token and `ChatGPT-Account-ID`, tracks the official `x-codex-primary-*` / `x-codex-secondary-*` windows, and fails exhausted requests over to the next Codex subscription
 - **Instant failover on 429** — an exhausted account (token quota hit) is throttled for its `retry-after` (clamped to 1s–5m) and skipped; a rate/concurrency 429 (quota left but hit too fast) tries up to `rateLimitFailovers` alternate accounts so concurrent overflow spreads instead of erroring. After that budget, transient/global 429s keep the original model, never throttle the fleet, and are retried internally within the bounded continuity deadline
 - **Interactive TUI** — real-time dashboard with numbered account rows, color-coded quota bars showing usage %, reset countdowns, an activity log, and keyboard controls (switch, enable/disable, reorder accounts)
-- **Manual account controls** — enable/disable accounts and pin an explicit account order from the TUI or CLI (`teamclaude disable|enable|priority`); a disabled account is excluded from rotation while its in-flight requests drain, and everything unranked stays on automatic use-or-lose ordering
+- **Manual account controls** — enable/disable accounts and pin an explicit account order from the TUI or CLI (`teamcodex disable|enable|priority`); a disabled account is excluded from rotation while its in-flight requests drain, and everything unranked stays on automatic use-or-lose ordering
 - **Quota survives restarts** — general per-account quota state *and* the warm-up probe template are snapshotted to `<config>.quota.json` (every minute and on exit) and restored at startup. Model-scoped usage is deliberately not restored: every Fable/Mythos window starts unknown and is re-measured from runtime traffic
 - **Account-first Fable/Mythos routing** — only an account with a fresh, finite, full model-scoped window is skipped for that top-tier request. Any generally available account (enabled, auth-healthy, and under its general 5h/7d limits) whose model window is unknown, expired, or ready keeps the original model eligible; Opus, Sonnet, and Haiku eligibility is never removed by a Fable/Mythos window
 - **Active warm-up** — after a (re)start the proxy probes eligible unmeasured accounts with a minimal request (reusing the last accepted request shape), so response-derived quota data populates without waiting for normal traffic to reach each account
-- **Server lifecycle** — `teamclaude stop` / `teamclaude restart` cleanly stop or replace the running server from any terminal
+- **Server lifecycle** — `teamcodex stop` / `teamcodex restart` cleanly stop or replace the running server from any terminal
 - **OAuth token management** — automatically refreshes tokens nearing expiry and persists them to config; client token refreshes pass through untouched. A periodic keep-alive sweep (default 5 min) also refreshes **idle** accounts' expiring tokens — including parked and disabled accounts — so their refresh-token chains stay alive with zero traffic. A refresh-caused error self-heals on success; an upstream-auth rejection stays parked until re-import/login
 - **Hot-reload accounts** — add accounts via `import` or `login` while the server is running, press **R** to pick them up; **R** also force-re-measures every idle account, including disabled accounts, so the dashboard reflects usage spent outside this proxy and reports an honest `M/N`
 - **Account deduplication** — detects duplicate accounts by UUID and keeps the most recent
 - **Request logging** — optional full request/response logging for debugging
-- **Host CPU / RAM tracking** — live host CPU%, 1/5/15-min load average, and RAM usage in the TUI header, `teamclaude status`, and the `/teamclaude/status` JSON (`host` field); measured with Node built-ins only
+- **Host CPU / RAM tracking** — live host CPU%, 1/5/15-min load average, and RAM usage in the TUI header, `teamcodex status`, and the `/teamclaude/status` JSON (`host` field); measured with Node built-ins only
 - **Zero dependencies** — uses only Node.js built-in modules
 
 ## Quick Start
@@ -181,20 +181,20 @@ Requires Node.js 18+.
 npm install -g teamcodex
 
 # Add your first account (opens browser for OAuth)
-teamclaude login
+teamcodex login
 
 # Add a second account
-teamclaude login
+teamcodex login
 
 # Start the proxy
-teamclaude server
+teamcodex server
 
 # In another terminal, run Claude Code through the proxy
-teamclaude run
+teamcodex run
 ```
 
 > **Important:** a running proxy does not automatically capture a plain `claude`
-> process. Start Claude Code with `teamclaude run`; otherwise it connects directly
+> process. Start Claude Code with `teamcodex run`; otherwise it connects directly
 > with its single logged-in account and cannot rotate when that account reaches a
 > usage limit.
 
@@ -202,7 +202,7 @@ You can also import existing Claude Code credentials instead of logging in:
 
 ```bash
 claude /login           # Log into an account in Claude Code
-teamclaude import       # Import its credentials
+teamcodex import       # Import its credentials
 ```
 
 ## Codex Multi-account Setup
@@ -314,7 +314,7 @@ check, use `teamcodex codex status`.
 The easiest way to add accounts — opens your browser for authentication:
 
 ```bash
-teamclaude login
+teamcodex login
 ```
 
 Uses the same OAuth flow as Claude Code. Auto-detects the account email and subscription tier. Logging in with the same account again updates its credentials.
@@ -327,13 +327,13 @@ If you already have Claude Code set up, you can import its credentials directly:
 
 ```bash
 claude /login           # Log into an account in Claude Code
-teamclaude import       # Import its credentials
+teamcodex import       # Import its credentials
 ```
 
 Re-importing the same account updates its credentials. You can also import from a custom path:
 
 ```bash
-teamclaude import --from /path/to/credentials.json
+teamcodex import --from /path/to/credentials.json
 ```
 
 ### API Key
@@ -341,7 +341,7 @@ teamclaude import --from /path/to/credentials.json
 For Anthropic API key accounts (billed via Console):
 
 ```bash
-teamclaude login --api
+teamcodex login --api
 ```
 
 ## Usage
@@ -349,7 +349,7 @@ teamclaude login --api
 ### Start the proxy server
 
 ```bash
-teamclaude server
+teamcodex server
 ```
 
 When running from a TTY, shows an interactive TUI with:
@@ -359,7 +359,7 @@ When running from a TTY, shows an interactive TUI with:
 
 Falls back to plain log output when not a TTY (e.g. running as a service).
 
-If the configured port is already in use — for example another TeamClaude proxy is already running — the server prints a clear message and exits instead of crashing with an unhandled error. Inspect the existing one with `teamclaude status`, or find the listener with `lsof -nP -iTCP:<port> -sTCP:LISTEN`.
+If the configured port is already in use — for example another TeamClaude proxy is already running — the server prints a clear message and exits instead of crashing with an unhandled error. Inspect the existing one with `teamcodex status`, or find the listener with `lsof -nP -iTCP:<port> -sTCP:LISTEN`.
 
 #### TUI Keyboard Shortcuts
 
@@ -379,39 +379,39 @@ In selection mode, use `j`/`k` or arrow keys to navigate, `Enter` to confirm, `E
 ### Stop / restart the server
 
 ```bash
-teamclaude stop       # SIGTERM the running server (escalates to SIGKILL if needed)
-teamclaude restart    # stop the running server (if any) and start a fresh one
+teamcodex stop       # SIGTERM the running server (escalates to SIGKILL if needed)
+teamcodex restart    # stop the running server (if any) and start a fresh one
 ```
 
 The running server is discovered via its state file (`<config>.server.json`) with a port-probe fallback, so `stop`/`restart` work from any terminal — even after a config port change. Quota state is restored on restart (see below), so a restart doesn't lose the dashboard.
 
-> **Note:** if a Claude Code session is itself routed through the proxy (`teamclaude run`), running `teamclaude stop` *inside that session* severs its own API connection (`Unable to connect to API (ConnectionRefused)`). Stop or restart the proxy from a separate terminal instead — with `restart`, an in-flight session recovers on its own retries.
+> **Note:** if a Claude Code session is itself routed through the proxy (`teamcodex run`), running `teamcodex stop` *inside that session* severs its own API connection (`Unable to connect to API (ConnectionRefused)`). Stop or restart the proxy from a separate terminal instead — with `restart`, an in-flight session recovers on its own retries.
 
 ### Account order & manual controls
 
 By default every account is on **`auto`** ordering (use-or-lose: weekly reset soonest is drained first). You can layer manual controls on top:
 
 ```bash
-teamclaude disable <name>            # exclude from rotation (in-flight requests drain)
-teamclaude enable <name>             # re-enable
-teamclaude priority <name> <n|auto>  # pin explicit order (lower = preferred); "auto" clears it
+teamcodex disable <name>            # exclude from rotation (in-flight requests drain)
+teamcodex enable <name>             # re-enable
+teamcodex priority <name> <n|auto>  # pin explicit order (lower = preferred); "auto" clears it
 ```
 
 In the TUI, `↑`/`↓` select an account, `e` toggles enable/disable, and `o` grabs the selected account into order mode: `↑`/`↓` move its rank, `a` resets the WHOLE order back to `auto`, `c` clears just that account's rank, `Enter`/`Esc` done. Ranked accounts render as `#1 #2 …` and are preferred first; everything unranked stays on the automatic ordering — so you can pin a few accounts and let the rest rotate.
 
-CLI changes made while the server is running are picked up with **R** (reload) in the TUI or `teamclaude restart`.
+Account changes made with the CLI while the server is running (`import`/`login`/`remove`/`disable`/`enable`/`priority`) do not need a restart — the CLI signals the running worker to re-read the accounts and waits for the worker to confirm that the reload finished (default 10s, override with `TEAMCLAUDE_RELOAD_TIMEOUT_MS`). It prints `Applied to the running server` only after that confirmation. In-flight requests are not cut. **R** in the TUI forces the same reload. If the reload fails, the worker exits, or no confirmation arrives in time (an older server never confirms), the CLI prints `NOT confirmed as applied to the running server` and exits non-zero: the change is saved on disk but not confirmed live. After a timeout the reload may still be in progress, so check the server log for `Applied account config without restarting the worker` first; otherwise the running server keeps its previous accounts until a later reload succeeds or it restarts. Retry the command, or schedule that restart for an idle moment instead of restarting a busy proxy. A failed reload never restarts the server. Do not use `teamcodex restart` to apply them while requests are in flight: a restart ends every in-flight request.
 
 ### Run Claude Code through the proxy
 
 ```bash
-teamclaude run
+teamcodex run
 ```
 
-`teamclaude run` injects the proxy URL when the Claude Code process starts and
+`teamcodex run` injects the proxy URL when the Claude Code process starts and
 removes inherited `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` values so Claude
 Code keeps its Max/Pro OAuth subscription instead of silently preferring API
 credits. A `CLAUDE_CODE_OAUTH_TOKEN`, when intentionally supplied, is preserved.
-If the proxy is not running, `teamclaude run` now starts it in the background
+If the proxy is not running, `teamcodex run` now starts it in the background
 and waits for the listener before launching Claude Code. The server keeps that
 public listener in a supervisor process, so a crashed proxy worker is replaced
 while new connections wait instead of failing with `ConnectionRefused`.
@@ -423,7 +423,7 @@ as `--resume <session-id> continue`, up to `claudeAutoResumeMaxRetries`, so an
 interactive session does not wait indefinitely at the prompt for a person.
 
 Claude Code authentication and the TeamClaude account pool are separate OAuth
-layers. `teamclaude login --name <name>` repairs only a pool account; it cannot
+layers. `teamcodex login --name <name>` repairs only a pool account; it cannot
 renew the local Claude Code session. Check and repair that local session with:
 
 ```bash
@@ -465,7 +465,7 @@ evidence cannot trigger the provider switch. The launcher writes a
 credential-protected, provider-neutral transcript summary under
 `~/.config/teamclaude-handoffs/`, stops the Claude child, and starts one Codex CLI
 with that handoff. Tool inputs and tool results are excluded from the handoff.
-When `launchModel` is configured, `teamclaude run` also checks the proxy's latest
+When `launchModel` is configured, `teamcodex run` also checks the proxy's latest
 quota status before launch. It starts Claude Code directly on the first configured
 fallback only when **every generally available account** has a fresh, measured,
 finite model-scoped window that is full. An unknown or expired window preserves
@@ -482,42 +482,42 @@ Exit that direct session and resume it through TeamClaude from the same working
 directory:
 
 ```bash
-teamclaude run -- --continue
+teamcodex run -- --continue
 # Or resume a specific conversation:
-teamclaude run -- --resume <session-id>
+teamcodex run -- --resume <session-id>
 ```
 
 Or manually set the environment:
 
 ```bash
-eval $(teamclaude env)
+eval $(teamcodex env)
 claude
 ```
 
 ### Troubleshoot `ConnectionRefused`
 
 `Unable to connect to API (ConnectionRefused)` means Claude Code could not reach
-the local TeamClaude supervisor. New sessions started with `teamclaude run`
+the local TeamClaude supervisor. New sessions started with `teamcodex run`
 automatically start a missing supervisor; a worker-only crash keeps the listener
 bound and is recovered automatically. If the supervisor itself was stopped,
 check it from a separate terminal:
 
 ```bash
-teamclaude status
+teamcodex status
 lsof -nP -iTCP:3456 -sTCP:LISTEN
-teamclaude restart
+teamcodex restart
 
 # Resume the conversation through the recovered proxy
-teamclaude run -- --continue
+teamcodex run -- --continue
 ```
 
 The PID shown by `lsof` is the stable TeamClaude supervisor. Its worker PID may
 change after a crash without creating a no-listener window. Do not run
-`teamclaude stop` from inside the affected proxied Claude Code session.
+`teamcodex stop` from inside the affected proxied Claude Code session.
 
 ### Host CPU / RAM line
 
-`teamclaude status` prints a `Host:` line for the machine the *proxy* runs on:
+`teamcodex status` prints a `Host:` line for the machine the *proxy* runs on:
 
 ```
 Host:           CPU 43.3% (load 18.99 / 16 cores)   RAM 63.2GB/64.0GB (98.8%)
@@ -533,7 +533,7 @@ are in the `host` field of `GET /teamclaude/status`.
 
 ### Understand the quota numbers
 
-`teamclaude status` and the TUI show the latest quota headers observed by the
+`teamcodex status` and the TUI show the latest quota headers observed by the
 proxy, not an on-demand account usage query. They can lag usage spent in another
 Claude Code session or on another device. Pressing **R** best-effort re-probes
 eligible idle accounts and refreshes only the headers returned by the captured
@@ -576,17 +576,17 @@ displayed total reflects real volume (qjc fork).
 ### Other commands
 
 ```bash
-teamclaude accounts          # List accounts with subscription tier and token status
-teamclaude accounts -v       # Also show token expiry times
-teamclaude status            # Show the proxy's last-observed quota status (requires running server)
-teamclaude stop              # Stop the running proxy server
-teamclaude restart           # Stop the running server and start a fresh one
-teamclaude remove <name>     # Remove an account
-teamclaude disable <name>    # Disable an account (excluded from rotation)
-teamclaude enable <name>     # Re-enable a disabled account
-teamclaude priority <name> <n|auto>  # Pin selection order (lower = preferred; "auto" clears)
-teamclaude api <path>        # Call an API endpoint with account credentials
-teamclaude help              # Show all commands
+teamcodex accounts          # List accounts with subscription tier and token status
+teamcodex accounts -v       # Also show token expiry times
+teamcodex status            # Show the proxy's last-observed quota status (requires running server)
+teamcodex stop              # Stop the running proxy server
+teamcodex restart           # Stop the running server and start a fresh one
+teamcodex remove <name>     # Remove an account
+teamcodex disable <name>    # Disable an account (excluded from rotation)
+teamcodex enable <name>     # Re-enable a disabled account
+teamcodex priority <name> <n|auto>  # Pin selection order (lower = preferred; "auto" clears)
+teamcodex api <path>        # Call an API endpoint with account credentials
+teamcodex help              # Show all commands
 ```
 
 ### Request logging
@@ -594,7 +594,7 @@ teamclaude help              # Show all commands
 Log full request/response details to a directory (one file per request):
 
 ```bash
-teamclaude server --log-to /tmp/requests
+teamcodex server --log-to /tmp/requests
 ```
 
 ## Configuration
@@ -604,7 +604,7 @@ Config is stored at `~/.config/teamclaude.json` (or `$XDG_CONFIG_HOME/teamclaude
 Override the config path with `TEAMCLAUDE_CONFIG`:
 
 ```bash
-TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
+TEAMCLAUDE_CONFIG=./my-config.json teamcodex server
 ```
 
 ### Config format
@@ -656,7 +656,7 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 | `accounts[].enabled` | Set `false` to exclude the account from rotation (optional, default `true`) |
 | `accounts[].priority` | Explicit selection rank (lower = preferred first; optional — unset means automatic use-or-lose ordering) |
 | `modelFallbacks` | Fork only — per-model fallback chains applied when the cached generally available fleet is fresh-full or a live labeled model-tier 429 reaches every eligible account. Unknown/expired/ready cached windows and unlabeled/global 429s stay account-first; a fleet that is only locally capped or queued for concurrency never changes the model (optional, default `{}`; see below) |
-| `launchModel` | Fork only — preferred Claude Code model for `teamclaude run`; launch directly on the first `modelFallbacks` target only when every generally available account is freshly measured full for that model (optional, default `null`) |
+| `launchModel` | Fork only — preferred Claude Code model for `teamcodex run`; launch directly on the first `modelFallbacks` target only when every generally available account is freshly measured full for that model (optional, default `null`) |
 | `autoResumeClaude` | Watch the launched Claude transcript and restart the same session after terminal timeout/rate/overload or supported expired-login errors (optional, default `true`) |
 | `claudeAutoResumeMaxRetries` | Maximum same-session automatic resumes before leaving Claude interactive for manual control (optional, default `3`) |
 | `claudeAutoResumeBackoffMs` | Initial automatic-resume delay; retries use capped exponential backoff (optional, default `2000`) |
