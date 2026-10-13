@@ -8,6 +8,8 @@ import {
   newReloadNonce,
   requestConfirmedReload,
   runConfirmedReload,
+  createReloadQueue,
+  MAX_CLAIMS_PER_STEP,
   normalizeReloadTimeoutMs,
   DEFAULT_RELOAD_CONFIRM_TIMEOUT_MS,
 } from '../src/reload-ack.js';
@@ -215,38 +217,41 @@ test('one reload answers every request it claimed, and only those', async () => 
   }
 });
 
-test('late request: a request posted after the claim is answered by a follow-up pass even if its signal was coalesced', async () => {
+test('late request: a request posted after the claim is answered by a follow-up step even if its signal was coalesced', async () => {
   const dir = join(await tempDir(), 'config.reload');
   const first = newReloadNonce();
   let releaseFirst;
   const firstGate = new Promise(resolve => { releaseFirst = resolve; });
   let reloads = 0;
+  const results = [];
   try {
     await mkdir(dir, { recursive: true });
     await writeFile(join(dir, `${first}.req`), '');
-    const worker = runConfirmedReload({
+    const queue = createReloadQueue({
       dir,
       reload: async () => {
         reloads += 1;
         if (reloads === 1) await firstGate;
       },
+      onResult: result => results.push(result),
     });
-    // The first pass has claimed `first` and is still reloading.
+    queue.trigger();
+    // The first step has claimed `first` and is still reloading.
     while ((await readdir(dir)).includes(`${first}.req`)) await new Promise(r => setTimeout(r, 5));
     let posted = false;
     const late = requestConfirmedReload({
       dir,
-      // Coalesced with the in-flight one: no new reload step is scheduled.
+      // Coalesced with the in-flight one: no new SIGHUP step is scheduled.
       signal: () => { posted = true; },
       timeoutMs: 2000,
       pollMs: 10,
     });
     while (!posted) await new Promise(r => setTimeout(r, 5));
     releaseFirst();
-    const result = await worker;
     assert.equal((await late).status, 'applied');
+    await queue.whenIdle();
     assert.equal(reloads, 2, 'the late request gets its own reload after its save');
-    assert.equal(result.claimed.length, 2);
+    assert.deepEqual(results.map(r => r.claimed.length), [1, 1]);
     const leftovers = (await readdir(dir)).filter(name => name !== `${first}.res`);
     assert.deepEqual(leftovers, []);
   } finally {
@@ -254,33 +259,75 @@ test('late request: a request posted after the claim is answered by a follow-up 
   }
 });
 
-test('late requests: requests that keep arriving during each pass are all answered, with no pass cap', async () => {
+test('late requests: requests that keep arriving during each step are all answered', async () => {
   const dir = join(await tempDir(), 'config.reload');
   const arrivals = 12;
   const posted = [];
+  const claimed = [];
   let reloads = 0;
   try {
     await mkdir(dir, { recursive: true });
-    const result = await runConfirmedReload({
+    const queue = createReloadQueue({
       dir,
       reload: async () => {
         reloads += 1;
         // A new CLI (with a coalesced signal) arrives during each of the first
-        // `arrivals` passes, plus a burst of three during the first one.
-        const burst = reloads === 1 ? 3 : 1;
+        // `arrivals` steps, plus a burst of three during the first one.
         if (reloads > arrivals) return;
+        const burst = reloads === 1 ? 3 : 1;
         for (let i = 0; i < burst; i++) {
           const nonce = newReloadNonce();
           posted.push(nonce);
           await writeFile(join(dir, `${nonce}.req`), '');
         }
       },
+      onResult: result => claimed.push(...result.claimed),
     });
-    assert.equal(result.ok, true);
+    queue.trigger();
+    await queue.whenIdle();
     assert.equal(posted.length, arrivals + 2);
-    assert.deepEqual(result.claimed.sort(), [...posted].sort(), 'every late request is claimed and answered');
+    assert.deepEqual(claimed.sort(), [...posted].sort(), 'every late request is claimed and answered');
     const files = (await readdir(dir)).sort();
     assert.deepEqual(files, posted.map(nonce => `${nonce}.res`).sort(), 'no request is left behind');
+  } finally {
+    await rm(join(dir, '..'), { recursive: true, force: true });
+  }
+});
+
+test('bounded steps: a burst larger than the per-step limit is served in several bounded steps', async () => {
+  const dir = join(await tempDir(), 'config.reload');
+  const nonces = Array.from({ length: 7 }, () => newReloadNonce());
+  const batches = [];
+  try {
+    await mkdir(dir, { recursive: true });
+    for (const nonce of nonces) await writeFile(join(dir, `${nonce}.req`), '');
+    const queue = createReloadQueue({
+      dir,
+      reload: async () => {},
+      maxClaims: 3,
+      onResult: result => batches.push(result.claimed),
+    });
+    queue.trigger();
+    await queue.whenIdle();
+    assert.deepEqual(batches.map(batch => batch.length), [3, 3, 1], 'no step claims more than the limit');
+    assert.deepEqual(batches.flat().sort(), [...nonces].sort());
+    assert.equal(MAX_CLAIMS_PER_STEP > 0, true);
+  } finally {
+    await rm(join(dir, '..'), { recursive: true, force: true });
+  }
+});
+
+test('no spin: a request file that cannot be claimed does not keep the queue stepping', async () => {
+  const dir = join(await tempDir(), 'config.reload');
+  const stuck = newReloadNonce();
+  let reloads = 0;
+  try {
+    // A directory under a valid request name cannot be unlinked as a file.
+    await mkdir(join(dir, `${stuck}.req`, 'x'), { recursive: true });
+    const queue = createReloadQueue({ dir, reload: async () => { reloads += 1; } });
+    queue.trigger();
+    await queue.whenIdle();
+    assert.equal(reloads, 1, 'one signal, one reload');
   } finally {
     await rm(join(dir, '..'), { recursive: true, force: true });
   }

@@ -26,7 +26,7 @@ import { TUI, applyTuiAccountMutation } from './tui.js';
 import { formatBytes } from './system-metrics.js';
 import { SseFramer, sseErrorEvent, isEventStream } from './sse.js';
 import { runClaudeWithRecovery } from './claude-recovery.js';
-import { requestConfirmedReload, runConfirmedReload, normalizeReloadTimeoutMs } from './reload-ack.js';
+import { requestConfirmedReload, createReloadQueue, normalizeReloadTimeoutMs } from './reload-ack.js';
 import {
   installTimestampedConsole,
   formatSignalTrace,
@@ -1142,39 +1142,37 @@ async function proxyWorkerCommand() {
   // operator explicitly opts out.
   config.continuityMode = config.continuityMode !== false;
   const server = createProxyServer(accountManager, config, hooks);
-  let liveSyncChain = Promise.resolve();
-  process.on('SIGHUP', () => {
-    // Account-only reload: keep the worker, sockets, affinity map, prompt caches,
-    // and every in-flight response alive. Serializing signals avoids overlapping
-    // remove/add passes when several CLI changes land together.
-    // Each step answers the CLI requests it claimed (reload-ack.js) only after
-    // the reload finished; a failure is reported to them and logged, never
-    // thrown, so it cannot take the worker or the supervisor down.
-    liveSyncChain = liveSyncChain.then(() => runConfirmedReload({
-      dir: getReloadAckDir(),
-      reload: async () => {
-        const diskConfig = await loadConfig();
-        if (!diskConfig) throw new Error(`config file not found: ${getConfigPath()}`);
-        await syncAccountsFromDisk(diskConfig, config, accountManager);
-        if (process.connected) {
-          process.send({
-            type: 'teamcodex:capacity',
-            maxPublicRequests: publicRequestCapacity(config, accountManager.accounts),
-          });
-        }
-      },
-      onResultError: err => console.error(`[TeamClaude] Could not record account reload result: ${err.message}`),
-    })).then(result => {
+  // Account-only reload: keep the worker, sockets, affinity map, prompt caches,
+  // and every in-flight response alive. The queue serializes steps (one per
+  // SIGHUP) so overlapping remove/add passes cannot interleave, answers the CLI
+  // requests each step claimed (reload-ack.js) only after the reload finished,
+  // and keeps stepping while a request whose SIGHUP was coalesced is waiting.
+  // A failure is reported to the waiting CLIs and logged, never thrown, so it
+  // cannot take the worker or the supervisor down.
+  const accountReloads = createReloadQueue({
+    dir: getReloadAckDir(),
+    reload: async () => {
+      const diskConfig = await loadConfig();
+      if (!diskConfig) throw new Error(`config file not found: ${getConfigPath()}`);
+      await syncAccountsFromDisk(diskConfig, config, accountManager);
+      if (process.connected) {
+        process.send({
+          type: 'teamcodex:capacity',
+          maxPublicRequests: publicRequestCapacity(config, accountManager.accounts),
+        });
+      }
+    },
+    onResultError: err => console.error(`[TeamClaude] Could not record account reload result: ${err.message}`),
+    onResult: result => {
       if (result.ok) console.log('[TeamClaude] Applied account config without restarting the worker');
       else console.error(`[TeamClaude] Account config reload failed: ${result.error}`);
       if (result.ackError) {
         console.error('[TeamClaude] A waiting account CLI was not sent its reload confirmation '
           + `and will report the change as unconfirmed: ${result.ackError}`);
       }
-    }).catch(err => {
-      console.error(`[TeamClaude] Account config reload failed: ${err.message}`);
-    });
+    },
   });
+  process.on('SIGHUP', () => { accountReloads.trigger(); });
   // Restore the last run's committed probe template alongside the quota
   // snapshot, so forced re-measure (TUI R) and warm-up probes work on a
   // freshly restarted idle proxy — without this the template is memory-only

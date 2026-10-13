@@ -57,20 +57,22 @@ async function writeExclusive(path, data) {
 
 // ── worker side ─────────────────────────────────────────────
 
+// Requests claimed (and results written) per reload step. A burst larger than
+// this is served by follow-up steps instead of one unbounded fan-out.
+export const MAX_CLAIMS_PER_STEP = 64;
+
 async function sweepStaleResults(dir, names) {
   const cutoff = Date.now() - STALE_RESULT_MS;
-  await Promise.all(names
-    .filter(name => name.endsWith('.res') || name.includes('.res.tmp-'))
-    .map(async name => {
-      const path = join(dir, name);
-      try {
-        if ((await stat(path)).mtimeMs < cutoff) await rm(path, { force: true });
-      } catch { /* already gone */ }
-    }));
+  for (const name of names) {
+    if (!name.endsWith('.res') && !name.includes('.res.tmp-')) continue;
+    const path = join(dir, name);
+    try {
+      if ((await stat(path)).mtimeMs < cutoff) await rm(path, { force: true });
+    } catch { /* already gone */ }
+  }
 }
 
-/** Claim every pending request: unlinking it is the claim, so a request the CLI withdrew is skipped. */
-async function claimReloadRequests(dir) {
+async function listRequestNonces(dir, { sweep = false } = {}) {
   let names;
   try {
     names = await readdir(dir);
@@ -78,18 +80,28 @@ async function claimReloadRequests(dir) {
     if (err.code === 'ENOENT') return [];
     throw err;
   }
-  await sweepStaleResults(dir, names);
+  if (sweep) await sweepStaleResults(dir, names);
+  return names
+    .filter(name => name.endsWith('.req'))
+    .map(name => name.slice(0, -'.req'.length))
+    .filter(nonce => NONCE_RE.test(nonce));
+}
+
+/**
+ * Claim up to `limit` pending requests: unlinking is the claim, so a request
+ * its CLI withdrew (or one that cannot be removed) is skipped. `attempted`
+ * lists every nonce tried, claimed or not.
+ */
+async function claimReloadRequests(dir, limit) {
+  const attempted = (await listRequestNonces(dir, { sweep: true })).slice(0, limit);
   const claimed = [];
-  for (const name of names) {
-    if (!name.endsWith('.req')) continue;
-    const nonce = name.slice(0, -'.req'.length);
-    if (!NONCE_RE.test(nonce)) continue;
+  for (const nonce of attempted) {
     try {
       await rm(requestPath(dir, nonce));
       claimed.push(nonce);
-    } catch { /* withdrawn by its CLI meanwhile */ }
+    } catch { /* withdrawn meanwhile, or not removable */ }
   }
-  return claimed;
+  return { claimed, attempted };
 }
 
 async function writeReloadResult(dir, nonce, result) {
@@ -105,47 +117,81 @@ async function writeReloadResult(dir, nonce, result) {
 }
 
 /**
- * Worker side of one signal: claim pending requests, run `reload`, answer every
- * claimed request, then re-check for requests posted while it ran (their SIGHUP
- * may have been coalesced with the one being handled) and serve them with a
- * fresh pass. Never throws — a failed reload is returned (and reported to the
- * waiting CLIs) so the caller keeps the worker running. `ackError` reports a
- * claim/result-write failure separately: the reload may have applied while a
- * waiting CLI never learns of it.
+ * One reload step: claim a bounded batch of pending requests, run `reload`,
+ * and answer every claimed request. Never throws — a failed reload is returned
+ * (and reported to the waiting CLIs) so the caller keeps the worker running.
+ * `ackError` reports a claim/result-write failure separately: the reload may
+ * have applied while a waiting CLI never learns of it. `pending` is true when a
+ * request this step did not try is waiting (batch overflow, or posted during
+ * the reload — its SIGHUP may have been coalesced with the one being handled).
+ * A request that was tried but could not be claimed does not count, so an
+ * unremovable file cannot make the caller spin.
  */
-export async function runConfirmedReload({ dir, reload, onResultError = () => {} }) {
+export async function runConfirmedReload({
+  dir, reload, onResultError = () => {}, maxClaims = MAX_CLAIMS_PER_STEP,
+}) {
   let ackError = null;
   const noteAckError = err => {
     ackError ??= err?.message || String(err);
     onResultError(err);
   };
-  const claim = () => claimReloadRequests(dir).catch(err => { noteAckError(err); return []; });
 
-  const claimedAll = [];
-  let failure = null;
-  // No pass cap: SIGHUPs can coalesce, so a request left pending here might
-  // never get a step of its own. The loop ends as soon as a re-claim comes back
-  // empty; a request that cannot be claimed is not returned by claim(), so an
-  // unremovable file cannot spin it.
-  let claimed = await claim();
-  for (;;) {
-    let outcome;
-    try {
-      await reload();
-      outcome = { ok: true };
-    } catch (err) {
-      outcome = { ok: false, error: err?.message || String(err) };
-      failure = outcome.error;
-    }
-    const result = { ...outcome, pid: process.pid, finishedAt: new Date().toISOString() };
-    await Promise.all(claimed.map(nonce => writeReloadResult(dir, nonce, result).catch(noteAckError)));
-    claimedAll.push(...claimed);
-    claimed = await claim();
-    if (claimed.length === 0) break;
+  let claimed = [];
+  let attempted = [];
+  try {
+    ({ claimed, attempted } = await claimReloadRequests(dir, maxClaims));
+  } catch (err) {
+    noteAckError(err);
   }
-  return failure === null
-    ? { ok: true, claimed: claimedAll, ackError }
-    : { ok: false, error: failure, claimed: claimedAll, ackError };
+  let outcome;
+  try {
+    await reload();
+    outcome = { ok: true };
+  } catch (err) {
+    outcome = { ok: false, error: err?.message || String(err) };
+  }
+  const result = { ...outcome, pid: process.pid, finishedAt: new Date().toISOString() };
+  for (const nonce of claimed) {
+    await writeReloadResult(dir, nonce, result).catch(noteAckError);
+  }
+  let pending = false;
+  try {
+    const tried = new Set(attempted);
+    pending = (await listRequestNonces(dir)).some(nonce => !tried.has(nonce));
+  } catch (err) {
+    noteAckError(err);
+  }
+  return { ...outcome, claimed, ackError, pending };
+}
+
+/**
+ * Serialize reload steps (one per SIGHUP) and keep stepping while requests the
+ * last step did not try are waiting, so a request whose SIGHUP was coalesced is
+ * still answered. Each step is bounded (`maxClaims`) and goes back through the
+ * same FIFO chain, so a step for a fresh SIGHUP is never starved by follow-ups;
+ * every step is a full reload of the current config either way.
+ */
+export function createReloadQueue({ dir, reload, onResult = () => {}, onResultError, maxClaims }) {
+  let chain = Promise.resolve();
+  const trigger = () => {
+    chain = chain
+      .then(() => runConfirmedReload({ dir, reload, onResultError, maxClaims }))
+      .then(result => {
+        onResult(result);
+        if (result.pending) trigger();
+      })
+      .catch(err => onResult({ ok: false, error: err?.message || String(err), claimed: [], pending: false }));
+    return chain;
+  };
+  // Resolves once no step is queued or running (tests and shutdown paths).
+  const whenIdle = async () => {
+    for (;;) {
+      const current = chain;
+      await current;
+      if (current === chain) return;
+    }
+  };
+  return { trigger, whenIdle };
 }
 
 // ── CLI side ────────────────────────────────────────────────
