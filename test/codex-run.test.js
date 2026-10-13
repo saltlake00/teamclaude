@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fakeCliPath, pathWith } from './helpers/fake-cli.js';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
@@ -34,7 +35,7 @@ function assertSingleInvocationWithoutResume(invocations, expectedTail) {
 test('teamclaude codex run launches Codex through the login-free HTTP-only provider', async () => {
   // Given
   const dir = await mkdtemp(join(tmpdir(), 'teamcodex-run-'));
-  const fakeCodex = join(dir, 'codex');
+  const fakeCodex = fakeCliPath(dir, 'codex');
   const configPath = join(dir, 'teamcodex.json');
   await writeFile(fakeCodex, `#!/usr/bin/env node
 console.log(JSON.stringify({
@@ -60,7 +61,7 @@ console.log(JSON.stringify({
         encoding: 'utf8',
         env: {
           ...process.env,
-          PATH: `${dir}:${process.env.PATH}`,
+          PATH: pathWith(dir),
           TEAMCODEX_CODEX_BIN: fakeCodex,
           TEAMCLAUDE_CONFIG: configPath,
           OPENAI_API_KEY: 'must-not-reach-child',
@@ -89,7 +90,7 @@ console.log(JSON.stringify({
 
 test('teamclaude codex run uses a single spawn for success, non-429, and 429-style exits without implicit resume', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'teamcodex-run-exit-'));
-  const fakeCodex = join(dir, 'codex');
+  const fakeCodex = fakeCliPath(dir, 'codex');
   const configPath = join(dir, 'teamcodex.json');
   await writeFile(fakeCodex, `#!/usr/bin/env node
 import { appendFileSync } from 'node:fs';
@@ -122,7 +123,7 @@ process.exit(Number(process.env.FAKE_EXIT));
           encoding: 'utf8',
           env: {
             ...process.env,
-            PATH: `${dir}:${process.env.PATH}`,
+            PATH: pathWith(dir),
             TEAMCODEX_CODEX_BIN: fakeCodex,
             TEAMCLAUDE_CONFIG: configPath,
             INVOCATION_LOG: logPath,
@@ -140,9 +141,11 @@ process.exit(Number(process.env.FAKE_EXIT));
   }
 });
 
-test('teamclaude codex run propagates SIGINT with a single spawn and no resume flags', async () => {
+test('teamclaude codex run propagates SIGINT with a single spawn and no resume flags', {
+  skip: process.platform === 'win32' && 'Windows has no terminating signals to observe on the child',
+}, async () => {
   const dir = await mkdtemp(join(tmpdir(), 'teamcodex-run-signal-'));
-  const fakeCodex = join(dir, 'codex');
+  const fakeCodex = fakeCliPath(dir, 'codex');
   const configPath = join(dir, 'teamcodex.json');
   const logPath = join(dir, 'invocations.log');
   await writeFile(fakeCodex, `#!/usr/bin/env node
@@ -164,7 +167,7 @@ process.kill(process.pid, 'SIGINT');
         encoding: 'utf8',
         env: {
           ...process.env,
-          PATH: `${dir}:${process.env.PATH}`,
+          PATH: pathWith(dir),
           TEAMCODEX_CODEX_BIN: fakeCodex,
           TEAMCLAUDE_CONFIG: configPath,
           INVOCATION_LOG: logPath,
@@ -242,7 +245,7 @@ test('teamclaude codex import creates a separate Codex account pool', async () =
 test('teamclaude codex login keeps the official login in an isolated CODEX_HOME', async () => {
   // Given
   const dir = await mkdtemp(join(tmpdir(), 'teamcodex-login-'));
-  const fakeCodex = join(dir, 'codex');
+  const fakeCodex = fakeCliPath(dir, 'codex');
   const auth = {
     auth_mode: 'chatgpt',
     tokens: {
@@ -275,7 +278,7 @@ writeFileSync(join(process.env.CODEX_HOME, 'auth.json'), ${JSON.stringify(JSON.s
         encoding: 'utf8',
         env: {
           ...process.env,
-          PATH: `${dir}:${process.env.PATH}`,
+          PATH: pathWith(dir),
           TEAMCODEX_CODEX_BIN: fakeCodex,
           XDG_CONFIG_HOME: dir,
           TEAMCLAUDE_CONFIG: '',

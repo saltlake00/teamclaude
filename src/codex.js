@@ -3,6 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { spawnTarget } from './spawn-target.js';
 
 const CODEX_REFRESH_ENDPOINT = 'https://auth.openai.com/oauth/token';
 const CODEX_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
@@ -170,7 +171,7 @@ export async function loginCodexCredentials({
   if (deviceAuth) loginArgs.push('--device-auth');
 
   try {
-    const result = run(codexBin, loginArgs, {
+    const result = run(...spawnTarget(codexBin, loginArgs), {
       stdio: 'inherit',
       env: { ...env, CODEX_HOME: codexHome },
     });

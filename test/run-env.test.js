@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
+import { fakeClaudeEnv, fakeCliPath, pathWith } from './helpers/fake-cli.js';
 
 const entry = fileURLToPath(new URL('../src/index.js', import.meta.url));
 const forbiddenResumeArgs = new Set(['resume', '--resume', '--last', '--continue']);
@@ -102,7 +103,7 @@ async function runModelFixture({
   const dir = await mkdtemp(join(tmpdir(), 'teamclaude-run-model-'));
   let server;
   try {
-    const fakeClaude = join(dir, 'claude');
+    const fakeClaude = fakeCliPath(dir, 'claude');
     const configPath = join(dir, 'config.json');
     await writeFile(fakeClaude, `#!/usr/bin/env node
 console.log(JSON.stringify({
@@ -122,7 +123,8 @@ console.log(JSON.stringify({
       encoding: 'utf8',
       env: {
         ...process.env,
-        PATH: `${dir}:${process.env.PATH}`,
+        PATH: pathWith(dir),
+        ...fakeClaudeEnv(fakeClaude),
         TEAMCLAUDE_PROVIDER: 'anthropic',
         TEAMCLAUDE_CONFIG: configPath,
         ...extraEnv,
@@ -139,7 +141,7 @@ test('run preserves OAuth while clearing higher-precedence API credentials', asy
   let server;
   try {
     server = await startStatusServer(dir, { accounts: [] });
-    const fakeClaude = join(dir, 'claude');
+    const fakeClaude = fakeCliPath(dir, 'claude');
     const configPath = join(dir, 'config.json');
     await writeFile(fakeClaude, `#!/usr/bin/env node
 console.log(JSON.stringify({
@@ -158,7 +160,8 @@ console.log(JSON.stringify({
       encoding: 'utf8',
       env: {
         ...process.env,
-        PATH: `${dir}:${process.env.PATH}`,
+        PATH: pathWith(dir),
+        ...fakeClaudeEnv(fakeClaude),
         TEAMCLAUDE_PROVIDER: 'anthropic',
         TEAMCLAUDE_CONFIG: configPath,
         ANTHROPIC_API_KEY: 'must-not-reach-child',
@@ -188,7 +191,7 @@ test('run defaults an unconfigured managed Claude session to Sonnet 5', async ()
   let server;
   try {
     server = await startStatusServer(dir, { accounts: [] });
-    const fakeClaude = join(dir, 'claude');
+    const fakeClaude = fakeCliPath(dir, 'claude');
     const configPath = join(dir, 'config.json');
     await writeFile(fakeClaude, `#!/usr/bin/env node
 console.log(JSON.stringify({
@@ -206,7 +209,8 @@ console.log(JSON.stringify({
       encoding: 'utf8',
       env: {
         ...process.env,
-        PATH: `${dir}:${process.env.PATH}`,
+        PATH: pathWith(dir),
+        ...fakeClaudeEnv(fakeClaude),
         TEAMCLAUDE_PROVIDER: 'anthropic',
         TEAMCLAUDE_CONFIG: configPath,
         DISABLE_GROWTHBOOK: '1',
@@ -229,7 +233,7 @@ test('run rejects an inherited supervised marker before spawning Claude', async 
   let server;
   try {
     server = await startStatusServer(dir, { accounts: [] });
-    const fakeClaude = join(dir, 'claude-vendor');
+    const fakeClaude = fakeCliPath(dir, 'claude-vendor');
     const configPath = join(dir, 'config.json');
     const invocationLog = join(dir, 'invocations.log');
     await writeFile(fakeClaude, `#!/usr/bin/env node
@@ -262,7 +266,7 @@ appendFileSync(process.env.INVOCATION_LOG, 'spawned\\n');
 
 test('codex run allows an inherited supervised marker for the internal handoff', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'teamcodex-run-supervised-handoff-'));
-  const fakeCodex = join(dir, 'codex');
+  const fakeCodex = fakeCliPath(dir, 'codex');
   const configPath = join(dir, 'teamcodex.json');
   try {
     await writeFile(fakeCodex, `#!/usr/bin/env node
@@ -281,7 +285,7 @@ console.log(JSON.stringify({ args: process.argv.slice(2) }));
         encoding: 'utf8',
         env: {
           ...process.env,
-          PATH: `${dir}:${process.env.PATH}`,
+          PATH: pathWith(dir),
           TEAMCODEX_CODEX_BIN: fakeCodex,
           TEAMCLAUDE_CONFIG: configPath,
           TEAMCLAUDE_SESSION_SUPERVISED: '1',
@@ -299,7 +303,7 @@ console.log(JSON.stringify({ args: process.argv.slice(2) }));
 
 test('codex run marks the launched CLI as supervised', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'teamcodex-run-supervised-child-'));
-  const fakeCodex = join(dir, 'codex');
+  const fakeCodex = fakeCliPath(dir, 'codex');
   const configPath = join(dir, 'teamcodex.json');
   try {
     await writeFile(fakeCodex, `#!/usr/bin/env node
@@ -320,7 +324,7 @@ console.log(JSON.stringify({
         encoding: 'utf8',
         env: {
           ...process.env,
-          PATH: `${dir}:${process.env.PATH}`,
+          PATH: pathWith(dir),
           TEAMCODEX_CODEX_BIN: fakeCodex,
           TEAMCLAUDE_CONFIG: configPath,
           TEAMCLAUDE_SESSION_SUPERVISED: '',
@@ -346,7 +350,7 @@ test('run routes Claude to the discovered live supervisor after the config port 
     await stopStatusServer(portHolder);
     portHolder = null;
 
-    const fakeClaude = join(dir, 'claude');
+    const fakeClaude = fakeCliPath(dir, 'claude');
     const configPath = join(dir, 'config.json');
     const statePath = join(dir, 'config.server.json');
     await writeFile(fakeClaude, `#!/usr/bin/env node
@@ -366,7 +370,8 @@ console.log(JSON.stringify({ baseUrl: process.env.ANTHROPIC_BASE_URL }));
       encoding: 'utf8',
       env: {
         ...process.env,
-        PATH: `${dir}:${process.env.PATH}`,
+        PATH: pathWith(dir),
+        ...fakeClaudeEnv(fakeClaude),
         TEAMCLAUDE_PROVIDER: 'anthropic',
         TEAMCLAUDE_CONFIG: configPath,
       },
@@ -387,7 +392,7 @@ test('run preserves the exact loopback proxy API key for a logged-out client', a
   let server;
   try {
     server = await startStatusServer(dir, { accounts: [] });
-    const fakeClaude = join(dir, 'claude');
+    const fakeClaude = fakeCliPath(dir, 'claude');
     const configPath = join(dir, 'config.json');
     await writeFile(fakeClaude, `#!/usr/bin/env node
 console.log(JSON.stringify({
@@ -406,7 +411,8 @@ console.log(JSON.stringify({
       encoding: 'utf8',
       env: {
         ...process.env,
-        PATH: `${dir}:${process.env.PATH}`,
+        PATH: pathWith(dir),
+        ...fakeClaudeEnv(fakeClaude),
         TEAMCLAUDE_PROVIDER: 'anthropic',
         TEAMCLAUDE_CONFIG: configPath,
         ANTHROPIC_API_KEY: 'loopback-proxy-key',
@@ -499,8 +505,8 @@ test('run uses the explicit vendor Claude binary instead of a PATH wrapper', asy
   let server;
   try {
     server = await startStatusServer(dir, { accounts: [] });
-    const pathWrapper = join(dir, 'claude');
-    const vendorClaude = join(dir, 'claude-vendor');
+    const pathWrapper = fakeCliPath(dir, 'claude');
+    const vendorClaude = fakeCliPath(dir, 'claude-vendor');
     const configPath = join(dir, 'config.json');
     await writeFile(pathWrapper, `#!/usr/bin/env node
 process.stderr.write('PATH wrapper must not be spawned\\n');
@@ -520,7 +526,7 @@ console.log(JSON.stringify({ args: process.argv.slice(2) }));
       encoding: 'utf8',
       env: {
         ...process.env,
-        PATH: `${dir}:${process.env.PATH}`,
+        PATH: pathWith(dir),
         TEAMCLAUDE_PROVIDER: 'anthropic',
         TEAMCLAUDE_CONFIG: configPath,
         TEAMCLAUDE_CLAUDE_BIN: vendorClaude,
@@ -536,12 +542,14 @@ console.log(JSON.stringify({ args: process.argv.slice(2) }));
   }
 });
 
-test('run propagates SIGINT from Claude with a single spawn and no resume flags', async () => {
+test('run propagates SIGINT from Claude with a single spawn and no resume flags', {
+  skip: process.platform === 'win32' && 'Windows has no terminating signals to observe on the child',
+}, async () => {
   const dir = await mkdtemp(join(tmpdir(), 'teamclaude-run-signal-'));
   let server;
   try {
     server = await startStatusServer(dir, { accounts: [] });
-    const fakeClaude = join(dir, 'claude');
+    const fakeClaude = fakeCliPath(dir, 'claude');
     const configPath = join(dir, 'config.json');
     const logPath = join(dir, 'invocations.log');
     await writeFile(fakeClaude, `#!/usr/bin/env node
@@ -559,7 +567,8 @@ process.kill(process.pid, 'SIGINT');
         encoding: 'utf8',
         env: {
           ...process.env,
-          PATH: `${dir}:${process.env.PATH}`,
+          PATH: pathWith(dir),
+          ...fakeClaudeEnv(fakeClaude),
           TEAMCLAUDE_PROVIDER: 'anthropic',
           TEAMCLAUDE_CONFIG: configPath,
           INVOCATION_LOG: logPath,
@@ -591,7 +600,7 @@ test('run starts Claude Code on the visible Opus 1M fallback when Fable is exhau
   const dir = await mkdtemp(join(tmpdir(), 'teamclaude-run-model-'));
   let server;
   try {
-    const fakeClaude = join(dir, 'claude');
+    const fakeClaude = fakeCliPath(dir, 'claude');
     const configPath = join(dir, 'config.json');
     await writeFile(fakeClaude, `#!/usr/bin/env node
 console.log(JSON.stringify({ args: process.argv.slice(2) }));
@@ -619,7 +628,8 @@ console.log(JSON.stringify({ args: process.argv.slice(2) }));
       encoding: 'utf8',
       env: {
         ...process.env,
-        PATH: `${dir}:${process.env.PATH}`,
+        PATH: pathWith(dir),
+        ...fakeClaudeEnv(fakeClaude),
         TEAMCLAUDE_PROVIDER: 'anthropic',
         TEAMCLAUDE_CONFIG: configPath,
       },
@@ -638,7 +648,7 @@ test('run keeps a confirmed-available Fable model and respects an explicit other
   const dir = await mkdtemp(join(tmpdir(), 'teamclaude-run-model-'));
   let server;
   try {
-    const fakeClaude = join(dir, 'claude');
+    const fakeClaude = fakeCliPath(dir, 'claude');
     const configPath = join(dir, 'config.json');
     await writeFile(fakeClaude, `#!/usr/bin/env node
 console.log(JSON.stringify({ args: process.argv.slice(2) }));
@@ -664,7 +674,8 @@ console.log(JSON.stringify({ args: process.argv.slice(2) }));
     }));
     const env = {
       ...process.env,
-      PATH: `${dir}:${process.env.PATH}`,
+      PATH: pathWith(dir),
+      ...fakeClaudeEnv(fakeClaude),
       TEAMCLAUDE_PROVIDER: 'anthropic',
       TEAMCLAUDE_CONFIG: configPath,
     };
@@ -882,17 +893,18 @@ test('run marks the supervised child with its provider', async () => {
   let server;
   try {
     server = await startStatusServer(dir, { accounts: [] });
-    const fakeClaude = join(dir, 'claude');
+    const fakeClaude = fakeCliPath(dir, 'claude');
     const configPath = join(dir, 'config.json');
     await writeFile(fakeClaude, `#!/usr/bin/env node
 console.log(JSON.stringify({ provider: process.env.TEAMCLAUDE_PROVIDER ?? null }));
 `);
     await chmod(fakeClaude, 0o755);
     await writeFile(configPath, JSON.stringify({ proxy: { port: server.port } }));
-    const env = { ...process.env, PATH: `${dir}:${process.env.PATH}`, TEAMCLAUDE_CONFIG: configPath };
+    const env = { ...process.env, PATH: pathWith(dir), TEAMCLAUDE_CONFIG: configPath };
     delete env.TEAMCLAUDE_PROVIDER;
     delete env.TEAMCLAUDE_SESSION_SUPERVISED;
     delete env.TEAMCLAUDE_CLAUDE_BIN;
+    Object.assign(env, fakeClaudeEnv(fakeClaude));
 
     const result = spawnSync(process.execPath, [entry, 'run'], { encoding: 'utf8', env });
 

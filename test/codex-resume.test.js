@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { access, chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fakeCliPath, pathWith } from './helpers/fake-cli.js';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
@@ -13,7 +14,7 @@ async function fixture(binding) {
   const dir = await mkdtemp(join(tmpdir(), 'teamcodex-resume-'));
   const codexLog = join(dir, 'codex.json');
   const cmuxLog = join(dir, 'cmux.json');
-  await writeFile(join(dir, 'codex'), `#!/usr/bin/env node
+  await writeFile(fakeCliPath(dir, 'codex'), `#!/usr/bin/env node
 import { writeFileSync } from 'node:fs';
 writeFileSync(process.env.CODEX_LOG, JSON.stringify({
   args: process.argv.slice(2),
@@ -35,7 +36,7 @@ writeFileSync(process.env.CMUX_LOG, JSON.stringify(process.argv.slice(2)));
 process.stdout.write(process.env.CMUX_BINDING);
 `);
   await Promise.all([
-    chmod(join(dir, 'codex'), 0o755),
+    chmod(fakeCliPath(dir, 'codex'), 0o755),
     chmod(join(dir, 'cmux'), 0o755),
     writeFile(join(dir, 'teamcodex.json'), JSON.stringify({
       provider: 'codex',
@@ -48,8 +49,8 @@ process.stdout.write(process.env.CMUX_BINDING);
     cmuxLog,
     env: {
       ...process.env,
-      PATH: `${dir}:${process.env.PATH}`,
-      TEAMCODEX_CODEX_BIN: join(dir, 'codex'),
+      PATH: pathWith(dir),
+      TEAMCODEX_CODEX_BIN: fakeCliPath(dir, 'codex'),
       TEAMCLAUDE_CONFIG: join(dir, 'teamcodex.json'),
       CODEX_LOG: codexLog,
       CMUX_LOG: cmuxLog,
@@ -131,7 +132,9 @@ test('codex resume rejects options that bypass TeamCodex provider routing', asyn
   }
 });
 
-test('codex resume uses the exact current cmux checkpoint without a selector', async () => {
+test('codex resume uses the exact current cmux checkpoint without a selector', {
+  skip: process.platform === 'win32' && 'POSIX-only: cmux is a macOS terminal',
+}, async () => {
   // Given
   const fx = await fixture({
     resume_binding: {

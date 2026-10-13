@@ -13,6 +13,7 @@ import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 import { claudeCredentialsPath } from './claude-paths.js';
+import { spawnTarget } from './spawn-target.js';
 import {
   assertSafeCodexArgs,
   buildCodexProxyArgs,
@@ -1924,6 +1925,8 @@ async function ensureProxyRunning(config, maxWaitMs = 15_000) {
   let launchError = null;
   const daemon = spawn(process.execPath, [process.argv[1], 'server'], {
     detached: true,
+    // A detached child gets its own console window on Windows unless hidden.
+    windowsHide: true,
     env: daemonEnv,
     stdio: 'ignore',
   });
@@ -2730,8 +2733,7 @@ async function runCommand(clientArgsOverride = null) {
       }
     }
     const launchCodex = launchArgs => spawnSync(
-      codexBin,
-      buildCodexProxyArgs(config.proxy.port, launchArgs),
+      ...spawnTarget(codexBin, buildCodexProxyArgs(config.proxy.port, launchArgs)),
       { stdio: 'inherit', env: childEnv },
     );
     let result = launchCodex(clientArgs);
@@ -2848,7 +2850,7 @@ async function runCommand(clientArgsOverride = null) {
           },
         };
       },
-      spawnClaude: (recoveryArgs, recoveryEnv) => spawn(claudeBin, recoveryArgs, {
+      spawnClaude: (recoveryArgs, recoveryEnv) => spawn(...spawnTarget(claudeBin, recoveryArgs), {
         stdio: 'inherit',
         env: recoveryEnv,
       }),
@@ -2873,7 +2875,7 @@ async function runCommand(clientArgsOverride = null) {
     return propagateChildExit(result);
   }
 
-  const result = spawnSync(claudeBin, clientArgs, {
+  const result = spawnSync(...spawnTarget(claudeBin, clientArgs), {
     stdio: 'inherit',
     env: childEnv,
   });

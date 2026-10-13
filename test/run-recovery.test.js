@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { fakeClaudeEnv, fakeCliPath, isolatedHome, pathWith } from './helpers/fake-cli.js';
 import { once } from 'node:events';
 import {
   mkdir,
@@ -149,7 +150,7 @@ test('real run keeps timeout UI-only and sends only bounded safety recovery prom
   for (const scenario of scenarios) {
     await t.test(scenario.name, async t => {
       const root = await mkdtemp(join(tmpdir(), 'teamclaude-run-exact-recovery-'));
-      t.after(() => rm(root, { recursive: true, force: true }));
+      t.after(() => rm(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }));
       const bin = join(root, 'bin');
       const project = join(root, 'project');
       const configPath = join(root, 'config.json');
@@ -157,7 +158,7 @@ test('real run keeps timeout UI-only and sends only bounded safety recovery prom
       await mkdir(bin);
       await mkdir(project);
 
-      await writeFile(join(bin, 'claude'), `#!/usr/bin/env node
+      await writeFile(fakeCliPath(bin, 'claude'), `#!/usr/bin/env node
 import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 const args = process.argv.slice(2);
@@ -209,10 +210,10 @@ if (sessionFlag >= 0) {
       const blockedPrompt = 'blocked original prompt must not replay';
       const env = {
         ...process.env,
-        HOME: root,
-        PATH: `${bin}:${process.env.PATH}`,
+        ...isolatedHome(root),
+        PATH: pathWith(bin),
         TEAMCLAUDE_PROVIDER: 'anthropic',
-        TEAMCLAUDE_CLAUDE_BIN: join(bin, 'claude'),
+        TEAMCLAUDE_CLAUDE_BIN: fakeCliPath(bin, 'claude'),
         TEAMCLAUDE_CONFIG: configPath,
         FAKE_CLAUDE_CALLS: claudeCalls,
         FAKE_RECOVERY_RECORD: JSON.stringify(scenario.record(project)),
@@ -248,7 +249,7 @@ if (sessionFlag >= 0) {
 
 test('real run Login expired rotates first and resumes the same session with recovery auth', async t => {
   const root = await mkdtemp(join(tmpdir(), 'teamclaude-run-login-recovery-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  t.after(() => rm(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }));
   const bin = join(root, 'bin');
   const project = join(root, 'project');
   const configDir = join(root, '.config');
@@ -291,7 +292,7 @@ if (sessionFlag >= 0) {
   ), 20);
 }
 `;
-  await writeFile(join(bin, 'claude'), fakeClaude, { mode: 0o755 });
+  await writeFile(fakeCliPath(bin, 'claude'), fakeClaude, { mode: 0o755 });
   const fakeCodex = `#!/usr/bin/env node
 import { appendFileSync } from 'node:fs';
 appendFileSync(process.env.FAKE_CODEX_CALLS, JSON.stringify({
@@ -299,7 +300,7 @@ appendFileSync(process.env.FAKE_CODEX_CALLS, JSON.stringify({
   provider: process.env.TEAMCLAUDE_PROVIDER ?? null,
 }) + '\\n');
 `;
-  await writeFile(join(bin, 'codex'), fakeCodex, { mode: 0o755 });
+  await writeFile(fakeCliPath(bin, 'codex'), fakeCodex, { mode: 0o755 });
 
   let currentAccount = 'account-a';
   let currentAccountUuid = 'uuid-a';
@@ -376,11 +377,12 @@ appendFileSync(process.env.FAKE_CODEX_CALLS, JSON.stringify({
   }));
   const env = {
     ...process.env,
-    HOME: root,
+    ...isolatedHome(root),
     XDG_CONFIG_HOME: configDir,
-    PATH: `${bin}:${process.env.PATH}`,
+    PATH: pathWith(bin),
+    ...fakeClaudeEnv(fakeCliPath(bin, 'claude')),
     TEAMCLAUDE_PROVIDER: 'anthropic',
-    TEAMCODEX_CODEX_BIN: join(bin, 'codex'),
+    TEAMCODEX_CODEX_BIN: fakeCliPath(bin, 'codex'),
     TEAMCLAUDE_CONFIG: configPath,
     FAKE_CLAUDE_CALLS: claudeCalls,
     FAKE_CODEX_CALLS: codexCalls,
@@ -464,7 +466,7 @@ appendFileSync(process.env.FAKE_CODEX_CALLS, JSON.stringify({
 
 test('real run seeds only a missing Claude OAuth marker from the production proxy status', async t => {
   const root = await mkdtemp(join(tmpdir(), 'teamclaude-run-seed-recovery-marker-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  t.after(() => rm(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }));
   const bin = join(root, 'bin');
   const project = join(root, 'project');
   const configPath = join(root, 'config.json');
@@ -479,7 +481,7 @@ appendFileSync(process.env.FAKE_CLAUDE_CALLS, JSON.stringify({
   oauthValue: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? null,
 }) + '\\n');
 `;
-  await writeFile(join(bin, 'claude'), fakeClaude, { mode: 0o755 });
+  await writeFile(fakeCliPath(bin, 'claude'), fakeClaude, { mode: 0o755 });
 
   const manager = new AccountManager([
     {
@@ -556,8 +558,9 @@ appendFileSync(process.env.FAKE_CLAUDE_CALLS, JSON.stringify({
       await writeFile(claudeCalls, '');
       const env = {
         ...process.env,
-        HOME: root,
-        PATH: `${bin}:${process.env.PATH}`,
+        ...isolatedHome(root),
+        PATH: pathWith(bin),
+        ...fakeClaudeEnv(fakeCliPath(bin, 'claude')),
         TEAMCLAUDE_PROVIDER: 'anthropic',
         TEAMCLAUDE_CONFIG: configPath,
         FAKE_CLAUDE_CALLS: claudeCalls,
@@ -592,7 +595,7 @@ test('real run fails closed when its seeded recovery account cannot serve the re
   for (const scenario of scenarios) {
     await t.test(scenario.name, async st => {
       const root = await mkdtemp(join(tmpdir(), 'teamclaude-run-marker-spill-'));
-      st.after(() => rm(root, { recursive: true, force: true }));
+      st.after(() => rm(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }));
       const bin = join(root, 'bin');
       const project = join(root, 'project');
       const configPath = join(root, 'config.json');
@@ -618,7 +621,7 @@ appendFileSync(process.env.FAKE_CLAUDE_CALLS, JSON.stringify({
 }) + '\\n');
 process.exit(response.status === 200 ? 0 : 9);
 `;
-      await writeFile(join(bin, 'claude'), fakeClaude, { mode: 0o755 });
+      await writeFile(fakeCliPath(bin, 'claude'), fakeClaude, { mode: 0o755 });
 
       const upstreamAuth = [];
       const upstream = http.createServer((req, res) => {
@@ -693,8 +696,9 @@ process.exit(response.status === 200 ? 0 : 9);
       }));
       const env = {
         ...process.env,
-        HOME: root,
-        PATH: `${bin}:${process.env.PATH}`,
+        ...isolatedHome(root),
+        PATH: pathWith(bin),
+        ...fakeClaudeEnv(fakeCliPath(bin, 'claude')),
         TEAMCLAUDE_PROVIDER: 'anthropic',
         TEAMCLAUDE_CONFIG: configPath,
         FAKE_CLAUDE_CALLS: claudeCalls,
@@ -723,7 +727,7 @@ process.exit(response.status === 200 ? 0 : 9);
 
 test('real run keeps failed marker B across a global drift to A and resumes with A', async t => {
   const root = await mkdtemp(join(tmpdir(), 'teamclaude-run-pinned-usage-recovery-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  t.after(() => rm(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }));
   const bin = join(root, 'bin');
   const project = join(root, 'project');
   const configPath = join(root, 'config.json');
@@ -757,7 +761,7 @@ if (resume >= 0 && args.at(-1) !== 'continue') {
   setTimeout(() => process.exit(0), 20);
 }
 `;
-  await writeFile(join(bin, 'claude'), fakeClaude, { mode: 0o755 });
+  await writeFile(fakeCliPath(bin, 'claude'), fakeClaude, { mode: 0o755 });
 
   const manager = new AccountManager([
     {
@@ -812,8 +816,9 @@ if (resume >= 0 && args.at(-1) !== 'continue') {
   const sessionId = '11111111-1111-4111-8111-111111111111';
   const env = {
     ...process.env,
-    HOME: root,
-    PATH: `${bin}:${process.env.PATH}`,
+    ...isolatedHome(root),
+    PATH: pathWith(bin),
+    ...fakeClaudeEnv(fakeCliPath(bin, 'claude')),
     TEAMCLAUDE_PROVIDER: 'anthropic',
     TEAMCLAUDE_CONFIG: configPath,
     FAKE_CLAUDE_CALLS: claudeCalls,
@@ -860,7 +865,7 @@ if (resume >= 0 && args.at(-1) !== 'continue') {
 
 test('real run parks on a tunnel ConnectionRefused and resumes only after the proxy returns', async t => {
   const root = await mkdtemp(join(tmpdir(), 'teamclaude-run-connection-refused-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  t.after(() => rm(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }));
   const bin = join(root, 'bin');
   const project = join(root, 'project');
   const configPath = join(root, 'config.json');
@@ -892,7 +897,7 @@ if (sessionFlag >= 0) {
   setTimeout(() => process.exit(0), 20);
 }
 `;
-  await writeFile(join(bin, 'claude'), fakeClaude, { mode: 0o755 });
+  await writeFile(fakeCliPath(bin, 'claude'), fakeClaude, { mode: 0o755 });
 
   let statusHits = 0;
   let restored = false;
@@ -934,8 +939,9 @@ if (sessionFlag >= 0) {
   }));
   const env = {
     ...process.env,
-    HOME: root,
-    PATH: `${bin}:${process.env.PATH}`,
+    ...isolatedHome(root),
+    PATH: pathWith(bin),
+    ...fakeClaudeEnv(fakeCliPath(bin, 'claude')),
     TEAMCLAUDE_PROVIDER: 'anthropic',
     TEAMCLAUDE_CONFIG: configPath,
     FAKE_CLAUDE_CALLS: claudeCalls,
@@ -961,7 +967,7 @@ if (sessionFlag >= 0) {
 
 test('real run reopens the same session once after an ambiguous-dispatch 502', async t => {
   const root = await mkdtemp(join(tmpdir(), 'teamclaude-run-ambiguous-dispatch-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  t.after(() => rm(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }));
   const bin = join(root, 'bin');
   const project = join(root, 'project');
   const configPath = join(root, 'config.json');
@@ -969,7 +975,7 @@ test('real run reopens the same session once after an ambiguous-dispatch 502', a
   await mkdir(bin);
   await mkdir(project);
 
-  await writeFile(join(bin, 'claude'), `#!/usr/bin/env node
+  await writeFile(fakeCliPath(bin, 'claude'), `#!/usr/bin/env node
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 const args = process.argv.slice(2);
@@ -1022,8 +1028,9 @@ if (sessionFlag >= 0) {
   }));
   const env = {
     ...process.env,
-    HOME: root,
-    PATH: `${bin}:${process.env.PATH}`,
+    ...isolatedHome(root),
+    PATH: pathWith(bin),
+    ...fakeClaudeEnv(fakeCliPath(bin, 'claude')),
     TEAMCLAUDE_PROVIDER: 'anthropic',
     TEAMCLAUDE_CONFIG: configPath,
     FAKE_CLAUDE_CALLS: claudeCalls,
@@ -1076,7 +1083,7 @@ test('real proxy and run reopen an ambiguous session without issuing a second PO
   });
   const upstreamPort = await listen(upstream);
 
-  await writeFile(join(bin, 'claude'), `#!/usr/bin/env node
+  await writeFile(fakeCliPath(bin, 'claude'), `#!/usr/bin/env node
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 const args = process.argv.slice(2);
@@ -1126,8 +1133,9 @@ if (sessionFlag >= 0) {
   }));
   const env = {
     ...process.env,
-    HOME: root,
-    PATH: `${bin}:${process.env.PATH}`,
+    ...isolatedHome(root),
+    PATH: pathWith(bin),
+    ...fakeClaudeEnv(fakeCliPath(bin, 'claude')),
     TEAMCLAUDE_PROVIDER: 'anthropic',
     TEAMCLAUDE_CONFIG: configPath,
     FAKE_CLAUDE_CALLS: claudeCalls,
@@ -1147,7 +1155,7 @@ if (sessionFlag >= 0) {
     }
     upstream.closeAllConnections();
     if (upstream.listening) await closeServer(upstream);
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
   await waitForStatus(proxyPort);
 
@@ -1184,7 +1192,7 @@ test('tunnel-only run waits for the external listener instead of starting an emp
   await mkdir(bin);
   await mkdir(project);
 
-  await writeFile(join(bin, 'claude'), `#!/usr/bin/env node
+  await writeFile(fakeCliPath(bin, 'claude'), `#!/usr/bin/env node
 import { appendFileSync } from 'node:fs';
 appendFileSync(process.env.FAKE_CLAUDE_CALLS, JSON.stringify({
   args: process.argv.slice(2),
@@ -1200,8 +1208,9 @@ appendFileSync(process.env.FAKE_CLAUDE_CALLS, JSON.stringify({
 
   const env = {
     ...process.env,
-    HOME: root,
-    PATH: `${bin}:${process.env.PATH}`,
+    ...isolatedHome(root),
+    PATH: pathWith(bin),
+    ...fakeClaudeEnv(fakeCliPath(bin, 'claude')),
     TEAMCLAUDE_PROVIDER: 'anthropic',
     TEAMCLAUDE_CONFIG: configPath,
     FAKE_CLAUDE_CALLS: claudeCalls,
@@ -1217,7 +1226,7 @@ appendFileSync(process.env.FAKE_CLAUDE_CALLS, JSON.stringify({
       env,
       stdio: ['ignore', 'pipe', 'pipe'],
     }).catch(() => {});
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   const resultPromise = runCli(['run'], {
@@ -1250,7 +1259,7 @@ appendFileSync(process.env.FAKE_CLAUDE_CALLS, JSON.stringify({
 
 test('tunnel-only startup stops at the configured connection recovery deadline', async t => {
   const root = await mkdtemp(join(tmpdir(), 'teamclaude-run-tunnel-deadline-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  t.after(() => rm(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }));
   const bin = join(root, 'bin');
   const project = join(root, 'project');
   const configPath = join(root, 'config.json');
@@ -1259,7 +1268,7 @@ test('tunnel-only startup stops at the configured connection recovery deadline',
   await mkdir(bin);
   await mkdir(project);
 
-  await writeFile(join(bin, 'claude'), `#!/usr/bin/env node
+  await writeFile(fakeCliPath(bin, 'claude'), `#!/usr/bin/env node
 import { appendFileSync } from 'node:fs';
 appendFileSync(process.env.FAKE_CLAUDE_CALLS, JSON.stringify({
   args: process.argv.slice(2),
@@ -1275,11 +1284,11 @@ appendFileSync(process.env.FAKE_CLAUDE_CALLS, JSON.stringify({
 
   const env = {
     ...process.env,
-    HOME: root,
-    PATH: `${bin}:${process.env.PATH}`,
+    ...isolatedHome(root),
+    PATH: pathWith(bin),
     TEAMCLAUDE_PROVIDER: 'anthropic',
     TEAMCLAUDE_CONFIG: configPath,
-    TEAMCLAUDE_CLAUDE_BIN: join(bin, 'claude'),
+    TEAMCLAUDE_CLAUDE_BIN: fakeCliPath(bin, 'claude'),
     FAKE_CLAUDE_CALLS: claudeCalls,
   };
   delete env.TEAMCLAUDE_SUPERVISED_WORKER;
@@ -1344,7 +1353,7 @@ test('active recovery bounds a failed local proxy start by the same deadline', a
     await rm(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
-  await writeFile(join(bin, 'claude'), `#!/usr/bin/env node
+  await writeFile(fakeCliPath(bin, 'claude'), `#!/usr/bin/env node
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 const args = process.argv.slice(2);
@@ -1379,11 +1388,11 @@ if (sessionFlag >= 0) {
 
   const env = {
     ...process.env,
-    HOME: root,
-    PATH: `${bin}:${process.env.PATH}`,
+    ...isolatedHome(root),
+    PATH: pathWith(bin),
     TEAMCLAUDE_PROVIDER: 'anthropic',
     TEAMCLAUDE_CONFIG: configPath,
-    TEAMCLAUDE_CLAUDE_BIN: join(bin, 'claude'),
+    TEAMCLAUDE_CLAUDE_BIN: fakeCliPath(bin, 'claude'),
     FAKE_CLAUDE_CALLS: claudeCalls,
     FAKE_OUTAGE_URL: `http://127.0.0.1:${controlPort}/outage`,
   };
@@ -1454,7 +1463,7 @@ if (sessionFlag >= 0) {
   setInterval(() => {}, 1000);
 }
 `;
-  await writeFile(join(bin, 'claude'), fakeClaude, { mode: 0o755 });
+  await writeFile(fakeCliPath(bin, 'claude'), fakeClaude, { mode: 0o755 });
 
   const statusResponse = (_req, res) => {
     res.writeHead(200, { 'content-type': 'application/json' });
@@ -1484,8 +1493,9 @@ if (sessionFlag >= 0) {
 
   const env = {
     ...process.env,
-    HOME: root,
-    PATH: `${bin}:${process.env.PATH}`,
+    ...isolatedHome(root),
+    PATH: pathWith(bin),
+    ...fakeClaudeEnv(fakeCliPath(bin, 'claude')),
     TEAMCLAUDE_PROVIDER: 'anthropic',
     TEAMCLAUDE_CONFIG: configPath,
     FAKE_CLAUDE_CALLS: claudeCalls,
@@ -1504,7 +1514,7 @@ if (sessionFlag >= 0) {
       newStatusServer.listening ? closeServer(newStatusServer) : Promise.resolve(),
       controlServer.listening ? closeServer(controlServer) : Promise.resolve(),
     ]);
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   const result = await runCli(['run'], {
@@ -1550,8 +1560,9 @@ test('real run follows a replacement supervisor to its new configured port befor
 
   const baseEnv = {
     ...process.env,
-    HOME: root,
-    PATH: `${bin}:${process.env.PATH}`,
+    ...isolatedHome(root),
+    PATH: pathWith(bin),
+    ...fakeClaudeEnv(fakeCliPath(bin, 'claude')),
     TEAMCLAUDE_PROVIDER: 'anthropic',
     TEAMCLAUDE_CONFIG: configPath,
     FAKE_CLAUDE_CALLS: claudeCalls,
@@ -1606,7 +1617,7 @@ if (sessionFlag >= 0) {
   process.exit(response.status === 200 ? 0 : 9);
 }
 `;
-  await writeFile(join(bin, 'claude'), fakeClaude, { mode: 0o755 });
+  await writeFile(fakeCliPath(bin, 'claude'), fakeClaude, { mode: 0o755 });
 
   try {
     const result = await runCli(['run'], {
@@ -1635,7 +1646,7 @@ if (sessionFlag >= 0) {
       env: baseEnv,
       stdio: ['ignore', 'pipe', 'pipe'],
     }).catch(() => {});
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   }
 });
 
@@ -1690,8 +1701,8 @@ appendFileSync(process.env.FAKE_CODEX_CALLS, JSON.stringify({
   provider: process.env.TEAMCLAUDE_PROVIDER ?? null,
 }) + '\\n');
 `;
-  await writeFile(join(bin, 'claude'), fakeClaude, { mode: 0o755 });
-  await writeFile(join(bin, 'codex'), fakeCodex, { mode: 0o755 });
+  await writeFile(fakeCliPath(bin, 'claude'), fakeClaude, { mode: 0o755 });
+  await writeFile(fakeCliPath(bin, 'codex'), fakeCodex, { mode: 0o755 });
 
   let utilization = 0.5;
   const statusServer = http.createServer((req, res) => {
@@ -1735,10 +1746,11 @@ appendFileSync(process.env.FAKE_CODEX_CALLS, JSON.stringify({
 
   const env = {
     ...process.env,
-    HOME: root,
+    ...isolatedHome(root),
     XDG_CONFIG_HOME: configDir,
-    PATH: `${bin}:${process.env.PATH}`,
-    TEAMCODEX_CODEX_BIN: join(bin, 'codex'),
+    PATH: pathWith(bin),
+    ...fakeClaudeEnv(fakeCliPath(bin, 'claude')),
+    TEAMCODEX_CODEX_BIN: fakeCliPath(bin, 'codex'),
     FAKE_CLAUDE_CALLS: claudeCalls,
     FAKE_CODEX_CALLS: codexCalls,
     FAKE_COMPETING_TRANSCRIPT: join(
