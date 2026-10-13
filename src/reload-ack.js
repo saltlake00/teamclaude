@@ -104,28 +104,50 @@ async function writeReloadResult(dir, nonce, result) {
   }
 }
 
+// Upper bound on follow-up passes for requests that arrive mid-reload, so a
+// steady stream of CLI calls cannot keep one signal step busy forever. Requests
+// left over after the cap are still served by their own signal's step.
+const MAX_RELOAD_PASSES = 8;
+
 /**
- * Worker side of one reload: claim pending requests, run `reload`, and answer
- * every claimed request. Never throws — a failed reload is returned (and
- * reported to the waiting CLIs) so the caller keeps the worker running.
+ * Worker side of one signal: claim pending requests, run `reload`, answer every
+ * claimed request, then re-check for requests posted while it ran (their SIGHUP
+ * may have been coalesced with the one being handled) and serve them with a
+ * fresh pass. Never throws — a failed reload is returned (and reported to the
+ * waiting CLIs) so the caller keeps the worker running. `ackError` reports a
+ * claim/result-write failure separately: the reload may have applied while a
+ * waiting CLI never learns of it.
  */
 export async function runConfirmedReload({ dir, reload, onResultError = () => {} }) {
-  let claimed = [];
-  try {
-    claimed = await claimReloadRequests(dir);
-  } catch (err) {
+  let ackError = null;
+  const noteAckError = err => {
+    ackError ??= err?.message || String(err);
     onResultError(err);
+  };
+  const claim = () => claimReloadRequests(dir).catch(err => { noteAckError(err); return []; });
+
+  const claimedAll = [];
+  let failure = null;
+  let claimed = await claim();
+  for (let pass = 1; ; pass++) {
+    let outcome;
+    try {
+      await reload();
+      outcome = { ok: true };
+    } catch (err) {
+      outcome = { ok: false, error: err?.message || String(err) };
+      failure = outcome.error;
+    }
+    const result = { ...outcome, pid: process.pid, finishedAt: new Date().toISOString() };
+    await Promise.all(claimed.map(nonce => writeReloadResult(dir, nonce, result).catch(noteAckError)));
+    claimedAll.push(...claimed);
+    if (pass >= MAX_RELOAD_PASSES) break;
+    claimed = await claim();
+    if (claimed.length === 0) break;
   }
-  let outcome;
-  try {
-    await reload();
-    outcome = { ok: true };
-  } catch (err) {
-    outcome = { ok: false, error: err?.message || String(err) };
-  }
-  const result = { ...outcome, pid: process.pid, finishedAt: new Date().toISOString() };
-  await Promise.all(claimed.map(nonce => writeReloadResult(dir, nonce, result).catch(onResultError)));
-  return { ...outcome, claimed };
+  return failure === null
+    ? { ok: true, claimed: claimedAll, ackError }
+    : { ok: false, error: failure, claimed: claimedAll, ackError };
 }
 
 // ── CLI side ────────────────────────────────────────────────

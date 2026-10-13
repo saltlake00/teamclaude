@@ -1167,6 +1167,10 @@ async function proxyWorkerCommand() {
     })).then(result => {
       if (result.ok) console.log('[TeamClaude] Applied account config without restarting the worker');
       else console.error(`[TeamClaude] Account config reload failed: ${result.error}`);
+      if (result.ackError) {
+        console.error('[TeamClaude] A waiting account CLI was not sent its reload confirmation '
+          + `and will report the change as unconfirmed: ${result.ackError}`);
+      }
     }).catch(err => {
       console.error(`[TeamClaude] Account config reload failed: ${err.message}`);
     });

@@ -215,6 +215,65 @@ test('one reload answers every request it claimed, and only those', async () => 
   }
 });
 
+test('late request: a request posted after the claim is answered by a follow-up pass even if its signal was coalesced', async () => {
+  const dir = join(await tempDir(), 'config.reload');
+  const first = newReloadNonce();
+  let releaseFirst;
+  const firstGate = new Promise(resolve => { releaseFirst = resolve; });
+  let reloads = 0;
+  try {
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, `${first}.req`), '');
+    const worker = runConfirmedReload({
+      dir,
+      reload: async () => {
+        reloads += 1;
+        if (reloads === 1) await firstGate;
+      },
+    });
+    // The first pass has claimed `first` and is still reloading.
+    while ((await readdir(dir)).includes(`${first}.req`)) await new Promise(r => setTimeout(r, 5));
+    let posted = false;
+    const late = requestConfirmedReload({
+      dir,
+      // Coalesced with the in-flight one: no new reload step is scheduled.
+      signal: () => { posted = true; },
+      timeoutMs: 2000,
+      pollMs: 10,
+    });
+    while (!posted) await new Promise(r => setTimeout(r, 5));
+    releaseFirst();
+    const result = await worker;
+    assert.equal((await late).status, 'applied');
+    assert.equal(reloads, 2, 'the late request gets its own reload after its save');
+    assert.equal(result.claimed.length, 2);
+    const leftovers = (await readdir(dir)).filter(name => name !== `${first}.res`);
+    assert.deepEqual(leftovers, []);
+  } finally {
+    await rm(join(dir, '..'), { recursive: true, force: true });
+  }
+});
+
+test('ack failure: a reload that succeeded but could not record a result reports the ack error', async () => {
+  const dir = join(await tempDir(), 'config.reload');
+  const nonce = newReloadNonce();
+  const errors = [];
+  try {
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, `${nonce}.req`), '');
+    // A directory squatting on the result path makes the final rename fail.
+    await mkdir(join(dir, `${nonce}.res`, 'blocker'), { recursive: true });
+    const result = await runConfirmedReload({
+      dir, reload: async () => {}, onResultError: err => errors.push(err),
+    });
+    assert.equal(result.ok, true, 'the config itself was applied');
+    assert.ok(result.ackError, 'the missing confirmation is reported separately');
+    assert.equal(errors.length, 1);
+  } finally {
+    await rm(join(dir, '..'), { recursive: true, force: true });
+  }
+});
+
 test('worker reload without any pending request still runs and writes nothing', async () => {
   const dir = join(await tempDir(), 'missing', 'config.reload');
   let ran = false;
