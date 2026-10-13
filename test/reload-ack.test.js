@@ -254,6 +254,38 @@ test('late request: a request posted after the claim is answered by a follow-up 
   }
 });
 
+test('late requests: requests that keep arriving during each pass are all answered, with no pass cap', async () => {
+  const dir = join(await tempDir(), 'config.reload');
+  const arrivals = 12;
+  const posted = [];
+  let reloads = 0;
+  try {
+    await mkdir(dir, { recursive: true });
+    const result = await runConfirmedReload({
+      dir,
+      reload: async () => {
+        reloads += 1;
+        // A new CLI (with a coalesced signal) arrives during each of the first
+        // `arrivals` passes, plus a burst of three during the first one.
+        const burst = reloads === 1 ? 3 : 1;
+        if (reloads > arrivals) return;
+        for (let i = 0; i < burst; i++) {
+          const nonce = newReloadNonce();
+          posted.push(nonce);
+          await writeFile(join(dir, `${nonce}.req`), '');
+        }
+      },
+    });
+    assert.equal(result.ok, true);
+    assert.equal(posted.length, arrivals + 2);
+    assert.deepEqual(result.claimed.sort(), [...posted].sort(), 'every late request is claimed and answered');
+    const files = (await readdir(dir)).sort();
+    assert.deepEqual(files, posted.map(nonce => `${nonce}.res`).sort(), 'no request is left behind');
+  } finally {
+    await rm(join(dir, '..'), { recursive: true, force: true });
+  }
+});
+
 test('ack failure: a reload that succeeded but could not record a result reports the ack error', async () => {
   const dir = join(await tempDir(), 'config.reload');
   const nonce = newReloadNonce();

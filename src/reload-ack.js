@@ -104,11 +104,6 @@ async function writeReloadResult(dir, nonce, result) {
   }
 }
 
-// Upper bound on follow-up passes for requests that arrive mid-reload, so a
-// steady stream of CLI calls cannot keep one signal step busy forever. Requests
-// left over after the cap are still served by their own signal's step.
-const MAX_RELOAD_PASSES = 8;
-
 /**
  * Worker side of one signal: claim pending requests, run `reload`, answer every
  * claimed request, then re-check for requests posted while it ran (their SIGHUP
@@ -128,8 +123,12 @@ export async function runConfirmedReload({ dir, reload, onResultError = () => {}
 
   const claimedAll = [];
   let failure = null;
+  // No pass cap: SIGHUPs can coalesce, so a request left pending here might
+  // never get a step of its own. The loop ends as soon as a re-claim comes back
+  // empty; a request that cannot be claimed is not returned by claim(), so an
+  // unremovable file cannot spin it.
   let claimed = await claim();
-  for (let pass = 1; ; pass++) {
+  for (;;) {
     let outcome;
     try {
       await reload();
@@ -141,7 +140,6 @@ export async function runConfirmedReload({ dir, reload, onResultError = () => {}
     const result = { ...outcome, pid: process.pid, finishedAt: new Date().toISOString() };
     await Promise.all(claimed.map(nonce => writeReloadResult(dir, nonce, result).catch(noteAckError)));
     claimedAll.push(...claimed);
-    if (pass >= MAX_RELOAD_PASSES) break;
     claimed = await claim();
     if (claimed.length === 0) break;
   }
