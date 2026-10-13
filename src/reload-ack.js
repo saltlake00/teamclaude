@@ -31,7 +31,7 @@
 // `res/` with an `opendir` iterator capped by entry count and time.
 
 import { randomBytes } from 'node:crypto';
-import { chmod, mkdir, open, opendir, readFile, rename, rm, stat } from 'node:fs/promises';
+import { chmod, lstat, mkdir, open, opendir, readFile, rename, rm, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
@@ -248,6 +248,18 @@ export function createReloadQueue({ dir, reload, onResult = () => {}, ...stepOpt
 
 // ── CLI side ────────────────────────────────────────────────
 
+/**
+ * Create `path` as a 0700 directory, or tighten an existing one: mkdir's mode
+ * only applies on creation. A symlink or non-directory is refused rather than
+ * followed, so requests and results are never written through a link.
+ */
+async function ensurePrivateDir(path) {
+  await mkdir(path, { recursive: true, mode: 0o700 });
+  const info = await lstat(path);
+  if (!info.isDirectory()) throw new Error(`${path} is not a directory`);
+  if (process.platform !== 'win32') await chmod(path, 0o700);
+}
+
 /** Read and consume this request's result by exact path — never a directory scan. */
 async function takeResult(dir, nonce) {
   const path = reloadResultPath(dir, nonce);
@@ -284,11 +296,9 @@ export async function requestConfirmedReload({
   isWorkerAlive = () => true,
   nonce = newReloadNonce(),
 }) {
-  await mkdir(dir, { recursive: true, mode: 0o700 });
-  // mkdir's mode only applies on creation; tighten a pre-existing directory too.
-  if (process.platform !== 'win32') await chmod(dir, 0o700);
-  await mkdir(requestDir(dir), { recursive: true, mode: 0o700 });
-  await mkdir(resultDir(dir), { recursive: true, mode: 0o700 });
+  await ensurePrivateDir(dir);
+  await ensurePrivateDir(requestDir(dir));
+  await ensurePrivateDir(resultDir(dir));
   await writeExclusive(reloadRequestPath(dir, nonce), '');
   const withdraw = () => rm(reloadRequestPath(dir, nonce), { force: true }).catch(() => {});
 

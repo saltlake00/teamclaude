@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readdirSync, writeFileSync } from 'node:fs';
-import { chmod, mkdtemp, readdir, readFile, rm, stat, writeFile, mkdir } from 'node:fs/promises';
+import { chmod, mkdtemp, readdir, readFile, rm, stat, symlink, utimes, writeFile, mkdir } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -219,6 +219,46 @@ test('request directory is private even when it already existed with wider permi
   }
 });
 
+test('request and result subdirectories are private even when they already existed with wider permissions', { skip: process.platform === 'win32' }, async () => {
+  const dir = join(await tempDir(), 'config.reload');
+  try {
+    for (const sub of ['req', 'res']) {
+      await mkdir(join(dir, sub), { recursive: true });
+      await chmod(join(dir, sub), 0o777);
+    }
+    await requestConfirmedReload({ dir, signal: () => {}, timeoutMs: 20, pollMs: 5 });
+    for (const sub of ['req', 'res']) {
+      assert.equal((await stat(join(dir, sub))).mode & 0o777, 0o700, sub);
+    }
+  } finally {
+    await rm(join(dir, '..'), { recursive: true, force: true });
+  }
+});
+
+test('a symlinked or non-directory reload path is refused instead of followed', { skip: process.platform === 'win32' }, async () => {
+  const root = await tempDir();
+  const dir = join(root, 'config.reload');
+  try {
+    const elsewhere = join(root, 'elsewhere');
+    await mkdir(elsewhere);
+    await mkdir(dir);
+    await symlink(elsewhere, join(dir, 'req'));
+    await assert.rejects(
+      requestConfirmedReload({ dir, signal: () => assert.fail('must not signal'), timeoutMs: 20 }),
+      /not a directory/,
+    );
+    assert.deepEqual(await readdir(elsewhere), [], 'nothing is written through the link');
+
+    const fileDir = join(root, 'file.reload');
+    await writeFile(fileDir, '');
+    await assert.rejects(
+      requestConfirmedReload({ dir: fileDir, signal: () => assert.fail('must not signal'), timeoutMs: 20 }),
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('one reload answers every request it claimed, and only those', async () => {
   const dir = join(await tempDir(), 'config.reload');
   const a = newReloadNonce();
@@ -420,7 +460,10 @@ test('sweep: fresh results are kept and stale ones are removed', async () => {
     const kept = await runConfirmedReload({ dir, reload: async () => {} });
     assert.equal(kept.swept, 0);
     assert.deepEqual(await listing(dir), [`res/${fresh}.res`]);
-    const removed = await runConfirmedReload({ dir, reload: async () => {}, staleResultMs: 0 });
+    // Age the file explicitly: sub-millisecond mtimes can be "newer" than Date.now().
+    const past = new Date(Date.now() - 60_000);
+    await utimes(resFile(dir, fresh), past, past);
+    const removed = await runConfirmedReload({ dir, reload: async () => {}, staleResultMs: 30_000 });
     assert.equal(removed.swept, 1);
     assert.deepEqual(await listing(dir), []);
   } finally {
