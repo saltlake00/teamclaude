@@ -10,6 +10,7 @@ import {
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 import { parseClaudeRecoveryAccount } from './claude-auth.js';
+import { claudeTranscriptRoot } from './claude-paths.js';
 import { modelQuotaLabel } from './account-manager.js';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -808,7 +809,7 @@ export async function runClaudeWithRecovery({
   childEnv,
   config,
   cwd = process.cwd(),
-  transcriptRoot = join(homedir(), '.claude', 'projects'),
+  transcriptRoot = claudeTranscriptRoot(childEnv),
   handoffRoot = join(homedir(), '.config', 'teamclaude-handoffs'),
   pollIntervalMs = 1000,
   fetchStatus,

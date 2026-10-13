@@ -12,6 +12,7 @@ import { assertSafeProxyConfig, loadOrCreateConfig, loadConfig, atomicConfigUpda
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
+import { claudeCredentialsPath } from './claude-paths.js';
 import {
   assertSafeCodexArgs,
   buildCodexProxyArgs,
@@ -2129,7 +2130,7 @@ async function importCommand() {
     }
   } else {
     const fromPath = argValue('--from')
-      || (codexMode ? '~/.codex/auth.json' : '~/.claude/.credentials.json');
+      || (codexMode ? '~/.codex/auth.json' : claudeCredentialsPath());
     try {
       creds = codexMode
         ? await importCodexCredentials(fromPath)
@@ -3490,7 +3491,8 @@ Commands:
 
 Options:
   --name NAME         Set account name (import/login)
-  --from PATH         Credentials path (import, default: ~/.claude/.credentials.json)
+  --from PATH         Credentials path (import, default: $CLAUDE_CONFIG_DIR/.credentials.json,
+                      else ~/.claude/.credentials.json)
   --json JSON         Import from inline JSON (import), e.g.:
                       --json '{"accessToken":"...","refreshToken":"...","expiresAt":1234}'
   --log-to DIR        Log full requests/responses to DIR (server, one file per request)

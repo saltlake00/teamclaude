@@ -4,6 +4,7 @@ import { access } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { promisify } from 'node:util';
+import { claudeTranscriptRoot } from './claude-paths.js';
 import {
   buildResumeCommand,
   claimSessionLease,
@@ -725,6 +726,6 @@ export function createCmuxSessionRescuer({
 export function defaultCmuxRescuePaths() {
   return {
     storePath: join(homedir(), '.cmuxterm', 'claude-hook-sessions.json'),
-    transcriptRoot: join(homedir(), '.claude', 'projects'),
+    transcriptRoot: claudeTranscriptRoot(),
   };
 }

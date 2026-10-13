@@ -1,4 +1,5 @@
 import { importCredentials, fetchProfile } from './oauth.js';
+import { claudeCredentialsPath } from './claude-paths.js';
 import { importCodexCredentials } from './codex.js';
 import { createHostTracker } from './system-metrics.js';
 import { subscriptionSnapshot } from './subscription.js';
@@ -528,7 +529,7 @@ export class TUI {
     }
     try {
       this._addLog('Importing credentials...');
-      const creds = await importCredentials('~/.claude/.credentials.json');
+      const creds = await importCredentials(claudeCredentialsPath());
       const profile = await fetchProfile(creds.accessToken);
       const profileOk = profile && !profile.error;
 
