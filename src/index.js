@@ -1687,7 +1687,8 @@ function isPidAlive(pid) {
 }
 
 function readProcessIdentity(pid) {
-  if (!Number.isInteger(pid) || pid <= 0 || process.platform === 'win32') return null;
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  if (process.platform === 'win32') return readWindowsProcessIdentity(pid);
   try {
     const result = spawnSync(
       'ps',
@@ -1717,6 +1718,35 @@ function readProcessIdentity(pid) {
   }
 }
 
+/**
+ * Windows has no `ps`; CIM gives the same three fields. CreationDate plays the
+ * role of `lstart` — with the pid it pins one process instance, so a recycled
+ * pid never matches a recorded identity.
+ */
+function readWindowsProcessIdentity(pid) {
+  const script = [
+    '[Console]::OutputEncoding = [Text.Encoding]::UTF8',
+    `$p = Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}'`,
+    'if ($p) { [pscustomobject]@{ ppid = [int]$p.ParentProcessId;'
+      + " startedAt = $p.CreationDate.ToUniversalTime().ToString('o');"
+      + ' command = [string]$p.CommandLine } | ConvertTo-Json -Compress }',
+  ].join('; ');
+  try {
+    const result = spawnSync(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-Command', script],
+      { encoding: 'utf8', windowsHide: true },
+    );
+    if (result.status !== 0 || !result.stdout?.trim()) return null;
+    const data = JSON.parse(result.stdout.trim());
+    if (!Number.isInteger(data?.ppid) || typeof data.startedAt !== 'string'
+        || typeof data.command !== 'string' || !data.command.trim()) return null;
+    return { pid, ppid: data.ppid, startedAt: data.startedAt, command: data.command.trim() };
+  } catch {
+    return null;
+  }
+}
+
 function sameProcessIdentity(recorded, current) {
   return Boolean(recorded && current
     && recorded.pid === current.pid
@@ -1727,7 +1757,8 @@ function sameProcessIdentity(recorded, current) {
 
 function commandReferencesRuntime(command) {
   if (typeof command !== 'string') return false;
-  return command.split(/\s+/).some(token => {
+  // Windows command lines quote paths that contain spaces; keep those whole.
+  return (command.match(/"[^"]*"|\S+/g) || []).some(token => {
     const candidate = token.replace(/^['"]|['"]$/g, '');
     try {
       const resolved = realpathSync(candidate);
@@ -1783,6 +1814,8 @@ function verifyWorkerIdentity(state, supervisor) {
 async function waitForExit(identity, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
+    // A dead pid cannot match; skip the identity read (slow on Windows).
+    if (!isPidAlive(identity.pid)) return true;
     if (!sameProcessIdentity(identity, readProcessIdentity(identity.pid))) return true;
     await delay(150);
   }
@@ -1830,9 +1863,9 @@ function configuredStatusProbeTimeoutMs(fallbackMs = 1500) {
   return Math.min(30_000, Math.max(250, Math.floor(configured)));
 }
 
-/** Best-effort: the pid listening on a TCP port (macOS/Linux via lsof). */
+/** Best-effort: the pid listening on a TCP port (lsof on macOS/Linux, netstat on Windows). */
 function lsofPid(port) {
-  if (process.platform === 'win32') return null;
+  if (process.platform === 'win32') return netstatListenerPid(port);
   try {
     const r = spawnSync('lsof', ['-b', '-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-t'], { encoding: 'utf8' });
     if (r.status !== 0 || r.error || r.signal) return null;
@@ -1841,6 +1874,32 @@ function lsofPid(port) {
     const pid = Number(output);
     return Number.isSafeInteger(pid) ? pid : null;
   } catch { return null; }
+}
+
+function netstatListenerPid(port) {
+  try {
+    const r = spawnSync('netstat', ['-ano'], { encoding: 'utf8', windowsHide: true });
+    if (r.status !== 0 || r.error) return null;
+    const pids = new Set();
+    for (const line of (r.stdout || '').split(/\r?\n/)) {
+      // `TCP  127.0.0.1:PORT  0.0.0.0:0  LISTENING  PID`. The state word can be
+      // localized, so a listener is recognized by its wildcard remote address.
+      const cols = line.trim().split(/\s+/);
+      if (cols.length !== 5 || cols[0] !== 'TCP') continue;
+      if (!cols[1].endsWith(`:${port}`) || !/^(0\.0\.0\.0|\[::\]):0$/.test(cols[2])) continue;
+      if (/^[1-9]\d*$/.test(cols[4])) pids.add(Number(cols[4]));
+    }
+    // Same contract as lsof: exactly one owner, or unknown.
+    if (pids.size !== 1) return null;
+    const [pid] = pids;
+    return Number.isSafeInteger(pid) ? pid : null;
+  } catch { return null; }
+}
+
+function manualStopHint(port) {
+  return process.platform === 'win32'
+    ? `netstat -ano | findstr :${port}   then   taskkill /F /PID <pid>`
+    : `kill $(lsof -nP -iTCP:${port} -sTCP:LISTEN -t)`;
 }
 
 /**
@@ -2058,8 +2117,8 @@ async function stopCommand() {
       console.log('No TeamClaude server is running.');
       return;
     case 'no-pid':
-      console.error(`A server is responding on port ${r.port} but its PID is unknown (lsof unavailable).`);
-      console.error(`Stop it once with:  kill $(lsof -nP -iTCP:${r.port} -sTCP:LISTEN -t)`);
+      console.error(`A server is responding on port ${r.port} but its PID is unknown (lsof/netstat unavailable).`);
+      console.error(`Stop it once with:  ${manualStopHint(r.port)}`);
       process.exit(1);
       break;
     case 'eperm':
@@ -2087,7 +2146,7 @@ async function restartCommand() {
       : r.reason;
     console.error(`Could not stop the existing server (${reason}); aborting restart.`);
     if (r.reason === 'no-pid') {
-      console.error(`Stop it manually first:  kill $(lsof -nP -iTCP:${r.port} -sTCP:LISTEN -t)`);
+      console.error(`Stop it manually first:  ${manualStopHint(r.port)}`);
     }
     process.exit(1);
   }

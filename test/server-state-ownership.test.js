@@ -146,10 +146,18 @@ test('status discovers a running server from the state PID when lsof is unavaila
   }
 });
 
-test('lifecycle identity accepts a server launched through an absolute symlink entry', async () => {
+test('lifecycle identity accepts a server launched through an absolute symlink entry', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'teamcodex-symlink-lifecycle-'));
   const linkedEntry = join(dir, 'teamcodex');
-  await symlink(cliPath, linkedEntry);
+  try {
+    await symlink(cliPath, linkedEntry);
+  } catch (err) {
+    // Windows needs Developer Mode or admin rights to create symlinks.
+    if (process.platform !== 'win32' || err.code !== 'EPERM') throw err;
+    await rm(dir, { recursive: true, force: true });
+    t.skip('symlink creation not permitted on this Windows account');
+    return;
+  }
   const port = await unusedPort();
   const configPath = join(dir, 'config.json');
   await writeFile(configPath, JSON.stringify({
