@@ -79,6 +79,8 @@ const SUPERVISED_WORKER_ENV = 'TEAMCLAUDE_SUPERVISED_WORKER';
 const SUPERVISOR_PID_ENV = 'TEAMCLAUDE_SUPERVISOR_PID';
 const LIFECYCLE_ID_ENV = 'TEAMCLAUDE_LIFECYCLE_ID';
 const DEPLOYMENT_DRAIN_PATH = '/teamclaude/deployment/drain';
+// Windows has no SIGHUP; the CLI asks the supervisor to relay the reload over IPC.
+const ACCOUNT_RELOAD_PATH = '/teamclaude/accounts/reload';
 const LIFECYCLE_ID_HEADER = 'x-teamcodex-lifecycle-id';
 const DEFAULT_MAX_BUFFERED_REQUEST_BYTES = 256 * 1024 * 1024;
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
@@ -468,6 +470,45 @@ async function superviseServerCommand() {
     return true;
   }
 
+  // Same fence as deployment control: local, proxy key, and the live lifecycle id
+  // (readable only from this user's state file).
+  function consumeAccountReload(req, res, isLocal) {
+    if (req.url !== ACCOUNT_RELOAD_PATH) return false;
+    if (!isLocal
+        || !proxyApiKey
+        || req.headers['x-api-key'] !== proxyApiKey
+        || req.headers[LIFECYCLE_ID_HEADER] !== lifecycleId) {
+      rejectPublicRequest(req, res, 403, { 'content-type': 'application/json' }, {
+        error: { type: 'permission_error', message: 'Account reload requires the live local lifecycle identity.' },
+      });
+      return true;
+    }
+    if (req.method !== 'POST'
+        || (req.headers['content-length'] != null && req.headers['content-length'] !== '0')
+        || req.headers['transfer-encoding'] != null) {
+      rejectPublicRequest(req, res, 405, { 'content-type': 'application/json' }, {
+        error: { type: 'invalid_request_error', message: 'Account reload accepts an empty POST request.' },
+      });
+      return true;
+    }
+    if (!worker?.connected) {
+      rejectPublicRequest(req, res, 503, { 'content-type': 'application/json', 'retry-after': '1' }, {
+        error: { type: 'overloaded_error', message: 'No live worker to reload.' },
+      });
+      return true;
+    }
+    try {
+      worker.send({ type: 'teamcodex:reload-accounts' });
+    } catch (err) {
+      rejectPublicRequest(req, res, 503, { 'content-type': 'application/json' }, {
+        error: { type: 'overloaded_error', message: `Worker reload relay failed: ${err.message}` },
+      });
+      return true;
+    }
+    rejectPublicRequest(req, res, 202, { 'content-type': 'application/json' }, { queued: true });
+    return true;
+  }
+
   const listener = http.createServer((req, res) => {
     const clientKey = req.headers['x-api-key'];
     const authorization = req.headers.authorization;
@@ -482,6 +523,7 @@ async function superviseServerCommand() {
       || remoteAddr === '::ffff:127.0.0.1';
     if (!isLocal) delete req.headers['x-teamcodex-status-identity'];
     if (consumeDeploymentDrain(req, res, isLocal)) return;
+    if (consumeAccountReload(req, res, isLocal)) return;
     if (consumeCodexRecoveryReceipt(req, res, isLocal)) return;
     if (hasRecoveryMarker && recoveryAccountUuid == null) {
       rejectPublicRequest(req, res, 403, { 'content-type': 'application/json' }, {
@@ -1551,7 +1593,7 @@ async function proxyWorkerCommand() {
   };
   const server = createProxyServer(accountManager, config, hooks);
   let liveSyncChain = Promise.resolve();
-  process.on('SIGHUP', () => {
+  const reloadAccountsFromDisk = () => {
     // Account-only reload: keep the worker, sockets, affinity map, prompt caches,
     // and every in-flight response alive. Serializing signals avoids overlapping
     // remove/add passes when several CLI changes land together.
@@ -1570,6 +1612,11 @@ async function proxyWorkerCommand() {
     }).catch(err => {
       console.error(`[TeamClaude] Account config reload failed: ${err.message}`);
     });
+  };
+  process.on('SIGHUP', reloadAccountsFromDisk);
+  // The supervisor relays ACCOUNT_RELOAD_PATH here (the SIGHUP path on Windows).
+  process.on('message', message => {
+    if (message?.type === 'teamcodex:reload-accounts') reloadAccountsFromDisk();
   });
   // Restore the last run's committed probe template alongside the quota
   // snapshot, so forced re-measure (TUI R) and warm-up probes work on a
@@ -3367,13 +3414,33 @@ async function noteRunningServerReload(config) {
       console.error('Apply the change with: teamcodex restart');
       return false;
     }
-    process.kill(workerPid, 'SIGHUP');
+    if (process.platform === 'win32') {
+      await requestAccountReload(running.port, state, config);
+    } else {
+      process.kill(workerPid, 'SIGHUP');
+    }
     console.log('Applied to the running server without restarting active connections.');
     return true;
   } catch (err) {
     console.error(`Could not reload the running server automatically: ${err.message}`);
     console.error('Apply the change with: teamcodex restart');
     return false;
+  }
+}
+
+async function requestAccountReload(port, state, config) {
+  const res = await fetch(`http://127.0.0.1:${port}${ACCOUNT_RELOAD_PATH}`, {
+    method: 'POST',
+    headers: {
+      'x-api-key': config?.proxy?.apiKey ?? '',
+      [LIFECYCLE_ID_HEADER]: state?.lifecycle?.id ?? '',
+      'content-length': '0',
+    },
+    signal: AbortSignal.timeout(configuredStatusProbeTimeoutMs(5_000)),
+  });
+  if (res.status !== 202) {
+    const body = await res.text().catch(() => '');
+    throw new Error(`account reload request returned ${res.status} ${body}`.trim());
   }
 }
 

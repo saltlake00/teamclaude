@@ -867,7 +867,13 @@ test('stop refuses a cross-wired state when listener ownership cannot be verifie
   }
 });
 
-test('CLI remove reloads the live worker while preserving the public supervisor', { timeout: 15000 }, async () => {
+test('CLI remove reloads the live worker while preserving the public supervisor', { timeout: 15000 }, async t => {
+  if (process.platform === 'win32') {
+    // Needs lsof, a POSIX locale and symlinks; the Windows relay path is covered
+    // by 'account CLI changes reach the running worker without restarting it'.
+    t.skip('lsof/locale/symlink harness is POSIX-only');
+    return;
+  }
   const dir = await mkdtemp(join(tmpdir(), 'teamclaude-live-remove-'));
   const configPath = join(dir, 'config.json');
   const statePath = join(dir, 'config.server.json');
@@ -1031,7 +1037,16 @@ test('SIGHUP replaces a same-name account when its UUID changes', { timeout: 150
       refreshToken: 'new-placeholder',
     };
     await writeFile(configPath, JSON.stringify(disk));
-    process.kill(initial.workerPid, 'SIGHUP');
+    if (process.platform === 'win32') {
+      // No SIGHUP on Windows; use the supervisor relay the CLI uses there.
+      const relayed = await fetch(`http://127.0.0.1:${port}/teamclaude/accounts/reload`, {
+        method: 'POST',
+        headers: { 'x-api-key': 'tc-test', 'x-teamcodex-lifecycle-id': initial.lifecycle.id },
+      });
+      assert.equal(relayed.status, 202);
+    } else {
+      process.kill(initial.workerPid, 'SIGHUP');
+    }
     try {
       await waitUntil(
         () => output.includes('Applied account config without restarting the worker'),
@@ -1052,6 +1067,115 @@ test('SIGHUP replaces a same-name account when its UUID changes', { timeout: 150
   } finally {
     await stopChild(child);
     await close(upstream);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// Windows has no SIGHUP, so the CLI relays the reload through the supervisor.
+// This runs on every platform so both delivery paths share one CLI contract.
+test('account CLI changes reach the running worker without restarting it', { timeout: 40000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-live-reload-cli-'));
+  const configPath = join(dir, 'config.json');
+  const statePath = join(dir, 'config.server.json');
+  const port = await unusedPort();
+  await writeFile(configPath, JSON.stringify({
+    proxy: { port, apiKey: 'tc-test' },
+    upstream: 'http://127.0.0.1:9',
+    activeWarmup: false,
+    accounts: [
+      { name: 'keep', type: 'apikey', apiKey: 'key-a' },
+      { name: 'remove-me', type: 'apikey', apiKey: 'key-b' },
+    ],
+  }));
+  const env = { ...process.env, TEAMCLAUDE_CONFIG: configPath };
+  delete env.TEAMCLAUDE_SESSION_SUPERVISED;
+  const child = spawn(process.execPath, [entry, 'server'], {
+    env,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let output = '';
+  child.stdout.on('data', chunk => { output += chunk; });
+
+  try {
+    await waitUntil(() => status(port), 'proxy did not start');
+    const initial = await waitUntil(async () => {
+      const state = await readState(statePath);
+      return state?.lifecycle?.worker ? state : null;
+    }, 'server lifecycle state was not written', 15000);
+
+    const result = spawnSync(process.execPath, [entry, 'remove', 'remove-me'], {
+      encoding: 'utf8',
+      env,
+      timeout: 25_000,
+    });
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+    assert.match(result.stdout, /Applied to the running server without restarting/);
+
+    const body = await waitUntil(async () => {
+      // Account names are only in the authenticated status view.
+      const response = await fetch(`http://127.0.0.1:${port}/teamclaude/status`, {
+        headers: { 'x-api-key': 'tc-test', 'x-teamcodex-status-identity': '1' },
+      }).catch(() => null);
+      const json = response?.ok && await response.json();
+      return json?.accounts?.length === 1 ? json : null;
+    }, `live worker did not apply the removed account\nstdout: ${output}`, 8000);
+    assert.deepEqual(body.accounts.map(account => account.name), ['keep']);
+    assert.match(output, /Applied account config without restarting the worker/);
+    assert.equal((await readState(statePath)).workerPid, initial.workerPid,
+      'account-only reload must preserve the worker');
+  } finally {
+    await stopChild(child);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('account reload endpoint requires the live local lifecycle identity', { timeout: 15000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-reload-endpoint-'));
+  const configPath = join(dir, 'config.json');
+  const port = await unusedPort();
+  await writeFile(configPath, JSON.stringify({
+    proxy: { port, apiKey: 'tc-test' },
+    upstream: 'http://127.0.0.1:9',
+    activeWarmup: false,
+    accounts: [{ name: 'api-test', type: 'apikey', apiKey: 'test-api-key' }],
+  }));
+  const child = spawn(process.execPath, [entry, 'server'], {
+    env: { ...process.env, TEAMCLAUDE_CONFIG: configPath },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let output = '';
+  child.stdout.on('data', chunk => { output += chunk; });
+  const reload = headers => fetch(`http://127.0.0.1:${port}/teamclaude/accounts/reload`, {
+    method: 'POST',
+    headers,
+  });
+
+  try {
+    await waitUntil(() => status(port), 'proxy did not start');
+    const { lifecycleId } = await (await fetch(`http://127.0.0.1:${port}/teamclaude/status`, {
+      headers: { 'x-api-key': 'tc-test', 'x-teamcodex-status-identity': '1' },
+    })).json();
+    assert.equal(typeof lifecycleId, 'string');
+
+    assert.equal((await reload({ 'x-teamcodex-lifecycle-id': lifecycleId })).status, 403);
+    assert.equal((await reload({ 'x-api-key': 'tc-test' })).status, 403);
+    assert.equal((await reload({
+      'x-api-key': 'tc-test',
+      'x-teamcodex-lifecycle-id': 'not-the-live-lifecycle',
+    })).status, 403);
+    const wrongMethod = await fetch(`http://127.0.0.1:${port}/teamclaude/accounts/reload`, {
+      headers: { 'x-api-key': 'tc-test', 'x-teamcodex-lifecycle-id': lifecycleId },
+    });
+    assert.equal(wrongMethod.status, 405);
+
+    const accepted = await reload({ 'x-api-key': 'tc-test', 'x-teamcodex-lifecycle-id': lifecycleId });
+    assert.equal(accepted.status, 202);
+    await waitUntil(
+      () => output.includes('Applied account config without restarting the worker'),
+      'worker did not run the relayed reload',
+    );
+  } finally {
+    await stopChild(child);
     await rm(dir, { recursive: true, force: true });
   }
 });
