@@ -133,7 +133,7 @@ Upstream has features this fork does not, so pick whichever fits your setup.
 
 ## Live dashboard
 
-This repository also owns the native macOS menu-bar app and its click-to-open usage dashboard in [menubar/](menubar/README.md). Build it with `npm run menubar:build`; no separate desktop dashboard, Electron or Tauri is required. On any platform the proxy itself also serves a read-only web dashboard — `teamclaude dashboard` opens it (see [Web dashboard](#web-dashboard-read-only)).
+This repository also owns the native macOS menu-bar app and its click-to-open usage dashboard in [menubar/](menubar/README.md). Build it with `npm run menubar:build`; no separate desktop dashboard, Electron or Tauri is required. On any platform the proxy itself also serves a web dashboard — `teamclaude dashboard` opens it (see [Web dashboard](#web-dashboard)).
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/sangrokjung/teamclaude/refs/heads/qjc/resilient-routing/docs/assets/teamcodex-dashboard.png" alt="TeamCodex terminal dashboard with three demo accounts" width="100%">
@@ -476,16 +476,18 @@ In selection mode, use `j`/`k` or arrow keys to navigate, `Enter` to confirm, `E
 
 The TUI is English by default. Set `TEAMCLAUDE_LANG=ko` (or `"language": "ko"` in the config) to show the account statuses, bar labels, key hints and the dashboard's own activity messages in Korean. The environment variable wins over the config key. Server log lines and `teamclaude status` keep their own wording.
 
-### Web dashboard (read-only)
+### Web dashboard
 
 ```bash
 teamclaude dashboard           # open it (an Edge app window on Windows, the default browser elsewhere)
 teamclaude dashboard --print   # print the one-time URL instead of opening a window
 ```
 
-The supervisor serves a small page at `http://127.0.0.1:<port>/teamclaude/dashboard` that redraws every 5 seconds from the in-memory status snapshot: usable accounts, requests in flight, the next session reset, one card per account (order rank, status, session/weekly bars with the same 70%/90% colours as the TUI, reset countdowns, request/token counters, concurrency) and host CPU/RAM. The activity list is built in the page by comparing consecutive snapshots (account switched, status changed, enabled/disabled, 70%/90% crossed, window reset), so it covers only the time the window has been open. It follows the system light/dark theme and the same `TEAMCLAUDE_LANG` / `language` setting as the TUI (`?lang=en|ko` and `?theme=light|dark` override them). Polling stops while the window is minimized. It reads no upstream quota and sends nothing upstream.
+The supervisor serves a small page at `http://127.0.0.1:<port>/teamclaude/dashboard` that redraws every 5 seconds from the in-memory status snapshot: usable accounts, requests in flight, the next session reset, one card per account (order rank, status, session/weekly bars with the same 70%/90% colours as the TUI, reset countdowns, request/error/token counters, concurrency) and host CPU/RAM. The activity list is built in the page by comparing consecutive snapshots (account switched, status changed, enabled/disabled, 70%/90% crossed, window reset), so it covers only the time the window has been open. It follows the system light/dark theme and the same `TEAMCLAUDE_LANG` / `language` setting as the TUI (`?lang=en|ko` and `?theme=light|dark` override them). Polling stops while the window is minimized. It reads no upstream quota and sends nothing upstream.
 
-Account names are shown only to a session opened by `teamclaude dashboard`: the CLI reads the proxy key from the config, asks the running server for a 60-second single-use code, and opens the page with it; the page trades the code for an `HttpOnly; SameSite=Strict` cookie and the supervisor adds the key itself when it asks the worker for the named snapshot. The key never reaches the browser. Opening the URL directly works too, with names replaced by `Account 1`, `Account 2`, …. The dashboard answers local clients only, checks the `Host` header (DNS rebinding) and refuses cross-site reads. Sessions live in memory, so after a server restart run `teamclaude dashboard` again to see names. Stage 1 has no controls; enable/disable, order and switch stay in the TUI and CLI.
+Account names are shown only to a session opened by `teamclaude dashboard`: the CLI reads the proxy key from the config, asks the running server for a 60-second single-use code, and opens the page with it; the page trades the code for an `HttpOnly; SameSite=Strict` cookie and the supervisor adds the key itself when it asks the worker for the named snapshot. The key never reaches the browser. Opening the URL directly works too, with names replaced by `Account 1`, `Account 2`, …. The dashboard answers local clients only, checks the `Host` header (DNS rebinding) and refuses cross-site reads. Sessions live in memory, so after a server restart run `teamclaude dashboard` again to see names.
+
+A named session also gets buttons on each card: **Switch now** (temporary, like the TUI's `s`: the account becomes current until the next automatic re-evaluation; nothing is saved), **Move up / Move down / Auto order** (the TUI's order rules: ranked accounts are `#1, #2, …`, the rest follow use-or-lose), and **Enable / Disable** (disable asks for confirmation; in-flight requests still finish). Order and enable/disable are written to the config file and applied to the running server at once. Deleting an account is not offered here — use the TUI or `teamclaude remove`. Each button press is a same-origin `POST` that must carry the session cookie and a per-session CSRF token, so another web page cannot trigger it.
 
 ### Stop / restart the server
 

@@ -3637,6 +3637,11 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     // A held fold still records the request itself (usage counters / lastUsed
     // live in updateQuota): fold an empty header set instead of skipping.
     accountManager.updateQuota(account, holdHeaderFold ? {} : rateLimitHeaders);
+    // Dashboard error counter: credential and upstream failures, not 429s
+    // (quota/rate limits have their own throttle state) or client 4xx.
+    if (upstreamRes.status === 401 || upstreamRes.status === 403 || upstreamRes.status >= 500) {
+      accountManager.noteRequestError(account);
+    }
     // 401 = auth failure (stale or revoked token). For OAuth, attempt one
     // forced token refresh and retry the same account (the token may be stale
     // but still refreshable). If that doesn't fix it — refresh fails, the token
@@ -4757,6 +4762,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     if (upstreamDeadline.timedOut && !res.destroyed) {
       if (continuityBoundedTimeout && replaySafe && sendSaved429(res, ctx)) return;
       console.error(`[TeamClaude] Upstream response timed out on account "${account.name}"`);
+      accountManager.noteRequestError(account);
       if (logDir) {
         appendLogSection('=== ERROR ===\nUpstream response timed out.');
         flushRequestLog(logDir, reqId, logSections, hooks);
@@ -4790,6 +4796,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     }
 
     console.error(`[TeamClaude] Upstream error (account "${account.name}"):`, err.message);
+    accountManager.noteRequestError(account);
 
     if (logDir) {
       appendLogSection(metadataOnlyLog

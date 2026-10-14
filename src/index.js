@@ -38,6 +38,7 @@ import {
   isCodexResponsesPath,
 } from './codex-recovery.js';
 import { TUI, applyTuiAccountMutation } from './tui.js';
+import { runAccountControl } from './account-controls.js';
 import { formatBytes } from './system-metrics.js';
 import { codexCreditsStatusLine } from './codex-credits.js';
 import { SseFramer, sseErrorEvent, isEventStream } from './sse.js';
@@ -379,6 +380,8 @@ async function superviseServerCommand() {
   let contentionNoticeAt = 0;
   let pingSeq = 0;
   const pongWaiters = new Map();
+  let controlSeq = 0;
+  const controlWaiters = new Map();
   // Watches OUR own event loop, the one that relays every SSE byte and holds
   // the probe's timeout timer. A probe that raced a stall of ours proves
   // nothing about the worker (see worker-health.js).
@@ -527,6 +530,36 @@ async function superviseServerCommand() {
     if (!response.ok) throw new Error(`Worker status returned ${response.status}`);
     return response.json();
   }
+  // Dashboard controls: the worker owns the live AccountManager, so the
+  // supervisor relays one already-authenticated request and waits for the
+  // worker's answer (src/account-controls.js).
+  function requestAccountControl({ action, accountUuid, name }) {
+    return new Promise((resolve, reject) => {
+      const child = worker;
+      if (!workerReady || !child?.connected) {
+        reject(new Error('Proxy worker is restarting.'));
+        return;
+      }
+      const id = ++controlSeq;
+      let timer = null;
+      const settle = (fn, value) => {
+        if (!controlWaiters.has(id)) return;
+        controlWaiters.delete(id);
+        clearTimeout(timer);
+        fn(value);
+      };
+      timer = setTimeout(() => settle(reject, new Error('The proxy worker did not answer in time.')), 10_000);
+      timer.unref?.();
+      controlWaiters.set(id, { child, resolve: value => settle(resolve, value) });
+      try {
+        child.send({ type: 'teamcodex:account-control', id, action, accountUuid, name }, err => {
+          if (err) settle(reject, err);
+        });
+      } catch (err) {
+        settle(reject, err);
+      }
+    });
+  }
   const dashboard = createDashboard({
     port,
     proxyApiKey,
@@ -534,6 +567,7 @@ async function superviseServerCommand() {
     lifecycleHeader: LIFECYCLE_ID_HEADER,
     language: resolveTuiLanguage(config),
     fetchStatus: fetchDashboardStatus,
+    controlAccount: requestAccountControl,
   });
 
   const listener = http.createServer((req, res) => {
@@ -1107,6 +1141,11 @@ async function superviseServerCommand() {
         pongWaiters.get(message.id)?.();
         return;
       }
+      if (message?.type === 'teamcodex:account-control-result') {
+        const waiter = controlWaiters.get(message.id);
+        if (waiter?.child === child) waiter.resolve({ statusCode: message.statusCode, body: message.body });
+        return;
+      }
       if (child !== worker) return;
       if (message?.type === 'teamcodex:shutdown') {
         requestShutdown({ workerWillExit: true });
@@ -1645,6 +1684,29 @@ async function proxyWorkerCommand() {
   // The supervisor relays ACCOUNT_RELOAD_PATH here (the SIGHUP path on Windows).
   process.on('message', message => {
     if (message?.type === 'teamcodex:reload-accounts') reloadAccountsFromDisk();
+  });
+  // Web dashboard controls relayed by the supervisor. Chained behind account
+  // reloads so a reload that read the disk before this write cannot re-apply
+  // the old value over the live change afterwards.
+  process.on('message', message => {
+    if (message?.type !== 'teamcodex:account-control') return;
+    const run = liveSyncChain.then(() => runAccountControl({
+      accountManager,
+      config,
+      persist: mutation => atomicConfigUpdate(diskConfig => {
+        applyTuiAccountMutation(diskConfig, config, accountManager, mutation);
+      }),
+    }, message));
+    liveSyncChain = run.catch(() => {});
+    run.catch(err => ({
+      statusCode: 500,
+      body: { error: { type: 'api_error', message: `Account control failed: ${err.message}` } },
+    })).then(answer => {
+      if (!process.connected) return;
+      try {
+        process.send({ type: 'teamcodex:account-control-result', id: message.id, ...answer });
+      } catch { /* the channel closed; the supervisor times out */ }
+    });
   });
   // Restore the last run's committed probe template alongside the quota
   // snapshot, so forced re-measure (TUI R) and warm-up probes work on a
@@ -3475,7 +3537,7 @@ async function requestAccountReload(port, state, config) {
 // ── dashboard ───────────────────────────────────────────────
 
 /**
- * Open the read-only web dashboard. The proxy key stays in this process: it
+ * Open the web dashboard. The proxy key stays in this process: it
  * mints a 60 s single-use code that the page trades for a session cookie.
  * `--print` prints the one-time URL instead of opening a window.
  */
@@ -3664,7 +3726,7 @@ Commands:
   resume [ID]         Resume the exact ID, or the current cmux tab checkpoint
   env                 Print an equivalent Codex launch command
   status              Show proxy & account status
-  dashboard [--print] Open the read-only web dashboard (--print: print the URL)
+  dashboard [--print] Open the web dashboard (--print: print the URL)
   accounts            List configured Codex accounts
   reauth <name>       Re-authenticate one existing OAuth account
   subscription cancel Track a cancelled subscription without disabling it
@@ -3704,7 +3766,7 @@ Commands:
   env                 Print env vars to use with Claude
   run [-- args...]    Run Claude Code through the proxy
   status              Show proxy & account status (live)
-  dashboard [--print] Open the read-only web dashboard in an app window
+  dashboard [--print] Open the web dashboard in an app window
                       (--print: print the one-time URL instead)
   accounts            List configured accounts
   reauth <name>       Re-authenticate one existing OAuth account

@@ -6,6 +6,7 @@ import { subscriptionSnapshot } from './subscription.js';
 import { formatCodexCreditsCompact } from './codex-credits.js';
 import { canReauthenticateTuiAccount, reauthenticateTuiAccount } from './reauth.js';
 import { resolveTuiLanguage, tuiText } from './tui-i18n.js';
+import { autoRanking, moveRanking, rankedAccounts, rankingChanges } from './account-order.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
@@ -748,9 +749,7 @@ export class TUI {
 
   /** Ranked accounts (priority set), in order: priority asc, then array index. */
   _rankedSorted() {
-    return this.am.accounts
-      .filter(a => a.priority != null)
-      .sort((a, b) => (a.priority - b.priority) || (a.index - b.index));
+    return rankedAccounts(this.am.accounts);
   }
 
   /**
@@ -782,21 +781,9 @@ export class TUI {
    * persisted onto its config entry (matched UUID-first, then name).
    */
   _moveOrder(account, dir) {
-    if (!this.am.accounts.includes(account)) return;
-    const ranked = this._rankedSorted();
-    const r = ranked.indexOf(account);
-
-    if (dir < 0) {                       // up — more preferred
-      if (r === -1) ranked.push(account);                                          // unranked → lowest ranked
-      else if (r > 0) { const t = ranked[r - 1]; ranked[r - 1] = ranked[r]; ranked[r] = t; }
-      else return;                                                                 // already at the top
-    } else {                             // down — less preferred
-      if (r === -1) return;                                                        // unranked: nothing below
-      else if (r < ranked.length - 1) { const t = ranked[r + 1]; ranked[r + 1] = ranked[r]; ranked[r] = t; }
-      else ranked.splice(r, 1);                                                    // last ranked → un-rank
-    }
-
-    this._applyRanking(ranked);
+    // Same rules as the web dashboard's order buttons (src/account-order.js).
+    const ranked = moveRanking(this.am.accounts, account, dir);
+    if (ranked) this._applyRanking(ranked);
   }
 
   /**
@@ -805,8 +792,8 @@ export class TUI {
    * renumber below still normalizes any legacy/duplicate priorities.
    */
   _setAutoOrder(account) {
-    if (!this.am.accounts.includes(account)) return;
-    this._applyRanking(this._rankedSorted().filter(a => a !== account));
+    const ranked = autoRanking(this.am.accounts, account);
+    if (ranked) this._applyRanking(ranked);
   }
 
   /**
@@ -815,10 +802,7 @@ export class TUI {
    * config in lockstep, then schedule a coalesced save.
    */
   _applyRanking(ranked) {
-    const set = new Set(ranked);
-    for (const a of this.am.accounts) {
-      const want = set.has(a) ? ranked.indexOf(a) : null;
-      if (a.priority === want) continue;
+    for (const { account: a, priority: want } of rankingChanges(this.am.accounts, ranked)) {
       this.am.setPriority(a, want);
       // Persist onto the config entry by identity (UUID-first, then name) — the
       // display index may not map 1:1 onto config.accounts. Write `null` (not a

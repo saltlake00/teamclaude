@@ -1,8 +1,10 @@
-// Browser bootstrap for the read-only web dashboard (served as
-// GET /teamclaude/dashboard/client.js). It only fetches the supervisor's
-// dashboard status route, keeps a short client-side activity list built by
-// diffing consecutive snapshots, and assigns the HTML that dashboard-view.js
-// renders. It never calls anything that spends upstream quota.
+// Browser bootstrap for the web dashboard (served as
+// GET /teamclaude/dashboard/client.js). It fetches the supervisor's dashboard
+// status route, keeps a short client-side activity list built by diffing
+// consecutive snapshots, and assigns the HTML that dashboard-view.js renders.
+// A named session also gets account controls: one delegated click handler
+// POSTs the action with the session's CSRF token (from the status response),
+// and "disable" asks for confirmation first. Nothing here spends upstream quota.
 
 import {
   buildViewModel,
@@ -34,6 +36,8 @@ const els = {
   accounts: $('accounts'),
   accountCount: $('account-count'),
   activity: $('activity'),
+  confirm: $('confirm'),
+  confirmTitle: $('confirm-title'),
 };
 
 let lastStatus = null;
@@ -41,6 +45,7 @@ let lastVm = null;
 let lastOkAt = null;
 let connected = null; // null = never tried yet
 let timer = null;
+let busy = false;
 const events = [];
 
 function pushEvents(list) {
@@ -78,7 +83,7 @@ function render() {
     const vm = buildViewModel(lastStatus, { now: Date.now(), text });
     els.host.innerHTML = renderHostHtml(vm, text);
     els.summary.innerHTML = renderSummaryHtml(vm, text);
-    els.accounts.innerHTML = renderAccountsHtml(vm, text);
+    els.accounts.innerHTML = renderAccountsHtml(vm, text, { busy });
     els.accountCount.textContent = String(vm.accounts.length);
     renderNotice(vm);
   }
@@ -108,6 +113,74 @@ async function poll() {
   }
   render();
 }
+
+// ── account controls ──
+
+/** Resolves true when the operator confirms disabling `label`. */
+function confirmDisable(label) {
+  const dialog = els.confirm;
+  if (!dialog || typeof dialog.showModal !== 'function') return Promise.resolve(false);
+  els.confirmTitle.textContent = text.controls.confirmTitle(label);
+  return new Promise(resolve => {
+    let answer = false;
+    const onClick = e => {
+      const which = e.target.closest('[data-dialog]')?.dataset.dialog;
+      if (!which) return;
+      answer = which === 'ok';
+      dialog.close();
+    };
+    dialog.addEventListener('click', onClick);
+    // Esc closes the dialog too and leaves answer = false.
+    dialog.addEventListener('close', () => {
+      dialog.removeEventListener('click', onClick);
+      resolve(answer);
+    }, { once: true });
+    dialog.showModal();
+    dialog.querySelector('[data-dialog="cancel"]')?.focus();
+  });
+}
+
+async function failureMessage(res) {
+  let body = null;
+  try { body = await res.json(); } catch { /* not JSON */ }
+  if (res.headers.get('x-teamclaude-reason') === 'session') return text.actionErrors.session;
+  const reason = body?.error?.reason;
+  if (reason && text.actionErrors[reason]) return text.actionErrors[reason];
+  return body?.error?.message || `HTTP ${res.status}`;
+}
+
+async function runAction(button) {
+  const action = button.dataset.act;
+  const name = button.dataset.name || '';
+  const accountUuid = button.dataset.uuid || null;
+  const csrf = lastStatus?.dashboard?.csrf;
+  if (!action || !name || !csrf || busy) return;
+  if (action === 'disable' && !(await confirmDisable(name))) return;
+  busy = true;
+  render();
+  try {
+    const res = await fetch('/teamclaude/dashboard/action', {
+      method: 'POST',
+      cache: 'no-store',
+      credentials: 'same-origin',
+      headers: { 'content-type': 'application/json', 'x-teamclaude-csrf': csrf },
+      body: JSON.stringify({ action, accountUuid, name }),
+    });
+    if (!res.ok) pushEvents([{ tone: 'crit', text: text.actionFailed(name, await failureMessage(res)) }]);
+  } catch {
+    pushEvents([{ tone: 'crit', text: text.actionFailed(name, text.actionErrors.network) }]);
+  } finally {
+    busy = false;
+  }
+  // Show the result at once; the diff against the previous snapshot reports it.
+  await poll();
+  schedule();
+}
+
+els.accounts.addEventListener('click', e => {
+  const button = e.target.closest('button[data-act]');
+  if (button && !button.disabled) runAction(button);
+});
 
 function schedule() {
   clearTimeout(timer);

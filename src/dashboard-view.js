@@ -1,4 +1,4 @@
-// Web dashboard view logic (read-only, stage 1).
+// Web dashboard view logic (status display + account control buttons).
 //
 // This file is served VERBATIM to the browser as an ES module
 // (GET /teamclaude/dashboard/view.js) and is also imported by the Node tests,
@@ -36,6 +36,29 @@ const EN = {
     inflight: (i, m) => `${i}/${m} in flight`,
     lastUsed: s => `last used ${s}`,
     credits: s => `credits ${s}`,
+    errors: n => (n === '1' ? '1 error' : `${n} errors`),
+  },
+  controls: {
+    switch: 'Switch now',
+    switchTitle: 'Make this the current account until the next automatic re-evaluation',
+    unavailableTitle: 'This account cannot take requests right now',
+    up: 'Move up',
+    down: 'Move down',
+    auto: 'Auto order',
+    autoTitle: 'Drop the explicit rank and return to automatic ordering',
+    enable: 'Enable',
+    disable: 'Disable',
+    confirmTitle: n => `Disable ${n}?`,
+    confirmBody: 'It leaves the rotation. Requests already in flight still finish, and you can enable it again at any time.',
+    confirmOk: 'Disable',
+    cancel: 'Cancel',
+  },
+  actionFailed: (n, msg) => `${n}: action failed — ${msg}`,
+  actionErrors: {
+    session: 'the dashboard session ended — reopen it with `teamclaude dashboard`',
+    'not-found': 'the account is no longer in the running proxy',
+    unavailable: 'the account cannot take requests right now',
+    network: 'the proxy did not answer',
   },
   // Same words as the TUI status column (src/tui-i18n.js); a test keeps them equal.
   status: {
@@ -74,9 +97,11 @@ const EN = {
   updated: s => `updated ${s}`,
   connecting: 'connecting…',
   unreachable: 'Proxy unreachable — retrying',
-  identityHint: 'Account names are hidden. Open this window with `teamclaude dashboard` to show them.',
+  identityHint: 'Account names and controls are hidden. Open this window with `teamclaude dashboard` to show them.',
   events: {
     current: (a, b) => `Active account: ${a} → ${b}`,
+    rank: (n, a, b) => `${n} order: ${a} → ${b}`,
+    autoRank: 'auto',
     status: (n, a, b) => `${n}: ${a} → ${b}`,
     enabled: n => `${n} enabled`,
     disabled: n => `${n} disabled`,
@@ -118,6 +143,29 @@ const KO = {
     inflight: (i, m) => `동시 ${i}/${m}`,
     lastUsed: s => `마지막 사용 ${s}`,
     credits: s => `잔액 ${s}`,
+    errors: n => `오류 ${n}`,
+  },
+  controls: {
+    switch: '지금 전환',
+    switchTitle: '다음 자동 재평가 전까지 이 계정을 현재 계정으로 씁니다',
+    unavailableTitle: '이 계정은 지금 요청을 받을 수 없습니다',
+    up: '순위 올리기',
+    down: '순위 내리기',
+    auto: '자동 순서',
+    autoTitle: '지정한 순위를 지우고 자동 순서로 되돌립니다',
+    enable: '켜기',
+    disable: '끄기',
+    confirmTitle: n => `${n} 계정을 끌까요?`,
+    confirmBody: '회전에서 빠집니다. 이미 진행 중인 요청은 끝까지 처리되고, 언제든 다시 켤 수 있습니다.',
+    confirmOk: '끄기',
+    cancel: '취소',
+  },
+  actionFailed: (n, msg) => `${n}: 조작 실패 — ${msg}`,
+  actionErrors: {
+    session: '대시보드 세션이 끝났습니다. `teamclaude dashboard`로 다시 여세요',
+    'not-found': '실행 중인 프록시에 그 계정이 없습니다',
+    unavailable: '그 계정은 지금 요청을 받을 수 없습니다',
+    network: '프록시가 응답하지 않습니다',
   },
   status: {
     disabled: '꺼짐',
@@ -155,9 +203,11 @@ const KO = {
   updated: s => `${s} 갱신`,
   connecting: '연결 중…',
   unreachable: '프록시에 연결할 수 없음 — 다시 시도 중',
-  identityHint: '계정 이름이 가려져 있습니다. `teamclaude dashboard` 명령으로 이 창을 열면 이름이 보입니다.',
+  identityHint: '계정 이름과 조작 버튼이 가려져 있습니다. `teamclaude dashboard` 명령으로 이 창을 열면 보입니다.',
   events: {
     current: (a, b) => `현재 계정: ${a} → ${b}`,
+    rank: (n, a, b) => `${n} 순서: ${a} → ${b}`,
+    autoRank: '자동',
     status: (n, a, b) => `${n}: ${a} → ${b}`,
     enabled: n => `${n} 켬`,
     disabled: n => `${n} 끔`,
@@ -358,6 +408,8 @@ export function buildViewModel(status, { now = Date.now(), text = EN } = {}) {
       index: i,
       label: named ? a.name : text.account(i + 1),
       named,
+      // What an action names the account by (the worker matches UUID first).
+      target: named ? { accountUuid: a.accountUuid || null, name: a.name } : null,
       rank: rankOf.get(i) ?? null,
       isCurrent: isCurrent(status, a),
       type: a.type || null,
@@ -368,6 +420,7 @@ export function buildViewModel(status, { now = Date.now(), text = EN } = {}) {
       bars: barsOf(a, now, text),
       stats: {
         requests: Number(usage.totalRequests) || 0,
+        errors: Number(usage.totalErrors) || 0,
         tokensIn: Number(usage.totalInputTokens) || 0,
         tokensOut: Number(usage.totalOutputTokens) || 0,
         inflight: Number(a.inflight) || 0,
@@ -397,8 +450,11 @@ export function buildViewModel(status, { now = Date.now(), text = EN } = {}) {
       }
     : null;
 
+  const identity = status?.dashboard?.identity === true;
   return {
-    identity: status?.dashboard?.identity === true,
+    identity,
+    // Buttons need a named session AND the supervisor's CSRF token for it.
+    controls: identity && typeof status?.dashboard?.csrf === 'string' && status.dashboard.csrf.length > 0,
     port: status?.dashboard?.port ?? null,
     summary: {
       usable: Number.isFinite(status?.usableCount) ? status.usableCount : rows.filter(r => r.usable).length,
@@ -443,6 +499,10 @@ export function diffSnapshots(prev, next, text) {
       out.push({ tone: r.enabled ? 'ok' : 'muted', text: r.enabled ? ev.enabled(r.label) : ev.disabled(r.label) });
     } else if (p.status.key !== r.status.key) {
       out.push({ tone: r.status.tone, text: ev.status(r.label, p.status.label, r.status.label) });
+    }
+    if (p.rank !== r.rank) {
+      const show = rank => (rank == null ? ev.autoRank : `#${rank}`);
+      out.push({ tone: 'info', text: ev.rank(r.label, show(p.rank), show(r.rank)) });
     }
     r.bars.forEach((b, i) => {
       const pb = p.bars[i];
@@ -507,7 +567,43 @@ function renderBar(b, text) {
     + `<div class="track"><div class="fill lvl-${b.level}" style="width:${width}%"></div></div></div>`;
 }
 
-export function renderAccountsHtml(vm, text) {
+function attr(name, value) {
+  return value == null ? '' : ` ${name}="${escapeHtml(value)}"`;
+}
+
+/**
+ * The control buttons for one row, or '' when this page may not act (no named
+ * session / no CSRF token) or the row is redacted. `busy` disables every button
+ * while an action is in flight. Data attributes carry the action and target;
+ * the browser bootstrap reads them with one delegated click handler.
+ */
+export function renderControlsHtml(r, vm, text, { busy = false } = {}) {
+  if (!vm.controls || !r.named || !r.target) return '';
+  const c = text.controls;
+  const target = attr('data-uuid', r.target.accountUuid) + attr('data-name', r.target.name);
+  const button = (act, label, { cls = '', disabled = false, title = null } = {}) =>
+    `<button type="button" class="btn${cls ? ` ${cls}` : ''}" data-act="${act}"${target}`
+      + `${attr('title', title)}${disabled || busy ? ' disabled' : ''}>${escapeHtml(label)}</button>`;
+  const parts = [];
+  if (!r.isCurrent && r.enabled) {
+    parts.push(button('switch', c.switch, {
+      cls: 'primary',
+      disabled: !r.usable,
+      title: r.usable ? c.switchTitle : c.unavailableTitle,
+    }));
+  }
+  parts.push('<span class="btn-group">'
+    + button('up', `▲ ${c.up}`, { disabled: r.rank === 1 })
+    + button('down', `▼ ${c.down}`, { disabled: r.rank == null })
+    + '</span>');
+  if (r.rank != null) parts.push(button('auto', c.auto, { title: c.autoTitle }));
+  parts.push(r.enabled
+    ? button('disable', c.disable, { cls: 'danger' })
+    : button('enable', c.enable, { cls: 'primary' }));
+  return `<div class="actions">${parts.join('')}</div>`;
+}
+
+export function renderAccountsHtml(vm, text, opts = {}) {
   if (vm.accounts.length === 0) return `<li class="empty">${escapeHtml(text.noAccounts)}</li>`;
   return vm.accounts.map(r => {
     const cls = ['acct'];
@@ -522,6 +618,7 @@ export function renderAccountsHtml(vm, text) {
     ];
     if (st.credits != null) stats.push(text.stats.credits(st.credits));
     if (st.lastUsedAgo) stats.push(text.stats.lastUsed(st.lastUsedAgo));
+    const errors = `<span${st.errors > 0 ? ' class="err"' : ''}>${escapeHtml(text.stats.errors(group(st.errors, text)))}</span>`;
     const title = r.status.title ? ` title="${escapeHtml(r.status.title)}"` : '';
     return `<li class="${cls.join(' ')}">`
       + '<div class="who">'
@@ -533,7 +630,9 @@ export function renderAccountsHtml(vm, text) {
       + (r.type ? `<span class="kind">${escapeHtml(r.provider === 'codex' ? 'codex' : r.type)}</span>` : '')
       + '</div>'
       + `<div class="bars">${r.bars.map(b => renderBar(b, text)).join('')}</div>`
-      + `<div class="stats">${stats.map(s => `<span>${escapeHtml(s)}</span>`).join('')}</div>`
+      + `<div class="stats">${stats.slice(0, 1).map(s => `<span>${escapeHtml(s)}</span>`).join('')}${errors}`
+      + `${stats.slice(1).map(s => `<span>${escapeHtml(s)}</span>`).join('')}</div>`
+      + renderControlsHtml(r, vm, text, opts)
       + '</li>';
   }).join('');
 }

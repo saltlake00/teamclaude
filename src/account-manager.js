@@ -236,6 +236,8 @@ export class AccountManager {
         totalInputTokens: 0,
         totalOutputTokens: 0,
         totalRequests: 0,
+        // Failed upstream attempts on this account (noteRequestError).
+        totalErrors: 0,
         lastUsed: null,
       },
       rateLimitedUntil: null,
@@ -424,6 +426,34 @@ export class AccountManager {
       currentAccount: next.name,
       currentAccountUuid: next.accountUuid || null,
     };
+  }
+
+  /**
+   * Operator switch (TUI `s`, web dashboard): make `ref` the sticky primary
+   * now. Temporary by design — nothing is persisted, and the next periodic
+   * re-evaluation (reevalIntervalMs), the account becoming unavailable, or
+   * cold-start warm-up may move the primary again. Live keep-alive
+   * connections keep their affinity home. Refuses an account that cannot take
+   * a request right now, since getActiveAccount would leave it at once.
+   */
+  switchTo(ref) {
+    const account = this._resolveRef(ref);
+    if (!account) return { switched: false, reason: 'not-found' };
+    if (!this._isAvailable(account)) return { switched: false, reason: 'unavailable' };
+    const changed = account.index !== this.currentIndex;
+    this.currentIndex = account.index;
+    this.lastEvalAt = Date.now(); // hold it until the next periodic re-evaluation
+    return { switched: true, changed };
+  }
+
+  /**
+   * Count one failed upstream attempt on `account` (401/403/5xx response or a
+   * transport failure / timeout). A display counter only — it feeds no routing
+   * decision, and a failover attempt counts on the account that failed.
+   */
+  noteRequestError(account) {
+    if (!account?.usage) return;
+    account.usage.totalErrors = (Number(account.usage.totalErrors) || 0) + 1;
   }
 
   // ── Concurrency layer: per-account in-flight cap + overflow queue ──────────
@@ -2425,7 +2455,7 @@ export class AccountManager {
       enabled: acctData.enabled !== false,
       priority: Number.isFinite(acctData.priority) ? Math.floor(acctData.priority) : null,
       quota: emptyQuota(),
-      usage: { totalInputTokens: 0, totalOutputTokens: 0, totalRequests: 0, lastUsed: null },
+      usage: { totalInputTokens: 0, totalOutputTokens: 0, totalRequests: 0, totalErrors: 0, lastUsed: null },
       rateLimitedUntil: null,
       avoidUntil: null,       // soft steer-away deadline after an upstream failure (in-memory only)
       unsupportedModels: new Map(),
