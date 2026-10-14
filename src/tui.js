@@ -5,6 +5,7 @@ import { createHostTracker } from './system-metrics.js';
 import { subscriptionSnapshot } from './subscription.js';
 import { formatCodexCreditsCompact } from './codex-credits.js';
 import { canReauthenticateTuiAccount, reauthenticateTuiAccount } from './reauth.js';
+import { resolveTuiLanguage, tuiText } from './tui-i18n.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
@@ -244,6 +245,8 @@ export class TUI {
     });
     this.onQuit = onQuit;
     this._host = createHostTracker(); // host CPU/RAM shown in the header
+    // Display language (English unless TEAMCLAUDE_LANG / config.language says ko).
+    this.text = tuiText(resolveTuiLanguage(config));
 
     this.log = [];           // completed activity entries
     this.active = new Map(); // in-flight requests
@@ -394,7 +397,7 @@ export class TUI {
     if (k === 'up' || k === 'k') this._moveSel(-1);
     else if (k === 'down' || k === 'j') this._moveSel(+1);
     // The action keys act DIRECTLY on the cursor-selected account (object-anchored).
-    else if (k === 's') { const a = this._selected(); if (a) { this.am.currentIndex = a.index; this._addLog(`Switched to "${a.name}"`); } }
+    else if (k === 's') { const a = this._selected(); if (a) { this.am.currentIndex = a.index; this._addLog(this.text.msg.switched(a.name)); } }
     else if (k === 'e') { const a = this._selected(); if (a) this._doToggleEnabled(a.index); }
     else if (k === 'o') { const a = this._selected(); if (a) { this.orderAccount = a; this.mode = 'order'; } }
     else if (k === 'r') { const a = this._selected(); if (this._canReauthenticate(a)) this._doReauthenticate(a); }
@@ -435,7 +438,7 @@ export class TUI {
       // fleet returns to automatic use-or-lose routing (weekly reset soonest
       // drained first). The list re-sorts to that drain order immediately.
       this._applyRanking([]);
-      this._addLog('Order reset: all accounts on auto (weekly-reset order)');
+      this._addLog(this.text.msg.orderReset);
       this._followOrderAccount();
     } else if (k === 'c') {
       // Clear: un-rank just the grabbed account (one keypress instead of moving
@@ -457,7 +460,7 @@ export class TUI {
     if (k === 'i') { this._doImport(); this.mode = 'normal'; }
     else if (k === 'k' && this.config.provider !== 'codex') {
       this.mode = 'input';
-      this.inputPrompt = 'API key';
+      this.inputPrompt = this.text.apiKeyPrompt;
       this.inputBuf = '';
       this.inputCb = v => { if (v) this._doAddKey(v); };
     }
@@ -479,15 +482,16 @@ export class TUI {
   // ── account operations ─────────────────────────────
 
   async _doSync() {
+    const m = this.text.msg;
     try {
       const count = await this.syncAccounts();
       if (count > 0) {
-        this._addLog(`Synced ${count} new account(s) from config`);
+        this._addLog(m.synced(count));
       } else {
-        this._addLog('Config reloaded, credentials refreshed');
+        this._addLog(m.reloaded);
       }
     } catch (e) {
-      this._addLog(`Sync failed: ${e.message}`);
+      this._addLog(m.syncFailed(e.message));
     }
     // Reload also re-measures the WHOLE fleet's quota, not just the account
     // list: the displayed usage drifts silently (spend from other devices or
@@ -496,20 +500,20 @@ export class TUI {
     // just-refreshed credentials.
     if (this.refreshQuota) {
       try {
-        this._addLog('Re-measuring quota for all accounts...');
+        this._addLog(m.remeasuring);
         const r = await this.refreshQuota();
         if (r === -1 || r == null) {
-          this._addLog('Quota refresh skipped — no request has flowed through the proxy yet');
+          this._addLog(m.remeasureSkipped);
         } else if (r.measured === r.targets) {
-          this._addLog(`Quota re-measured for all ${r.measured} account(s)`);
+          this._addLog(m.remeasuredAll(r.measured));
         } else {
           // Honest partial result — some probes were skipped (expired token
           // that would not refresh, auth error) or failed. Never report a
           // blanket success while accounts silently kept stale numbers.
-          this._addLog(`Quota re-measured for ${r.measured}/${r.targets} account(s) — the rest failed or were skipped`);
+          this._addLog(m.remeasuredPartial(r.measured, r.targets));
         }
       } catch (e) {
-        this._addLog(`Quota refresh failed: ${e.message}`);
+        this._addLog(m.remeasureFailed(e.message));
       }
     }
   }
@@ -527,21 +531,22 @@ export class TUI {
       await this._doImportCodex();
       return;
     }
+    const m = this.text.msg;
     try {
-      this._addLog('Importing credentials...');
+      this._addLog(m.importing);
       const creds = await importCredentials(claudeCredentialsPath());
       const profile = await fetchProfile(creds.accessToken);
       const profileOk = profile && !profile.error;
 
       if (!profileOk) {
-        this._addLog(`Warning: could not fetch profile — ${profile?.error || 'no token'}`);
+        this._addLog(m.profileWarning(profile?.error || 'no token'));
       }
 
       let name;
       if (profile?.email) {
         name = profile.email;
         const tier = profile.hasClaudeMax ? 'Max' : profile.hasClaudePro ? 'Pro' : null;
-        if (tier) this._addLog(`Detected Claude ${tier}: ${name}`);
+        if (tier) this._addLog(m.detected(tier, name));
       } else {
         // Pick the first FREE account-N (not `count + 1`, which collides after a
         // delete, e.g. delete account-1 then the next import reuses account-2).
@@ -601,22 +606,23 @@ export class TUI {
           // credentials, add it so the running server can actually use it.
           this.am.addAccount(entry);
         }
-        this._addLog(`Updated account "${name}"`);
+        this._addLog(m.updated(name));
       } else {
         this.config.accounts.push(entry);
         this.am.addAccount(entry);
-        this._addLog(`Imported account "${name}"`);
+        this._addLog(m.imported(name));
       }
 
       await this.saveConfig(this.config, { type: 'upsert', account: entry, previous });
     } catch (e) {
-      this._addLog(`Import failed: ${e.message}`);
+      this._addLog(m.importFailed(e.message));
     }
   }
 
   async _doImportCodex() {
+    const m = this.text.msg;
     try {
-      this._addLog('Importing Codex credentials...');
+      this._addLog(m.importingCodex);
       const creds = await importCodexCredentials();
       let name = creds.email;
       if (!name) {
@@ -658,15 +664,15 @@ export class TUI {
         } else {
           this.am.addAccount(entry);
         }
-        this._addLog(`Updated Codex account "${name}"`);
+        this._addLog(m.updatedCodex(name));
       } else {
         this.config.accounts.push(entry);
         this.am.addAccount(entry);
-        this._addLog(`Imported Codex account "${name}"`);
+        this._addLog(m.importedCodex(name));
       }
       await this.saveConfig(this.config, { type: 'upsert', account: entry, previous });
     } catch (e) {
-      this._addLog(`Codex import failed: ${e.message}`);
+      this._addLog(m.codexImportFailed(e.message));
     }
   }
 
@@ -680,7 +686,7 @@ export class TUI {
     this.config.accounts.push(entry);
     this.am.addAccount(entry);
     await this.saveConfig(this.config, { type: 'upsert', account: entry });
-    this._addLog(`Added API key account "${name}"`);
+    this._addLog(this.text.msg.addedApiKey(name));
   }
 
   async _doRemove(idx) {
@@ -705,7 +711,7 @@ export class TUI {
     if (this.selAcct && !this.am.accounts.includes(this.selAcct)) this.selAcct = null;
     if (this.selIdx >= this.am.accounts.length) this.selIdx = Math.max(0, this.am.accounts.length - 1);
     await this.saveConfig(this.config, { type: 'remove', account: removed });
-    this._addLog(`Deleted account "${name}"`);
+    this._addLog(this.text.msg.deleted(name));
   }
 
   async _doToggleEnabled(idx) {
@@ -729,7 +735,7 @@ export class TUI {
       account: amAcct,
       fields: { enabled: newEnabled ? undefined : false },
     });
-    this._addLog(`${newEnabled ? 'Enabled' : 'Disabled'} "${amAcct.name}"`);
+    this._addLog(this.text.msg[newEnabled ? 'enabled' : 'disabled'](amAcct.name));
   }
 
   // ── ordering (priority expressed as a movable rank, not a typed number) ──────
@@ -845,7 +851,7 @@ export class TUI {
           fields: { priority: account.priority },
         }));
         try { await this.saveConfig(this.config, { type: 'batchPatch', patches }); }
-        catch (e) { this._addLog(`Save failed: ${e.message}`); }
+        catch (e) { this._addLog(this.text.msg.saveFailed(e.message)); }
       }
       this._saving = null;
     })();
@@ -857,9 +863,10 @@ export class TUI {
     if (!this.running) return;
     const W = process.stdout.columns || 80;
     const H = process.stdout.rows || 24;
+    const t = this.text;
 
     if (W < 40 || H < 8) {
-      process.stdout.write(`${ESC}H${ESC}2JTerminal too small (need 40x8+)\r\n`);
+      process.stdout.write(`${ESC}H${ESC}2J${t.tooSmall}\r\n`);
       return;
     }
 
@@ -878,29 +885,31 @@ export class TUI {
     // The host segment is optional: on a narrow terminal (W can be as low as 40)
     // the full header would exceed W — Math.max floors the gap at 1 but the line
     // itself would wrap and corrupt the fixed frame. Drop CPU/RAM before Port.
-    let right = `${cpuS} ${dim('·')} ${memS} ${dim('·')} Port ${port} ${green('▲')} `;
-    if (vw(left) + vw(right) + 1 > W) right = `Port ${port} ${green('▲')} `;
+    let right = `${cpuS} ${dim('·')} ${memS} ${dim('·')} ${t.port} ${port} ${green('▲')} `;
+    if (vw(left) + vw(right) + 1 > W) right = `${t.port} ${port} ${green('▲')} `;
     lines.push(left + ' '.repeat(Math.max(1, W - vw(left) - vw(right))) + right);
     lines.push(' ' + dim('─'.repeat(W - 2)));
 
     // ── Accounts
     if (this.am.accounts.length === 0) {
       lines.push('');
-      lines.push(yellow('  No accounts configured. Press [a] to add one.'));
+      lines.push(yellow(`  ${t.noAccounts}`));
     } else {
       lines.push('');
       // Three quota bars (Ses / Wk / Fbl) when the terminal is wide enough,
       // two (Ses / Wk) on mid widths, one on narrow ones.
       const showThree = W >= 92;
       const showBoth = W >= 70;
+      // Wider (Korean) bar labels take their extra columns out of the bars.
+      const extra = t.labelWidth - 3;
       // The +4 in each offset reserves the width of the leading row-number
       // column (" NN." + its separator), so adding it doesn't push the bars
       // past the terminal edge and clip the rightmost (Fbl) bar.
       const bw = showThree
-        ? Math.max(5, Math.min(20, Math.floor((W - 66) / 3)))
+        ? Math.max(5, Math.min(20, Math.floor((W - 66 - 3 * extra) / 3)))
         : showBoth
-          ? Math.max(5, Math.min(20, Math.floor((W - 60) / 2)))
-          : Math.max(5, Math.min(20, W - 49));
+          ? Math.max(5, Math.min(20, Math.floor((W - 60 - 2 * extra) / 2)))
+          : Math.max(5, Math.min(20, W - 49 - extra));
 
       // Sync the cursor position to the anchored account before drawing — the
       // display order may have changed since the last frame (quota updates
@@ -915,8 +924,8 @@ export class TUI {
     // ── Activity header
     lines.push('');
     const ac = this.active.size;
-    const acTag = ac > 0 ? `  ${cyan(ac + ' active')}` : '';
-    const aHdr = ` Activity${acTag} `;
+    const acTag = ac > 0 ? `  ${cyan(t.activeCount(ac))}` : '';
+    const aHdr = ` ${t.activity}${acTag} `;
     lines.push(aHdr + dim('─'.repeat(Math.max(1, W - vw(aHdr)))));
 
     // Active requests
@@ -959,6 +968,8 @@ export class TUI {
     // grabbed account gets a distinct move marker.
     const isSel = (this.mode === 'normal' || this.mode === 'select' || this.mode === 'order') && pos === this.selIdx;
     const isMoving = this.mode === 'order' && a === this.orderAccount;
+    const t = this.text;
+    const st = t.status;
 
     // Prefix: selection / move marker + current marker
     const sel = isMoving ? cyan('⇅') : isSel ? cyan('>') : ' ';
@@ -980,29 +991,29 @@ export class TUI {
     // underlying quota status, since it's out of rotation either way.
     let status;
     if (a.enabled === false) {
-      status = gray('disabled');
+      status = gray(st.disabled);
     } else {
       const subscription = subscriptionSnapshot(a);
       if (subscription.state === 'ended') {
-        status = red('sub ended');
+        status = red(st.subEnded);
       } else if (a.status === 'error') {
         status = red(a.errorReason === 'subscription-disabled'
-          ? 'access'
-          : this._canReauthenticate(a) ? 'reauth' : 'error');
+          ? st.access
+          : this._canReauthenticate(a) ? st.reauth : st.error);
       } else if (subscription.state === 'end-date-reached') {
-        status = yellow('sub due');
+        status = yellow(st.subDue);
       } else if (subscription.state === 'cancellation-scheduled') {
-        status = yellow('canceling');
+        status = yellow(st.canceling);
       } else {
         const onCredits = a.status === 'active' && this.am._isCreditBackedNow?.(a) === true;
         switch (onCredits ? 'credits' : a.status) {
           // Included quota spent, still routable on the credit balance.
-          case 'credits':   status = cyan('credits'); break;
-          case 'active':    status = isCur ? green('active') : 'active'; break;
-          case 'throttled': status = yellow('throttled'); break;
-          case 'exhausted': status = red('exhausted'); break;
-          case 'error':     status = red('error'); break;
-          default:          status = a.status || 'ready';
+          case 'credits':   status = cyan(st.credits); break;
+          case 'active':    status = isCur ? green(st.active) : st.active; break;
+          case 'throttled': status = yellow(st.throttled); break;
+          case 'exhausted': status = red(st.exhausted); break;
+          case 'error':     status = red(st.error); break;
+          default:          status = a.status || st.ready;
         }
       }
     }
@@ -1013,7 +1024,9 @@ export class TUI {
     // not yet measured); an API-key account shows Tok/Req. Keying on the data
     // (unified5h != null) mislabels an unmeasured OAuth account as Tok/Req.
     const q = a.quota;
-    let r1 = null, r2 = null, l1 = 'Ses', l2 = 'Wk ', t1 = null, t2 = null;
+    const lw = t.labelWidth;
+    const lab = s => rpad(s, lw);
+    let r1 = null, r2 = null, l1 = lab(t.bar.ses), l2 = lab(t.bar.wk), t1 = null, t2 = null;
     let r3 = null, l3 = null, t3 = null;
 
     if (a.type === 'oauth') {
@@ -1029,16 +1042,16 @@ export class TUI {
       const mw = q.modelWeekly && (
         ('7d_oi' in q.modelWeekly && ['7d_oi', q.modelWeekly['7d_oi']])
         || Object.entries(q.modelWeekly)[0]);
-      l3 = 'Fbl';
+      l3 = lab(t.bar.fbl);
       if (mw) {
         const [label, win] = mw;
-        if (label !== '7d_oi') l3 = (label.slice(3) + '   ').slice(0, 3);
+        if (label !== '7d_oi') l3 = lab((label.slice(3) + '   ').slice(0, 3));
         r3 = win.utilization;
         t3 = win.reset;
       }
     } else {
-      l1 = 'Tok';
-      l2 = 'Req';
+      l1 = lab(t.bar.tok);
+      l2 = lab(t.bar.req);
       r1 = (q.tokensLimit != null && q.tokensRemaining != null)
         ? 1 - q.tokensRemaining / q.tokensLimit : null;
       r2 = (q.requestsLimit != null && q.requestsRemaining != null)
@@ -1058,10 +1071,10 @@ export class TUI {
       // API-key accounts have no third metric — pad the slot so the rank
       // badges stay column-aligned across mixed account types.
       line += credits != null
-        ? `  Cr  ${textCell(credits, bw)}`
-        : l3 ? `  ${l3} ${bar(r3, bw, t3)}` : ' '.repeat(6 + bw);
+        ? `  ${lab(t.bar.cr)} ${textCell(credits, bw)}`
+        : l3 ? `  ${l3} ${bar(r3, bw, t3)}` : ' '.repeat(3 + lw + bw);
     } else if (credits != null) {
-      line += `  Cr ${credits}`;
+      line += `  ${t.bar.cr} ${credits}`;
     }
     // Order badge: ranked accounts show their 1-based position (#1 = most
     // preferred). While ordering, unranked accounts are labelled "auto" so the
@@ -1069,27 +1082,24 @@ export class TUI {
     // never disrupts the fixed-width columns / quota bars.
     const rank = this._rankOf(a);
     if (rank != null) line += `  ${dim('#' + rank)}`;
-    else if (this.mode === 'order') line += `  ${dim('auto')}`;
+    else if (this.mode === 'order') line += `  ${dim(t.auto)}`;
     return line;
   }
 
   _renderFooter() {
+    const f = this.text.footer;
     switch (this.mode) {
       case 'normal': {
         const selected = this._selected();
-        const reauth = this._canReauthenticate(selected)
-          ? `  ${red('재인증 필요')} [${bold('r')}]`
-          : '';
-        return ` ${dim('↑↓')} select  ${bold('s')}witch  ${bold('e')}toggle  ${bold('o')}rder  ${bold('d')}elete${reauth}  ${bold('a')}dd  ${bold('R')}eload  ${bold('q')}uit`;
+        const reauth = this._canReauthenticate(selected) ? f.reauth(bold, red) : '';
+        return f.normal(bold, dim, reauth);
       }
       case 'select':
-        return ` ${dim('↑↓')} select  ${bold('Enter')} delete  ${bold('Esc')} cancel`;
+        return f.select(bold, dim);
       case 'order':
-        return ` ${dim('↑↓')} move (up = preferred)  ${bold('a')}uto-all (reset order, weekly-reset)  ${bold('c')}lear rank  ${bold('Enter')}/${bold('Esc')} done`;
+        return f.order(bold, dim);
       case 'add':
-        return this.config.provider === 'codex'
-          ? ` ${bold('i')}mport Codex login  ${bold('Esc')} cancel`
-          : ` ${bold('i')}mport Claude Code  ${bold('k')} API key  ${bold('Esc')} cancel`;
+        return this.config.provider === 'codex' ? f.addCodex(bold) : f.addClaude(bold);
       case 'input':
         return ` ${this.inputPrompt}: ${this.inputBuf}█`;
       default:

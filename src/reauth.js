@@ -1,3 +1,5 @@
+import { tuiText } from './tui-i18n.js';
+
 function matchingTargetIndexes(accounts, name, expectedAccountUuid) {
   if (expectedAccountUuid) {
     return accounts.map((account, index) => ({ account, index }))
@@ -198,7 +200,8 @@ export function reauthenticateTuiAccount(tui, account) {
   const previousConfig = configAccount ? { ...configAccount } : null;
 
   account._reauthenticating = true;
-  tui._addLog(`Re-authentication required for "${account.name}" — opening login...`);
+  const msg = (tui.text || tuiText()).msg;
+  tui._addLog(msg.reauthStart(account.name));
 
   const run = async () => {
     if (wasRunning) tui.stop();
@@ -252,7 +255,7 @@ export function reauthenticateTuiAccount(tui, account) {
           || persisted.expiresAt !== credentials.expiresAt) {
         throw new Error('re-authenticated account was not persisted');
       }
-      tui._addLog(`Re-authenticated "${account.name}" successfully`);
+      tui._addLog(msg.reauthDone(account.name));
     } catch (e) {
       account.credential = previousLive.credential;
       account.refreshToken = previousLive.refreshToken;
@@ -272,7 +275,7 @@ export function reauthenticateTuiAccount(tui, account) {
         Object.keys(configAccount).forEach(key => delete configAccount[key]);
         Object.assign(configAccount, previousConfig);
       }
-      tui._addLog(`Re-authentication failed for "${account.name}": ${e.message}`);
+      tui._addLog(msg.reauthFailed(account.name, e.message));
     } finally {
       delete account._reauthenticating;
       if (wasRunning) tui.start();

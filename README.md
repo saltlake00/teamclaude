@@ -472,6 +472,10 @@ If the configured port is already in use — for example another TeamClaude prox
 
 In selection mode, use `j`/`k` or arrow keys to navigate, `Enter` to confirm, `Esc` to cancel.
 
+#### Dashboard language
+
+The TUI is English by default. Set `TEAMCLAUDE_LANG=ko` (or `"language": "ko"` in the config) to show the account statuses, bar labels, key hints and the dashboard's own activity messages in Korean. The environment variable wins over the config key. Server log lines and `teamclaude status` keep their own wording.
+
 ### Stop / restart the server
 
 ```bash

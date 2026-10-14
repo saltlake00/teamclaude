@@ -2,6 +2,10 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
 import { TUI, displayWidth, fitLine } from '../src/tui.js';
+import { resolveTuiLanguage, tuiText } from '../src/tui-i18n.js';
+
+// The English assertions below must not depend on the developer's shell.
+delete process.env.TEAMCLAUDE_LANG;
 
 const maxFixture = (name, overrides = {}) => ({
   name,
@@ -422,4 +426,91 @@ test('TUI "e" toggle disables/enables the selected account and persists it', asy
   await tui._doToggleEnabled(0);
   assert.equal(am.accounts[0].enabled, true, 'toggled back on');
   assert.equal(config.accounts[0].enabled, true);
+});
+
+// ── display language (TEAMCLAUDE_LANG / config.language) ─────────────────────
+
+test('TUI language: English by default, TEAMCLAUDE_LANG wins over config.language', () => {
+  assert.equal(resolveTuiLanguage({}, {}), 'en');
+  assert.equal(resolveTuiLanguage(null, {}), 'en');
+  assert.equal(resolveTuiLanguage({ language: 'ko' }, {}), 'ko');
+  assert.equal(resolveTuiLanguage({}, { TEAMCLAUDE_LANG: 'ko-KR' }), 'ko');
+  assert.equal(resolveTuiLanguage({ language: 'ko' }, { TEAMCLAUDE_LANG: 'en' }), 'en');
+  assert.equal(resolveTuiLanguage({ language: 'ko' }, { TEAMCLAUDE_LANG: '' }), 'ko');
+  assert.equal(resolveTuiLanguage({ language: 'fr' }, {}), 'en');
+});
+
+test('TUI constructor picks Korean text from config.language', () => {
+  const am = new AccountManager([apiFixture('a0')], 0.98, 0, 5);
+  const tui = new TUI({ accountManager: am, config: { accounts: [], language: 'ko' }, saveConfig: async () => {}, syncAccounts: async () => 0, onQuit: () => {} });
+  assert.equal(tui.text.lang, 'ko');
+  assert.match(tui._renderFooter(), /종료/);
+});
+
+test('Korean footer with the reauthentication hint fits 80 columns', () => {
+  const am = new AccountManager([{ name: 'a0', type: 'oauth', provider: 'codex', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 }], 0.98, 0, 5);
+  const tui = new TUI({ accountManager: am, config: { accounts: [] }, saveConfig: async () => {}, syncAccounts: async () => 0, onQuit: () => {} });
+  tui.text = tuiText('ko');
+  am.accounts[0].status = 'error';
+  am.accounts[0].errorReason = 'auth-revoked';
+  const footer = tui._renderFooter();
+  assert.match(footer, /재인증 필요/);
+  assert.ok(displayWidth(footer) <= 80, `footer is ${displayWidth(footer)} columns`);
+  assert.match(fitLine(footer, 80), /q.*종료/);
+});
+
+function renderFrame(tui, cols, rows = 20) {
+  const out = process.stdout;
+  const saved = {
+    write: out.write,
+    columns: Object.getOwnPropertyDescriptor(out, 'columns'),
+    rows: Object.getOwnPropertyDescriptor(out, 'rows'),
+  };
+  let frame = '';
+  Object.defineProperty(out, 'columns', { value: cols, configurable: true });
+  Object.defineProperty(out, 'rows', { value: rows, configurable: true });
+  out.write = s => { frame = String(s); return true; };
+  try {
+    tui.running = true;
+    tui.render();
+  } finally {
+    tui.running = false;
+    out.write = saved.write;
+    for (const key of ['columns', 'rows']) {
+      if (saved[key]) Object.defineProperty(out, key, saved[key]);
+      else delete out[key];
+    }
+  }
+  return frame.replace(/^\x1b\[H/, '').split('\r\n');
+}
+
+test('Korean account rows keep the English row width (wider labels shrink the bars)', () => {
+  const now = Date.now();
+  const make = lang => {
+    const am = new AccountManager([
+      maxFixture('alice', { priority: 0 }),
+      apiFixture('api-1'),
+    ], 0.98, 0, 5);
+    Object.assign(am.accounts[0].quota, {
+      unified5h: 0.4, unified5hReset: now + 3600_000,
+      unified7d: 0.6, unified7dReset: now + 86_400_000,
+      modelWeekly: { '7d_oi': { utilization: 0.3, reset: now + 86_400_000 } },
+    });
+    const tui = new TUI({ accountManager: am, config: { accounts: [] }, saveConfig: async () => {}, syncAccounts: async () => 0, onQuit: () => {} });
+    tui.text = tuiText(lang);
+    return tui;
+  };
+  // At 70 columns the bars already sit at their 5-column floor, so the Korean
+  // row is 2 columns wider there; it must still fit.
+  for (const cols of [60, 70, 80, 92, 110]) {
+    const rowOf = lang => renderFrame(make(lang), cols).find(line => line.includes('alice'));
+    const en = rowOf('en');
+    const ko = rowOf('ko');
+    assert.match(ko, /세션/, `${cols} cols: Korean session label`);
+    assert.match(ko, /#1/, `${cols} cols: rank badge survives in Korean`);
+    assert.ok(displayWidth(ko.trimEnd()) <= cols, `${cols} cols: Korean row fits`);
+    if (cols !== 70) {
+      assert.equal(displayWidth(ko.trimEnd()), displayWidth(en.trimEnd()), `${cols} cols: row width`);
+    }
+  }
 });
