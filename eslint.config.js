@@ -18,6 +18,16 @@ export default [
       },
     },
   },
+  // The web dashboard bootstrap runs in the browser (served by src/dashboard.js).
+  {
+    files: ['src/dashboard-client.js'],
+    languageOptions: {
+      globals: {
+        document: 'readonly',
+        location: 'readonly',
+      },
+    },
+  },
   {
     languageOptions: {
       ecmaVersion: 2022,

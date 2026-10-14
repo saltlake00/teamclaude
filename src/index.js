@@ -2,7 +2,7 @@
 
 import { fork, spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { readFileSync, readdirSync, realpathSync, unlinkSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, realpathSync, unlinkSync } from 'node:fs';
 import http from 'node:http';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -74,6 +74,8 @@ import {
   unhealthyWorkerAction,
 } from './worker-health.js';
 import { installClaudeWrapper, uninstallClaudeWrapper } from './claude-wrapper.js';
+import { createDashboard, DASHBOARD_PATH, DASHBOARD_SESSION_PATH } from './dashboard.js';
+import { resolveTuiLanguage } from './tui-i18n.js';
 
 const SUPERVISED_WORKER_ENV = 'TEAMCLAUDE_SUPERVISED_WORKER';
 const SUPERVISOR_PID_ENV = 'TEAMCLAUDE_SUPERVISOR_PID';
@@ -223,6 +225,9 @@ switch (command) {
   case 'status':
     await statusCommand();
     process.exitCode = 0;
+    break;
+  case 'dashboard':
+    await dashboardCommand();
     break;
   case 'accounts':
     await accountsCommand();
@@ -509,6 +514,28 @@ async function superviseServerCommand() {
     return true;
   }
 
+  // Read-only web dashboard. The page never holds the proxy key: the supervisor
+  // adds it here when a valid dashboard session asks for the named snapshot.
+  async function fetchDashboardStatus(identity) {
+    if (!workerReady || !workerPort) throw new Error('Proxy worker is restarting.');
+    const response = await fetch(`http://127.0.0.1:${workerPort}/teamclaude/status`, {
+      headers: identity
+        ? { 'x-api-key': proxyApiKey, 'x-teamcodex-status-identity': '1' }
+        : {},
+      signal: AbortSignal.timeout(5_000),
+    });
+    if (!response.ok) throw new Error(`Worker status returned ${response.status}`);
+    return response.json();
+  }
+  const dashboard = createDashboard({
+    port,
+    proxyApiKey,
+    lifecycleId,
+    lifecycleHeader: LIFECYCLE_ID_HEADER,
+    language: resolveTuiLanguage(config),
+    fetchStatus: fetchDashboardStatus,
+  });
+
   const listener = http.createServer((req, res) => {
     const clientKey = req.headers['x-api-key'];
     const authorization = req.headers.authorization;
@@ -525,6 +552,7 @@ async function superviseServerCommand() {
     if (consumeDeploymentDrain(req, res, isLocal)) return;
     if (consumeAccountReload(req, res, isLocal)) return;
     if (consumeCodexRecoveryReceipt(req, res, isLocal)) return;
+    if (dashboard.handle(req, res, isLocal)) return;
     if (hasRecoveryMarker && recoveryAccountUuid == null) {
       rejectPublicRequest(req, res, 403, { 'content-type': 'application/json' }, {
         type: 'error',
@@ -3444,6 +3472,79 @@ async function requestAccountReload(port, state, config) {
   }
 }
 
+// ── dashboard ───────────────────────────────────────────────
+
+/**
+ * Open the read-only web dashboard. The proxy key stays in this process: it
+ * mints a 60 s single-use code that the page trades for a session cookie.
+ * `--print` prints the one-time URL instead of opening a window.
+ */
+async function dashboardCommand() {
+  const config = await loadOrCreateConfig();
+  const running = await findRunningServer(config);
+  if (!running) {
+    console.error(`No running proxy on port ${config.proxy.port}.`);
+    console.error('Start it with:  teamcodex server');
+    process.exitCode = 1;
+    return;
+  }
+  const state = await readServerState();
+  let code;
+  try {
+    const res = await fetch(`http://127.0.0.1:${running.port}${DASHBOARD_SESSION_PATH}`, {
+      method: 'POST',
+      headers: {
+        'x-api-key': config.proxy.apiKey,
+        [LIFECYCLE_ID_HEADER]: state?.lifecycle?.id ?? '',
+        'content-length': '0',
+      },
+      signal: AbortSignal.timeout(configuredStatusProbeTimeoutMs(5_000)),
+    });
+    if (res.status === 404) {
+      throw new Error('the running server has no dashboard yet; restart it with: teamcodex restart');
+    }
+    if (res.status !== 200) {
+      const body = await res.text().catch(() => '');
+      throw new Error(`dashboard session request returned ${res.status} ${body}`.trim());
+    }
+    ({ code } = await res.json());
+  } catch (err) {
+    console.error(`Could not open the dashboard: ${err.message}`);
+    process.exitCode = 1;
+    return;
+  }
+  const pageUrl = `http://127.0.0.1:${running.port}${DASHBOARD_PATH}`;
+  const url = `${pageUrl}?code=${encodeURIComponent(code)}`;
+  if (args.includes('--print')) {
+    console.log(url);
+    return;
+  }
+  openDashboardWindow(url);
+  console.log(`Dashboard: ${pageUrl}`);
+}
+
+/** Prefer an Edge app window (no address bar) on Windows; else the default browser. */
+function openDashboardWindow(url) {
+  const launch = (cmd, cmdArgs) => {
+    const child = spawn(cmd, cmdArgs, { detached: true, stdio: 'ignore' });
+    child.on('error', err => console.error(`Could not launch ${cmd}: ${err.message}
+Open ${url} within 60 seconds.`));
+    child.unref();
+  };
+  if (process.platform === 'win32') {
+    const edge = [process.env['ProgramFiles(x86)'], process.env.ProgramFiles, process.env.LOCALAPPDATA]
+      .filter(Boolean)
+      .map(base => join(base, 'Microsoft', 'Edge', 'Application', 'msedge.exe'))
+      .find(candidate => existsSync(candidate));
+    if (edge) launch(edge, [`--app=${url}`]);
+    else launch('rundll32', ['url.dll,FileProtocolHandler', url]);
+  } else if (process.platform === 'darwin') {
+    launch('open', [url]);
+  } else {
+    launch('xdg-open', [url]);
+  }
+}
+
 async function setEnabledCommand(enabled) {
   const name = args[1];
   if (!name) {
@@ -3563,6 +3664,7 @@ Commands:
   resume [ID]         Resume the exact ID, or the current cmux tab checkpoint
   env                 Print an equivalent Codex launch command
   status              Show proxy & account status
+  dashboard [--print] Open the read-only web dashboard (--print: print the URL)
   accounts            List configured Codex accounts
   reauth <name>       Re-authenticate one existing OAuth account
   subscription cancel Track a cancelled subscription without disabling it
@@ -3602,6 +3704,8 @@ Commands:
   env                 Print env vars to use with Claude
   run [-- args...]    Run Claude Code through the proxy
   status              Show proxy & account status (live)
+  dashboard [--print] Open the read-only web dashboard in an app window
+                      (--print: print the one-time URL instead)
   accounts            List configured accounts
   reauth <name>       Re-authenticate one existing OAuth account
   remove <name>       Remove an account
