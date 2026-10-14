@@ -118,6 +118,9 @@ test('status discovers a running server from the state PID when lsof is unavaila
   const dir = await mkdtemp(join(tmpdir(), 'teamcodex-lsof-fallback-'));
   const bin = join(dir, 'bin');
   await mkdir(bin);
+  // Windows never runs lsof (lsofPid uses netstat there), so this fake is not exercised on
+  // win32 and the test only proves status discovery works. The state-PID fallback itself is
+  // covered on macOS/Linux.
   const fakeLsof = join(bin, 'lsof');
   await writeFile(fakeLsof, '#!/bin/sh\nexit 127\n');
   await chmod(fakeLsof, 0o755);

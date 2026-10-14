@@ -9,6 +9,7 @@ import { once } from 'node:events';
 import { spawn, spawnSync } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
 import { buildClaudeRecoveryEnv } from '../src/claude-auth.js';
+import { fakeCliPath, fakeClaudeEnv, pathWith } from './helpers/fake-cli.js';
 
 const entry = fileURLToPath(new URL('../src/index.js', import.meta.url));
 
@@ -732,7 +733,7 @@ test('supervisor preserves worker session affinity for a public keep-alive conne
 test('teamclaude run starts a missing proxy before launching Claude Code', { timeout: 15000 }, async t => {
   const dir = await mkdtemp(join(tmpdir(), 'teamclaude-run-autostart-'));
   const configPath = join(dir, 'config.json');
-  const fakeClaude = join(dir, 'claude');
+  const fakeClaude = fakeCliPath(dir, 'claude');
   const port = await unusedPort();
   await writeFile(fakeClaude, `#!/usr/bin/env node
 const response = await fetch(process.env.ANTHROPIC_BASE_URL + '/teamclaude/status');
@@ -749,7 +750,8 @@ console.log(JSON.stringify({ ok: response.ok, accounts: body.accounts.length }))
 
   const env = {
     ...process.env,
-    PATH: `${dir}:${process.env.PATH}`,
+    PATH: pathWith(dir),
+    ...fakeClaudeEnv(fakeClaude),
     TEAMCLAUDE_PROVIDER: 'anthropic',
     TEAMCLAUDE_CONFIG: configPath,
   };
