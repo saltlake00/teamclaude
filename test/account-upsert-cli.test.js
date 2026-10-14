@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
+import { fakeCliPath } from './helpers/fake-cli.js';
 
 const entry = fileURLToPath(new URL('../src/index.js', import.meta.url));
 
@@ -20,11 +21,15 @@ async function codexFixture() {
       accessToken: 'old', refreshToken: 'old-r', expiresAt: 1, enabled: false, priority: 2,
     }],
   }), { mode: 0o600 });
-  const fakeCodex = join(dir, 'codex');
+  const fakeCodex = fakeCliPath(dir, 'codex');
   await writeFile(fakeCodex, [
-    '#!/bin/sh',
-    'mkdir -p "$CODEX_HOME"',
-    `printf '%s' '{"tokens":{"access_token":"fresh","refresh_token":"fresh-r","account_id":"acct-parked"}}' > "$CODEX_HOME/auth.json"`,
+    '#!/usr/bin/env node',
+    "const fs = require('node:fs');",
+    "const path = require('node:path');",
+    'fs.mkdirSync(process.env.CODEX_HOME, { recursive: true });',
+    "fs.writeFileSync(path.join(process.env.CODEX_HOME, 'auth.json'), JSON.stringify({",
+    "  tokens: { access_token: 'fresh', refresh_token: 'fresh-r', account_id: 'acct-parked' },",
+    '}));',
     '',
   ].join('\n'));
   await chmod(fakeCodex, 0o755);

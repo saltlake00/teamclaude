@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fakeCliPath } from './helpers/fake-cli.js';
 import { applyReauthToConfig, findReauthTarget, reauthenticateAccount } from '../src/reauth.js';
 import { AccountManager } from '../src/account-manager.js';
 import { TUI } from '../src/tui.js';
@@ -285,7 +286,7 @@ test('teamcodex codex reauth rejects a provider-less legacy config before OAuth'
 test('teamcodex codex reauth runs isolated official login and updates only the pinned account', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'teamcodex-reauth-cli-'));
   const configPath = join(dir, 'teamcodex.json');
-  const fakeCodex = join(dir, 'codex');
+  const fakeCodex = fakeCliPath(dir, 'codex');
   const jwt = payload => `header.${Buffer.from(JSON.stringify(payload)).toString('base64url')}.signature`;
   const auth = {
     auth_mode: 'chatgpt',
@@ -326,7 +327,14 @@ test('teamcodex codex reauth runs isolated official login and updates only the p
   };
   try {
     await writeFile(configPath, JSON.stringify(config, null, 2));
-    await writeFile(fakeCodex, `#!/bin/sh\nmkdir -p "$CODEX_HOME"\nprintf '%s\\n' '${JSON.stringify(auth)}' > "$CODEX_HOME/auth.json"\n`);
+    await writeFile(fakeCodex, [
+      '#!/usr/bin/env node',
+      "const fs = require('node:fs');",
+      "const path = require('node:path');",
+      'fs.mkdirSync(process.env.CODEX_HOME, { recursive: true });',
+      `fs.writeFileSync(path.join(process.env.CODEX_HOME, 'auth.json'), JSON.stringify(${JSON.stringify(auth)}));`,
+      '',
+    ].join('\n'));
     await chmod(fakeCodex, 0o700);
     const result = spawnSync(process.execPath, [
       entry, 'codex', 'reauth', 'codex@example.com',
