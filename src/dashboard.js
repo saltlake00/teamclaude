@@ -15,6 +15,10 @@
 //   POST /teamclaude/dashboard/action       one account control (enable, disable,
 //                                           up, down, auto, switch), relayed to
 //                                           the worker
+//   GET  /teamclaude/dashboard/autostart    Windows logon-task state (named page)
+//   POST /teamclaude/dashboard/autostart    { enabled, dashboard? } — same write
+//                                           guards as the action route; run by
+//                                           the supervisor itself (Windows only)
 //
 // The proxy API key never reaches the browser: `teamclaude dashboard` reads it
 // from the config file, mints a 60 s single-use code, and opens the page with
@@ -39,6 +43,7 @@ export const DASHBOARD_PATH = '/teamclaude/dashboard';
 export const DASHBOARD_SESSION_PATH = `${DASHBOARD_PATH}/session`;
 export const DASHBOARD_STATUS_PATH = `${DASHBOARD_PATH}/status`;
 export const DASHBOARD_ACTION_PATH = `${DASHBOARD_PATH}/action`;
+export const DASHBOARD_AUTOSTART_PATH = `${DASHBOARD_PATH}/autostart`;
 export const DASHBOARD_CSRF_HEADER = 'x-teamclaude-csrf';
 export const DASHBOARD_ACTIONS = Object.freeze(['enable', 'disable', 'up', 'down', 'auto', 'switch']);
 const MAX_ACTION_BODY_BYTES = 1024;
@@ -107,10 +112,11 @@ function rejectWithBody(req, res, statusCode, message, extra = {}) {
   sendJson(res, statusCode, { error: { type: 'permission_error', message } }, { connection: 'close', ...extra });
 }
 
+// Same shape and colour as assets/teamclaude.ico (scripts/make-icon.js).
 const FAVICON = 'data:image/svg+xml,'
   + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">'
-    + '<rect width="32" height="32" rx="8" fill="#c96442"/>'
-    + '<path d="M16 6v20M6 16h20M9 9l14 14M23 9L9 23" stroke="#fff" stroke-width="3" stroke-linecap="round"/></svg>');
+    + '<rect width="32" height="32" rx="8" fill="#3b4cca"/>'
+    + '<path d="M16 6v20M7.34 11l17.32 10M7.34 21l17.32-10" stroke="#fff" stroke-width="3.6" stroke-linecap="round"/></svg>');
 
 const STYLE = `
 :root {
@@ -147,7 +153,7 @@ body {
 main { max-width: 1040px; margin: 0 auto; padding: 20px 24px 32px; }
 .top { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
 .brand { display: flex; align-items: center; gap: 10px; font-size: 20px; font-weight: 600; letter-spacing: -0.01em; }
-.brand-mark { width: 26px; height: 26px; border-radius: 7px; background: var(--accent); display: grid; place-items: center; color: #fff; font-size: 16px; }
+.brand-mark { width: 26px; height: 26px; display: block; }
 .meta { display: flex; align-items: center; gap: 14px; color: var(--muted); font-size: 13px; flex-wrap: wrap; }
 .meta .sep { margin: 0 6px; opacity: .6; }
 .conn::before { content: ""; display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); margin-right: 6px; vertical-align: 1px; }
@@ -237,6 +243,21 @@ dialog::backdrop { background: rgba(20, 20, 19, .45); }
 dialog h3 { margin: 0 0 8px; font-size: 16px; }
 dialog p { margin: 0 0 18px; color: var(--muted); font-size: 13.5px; }
 dialog .row { display: flex; justify-content: flex-end; gap: 8px; }
+.settings { padding: 12px 16px; display: grid; gap: 10px; }
+.setting { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.setting-text { display: grid; gap: 2px; flex: 1 1 260px; }
+.setting-title { font-weight: 600; font-size: 14px; }
+.setting-sub { color: var(--muted); font-size: 12.5px; }
+.setting-sub.warn { color: var(--warn); }
+.setting-sub.err { color: var(--crit); }
+.setting.child { padding-left: 18px; }
+.setting.child .setting-title { font-weight: 500; }
+.switch { appearance: none; -webkit-appearance: none; width: 38px; height: 22px; border-radius: 11px; background: var(--track); border: 1px solid var(--border); position: relative; cursor: pointer; flex: none; margin: 0; transition: background .15s; }
+.switch::after { content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.25); transition: left .15s; }
+.switch:checked { background: var(--ok); border-color: var(--ok); }
+.switch:checked::after { left: 18px; }
+.switch:disabled { opacity: .5; cursor: default; }
+.switch:focus-visible { outline: 2px solid var(--info); outline-offset: 2px; }
 @media (max-width: 720px) {
   main { padding: 16px; }
   .summary { grid-template-columns: 1fr; }
@@ -261,7 +282,7 @@ export function dashboardHtml(lang) {
 <body>
 <main>
   <header class="top">
-    <div class="brand"><span class="brand-mark" aria-hidden="true">✳</span>${escapeHtml(text.title)}</div>
+    <div class="brand"><img class="brand-mark" src="${FAVICON}" alt="">${escapeHtml(text.title)}</div>
     <div class="meta"><span id="host"></span><span id="conn" class="conn">${escapeHtml(text.connecting)}</span></div>
   </header>
   <div id="notice" class="notice" hidden></div>
@@ -273,6 +294,10 @@ export function dashboardHtml(lang) {
   <section class="panel">
     <h2>${escapeHtml(text.activity)}</h2>
     <ol id="activity" class="activity"></ol>
+  </section>
+  <section id="settings" class="panel" hidden>
+    <h2>${escapeHtml(text.autostart.heading)}</h2>
+    <div id="autostart" class="card settings"></div>
   </section>
 </main>
 <dialog id="confirm" aria-labelledby="confirm-title">
@@ -299,6 +324,9 @@ export function dashboardHtml(lang) {
  * @param {(request: { action: string, accountUuid: string|null, name: string|null })
  *   => Promise<{ statusCode: number, body: object }>} [opts.controlAccount]
  *   runs one account control in the worker; without it the action route is 404
+ * @param {{ read: () => Promise<object>, set: (o: { enabled: boolean, dashboard: boolean })
+ *   => Promise<object> }} [opts.autostart] the Windows logon task (src/autostart.js);
+ *   without it the autostart route is 404 and the page shows no switch
  * @param {() => number} [opts.now]
  */
 export function createDashboard({
@@ -309,6 +337,7 @@ export function createDashboard({
   language = 'en',
   fetchStatus,
   controlAccount = null,
+  autostart = null,
   now = Date.now,
 }) {
   const codes = new Map(); // code -> expiresAt
@@ -393,6 +422,40 @@ export function createDashboard({
     });
   }
 
+  /**
+   * Every check a dashboard write must pass (see the header comment). Answers
+   * the refusal itself and returns false; true means the body may be read.
+   */
+  function writeAllowed(req, res) {
+    if (!sameOriginWrite(req)) {
+      rejectWithBody(req, res, 403, 'Dashboard actions must come from the dashboard page itself.');
+      return false;
+    }
+    const session = sessionOf(req);
+    if (!session) {
+      rejectWithBody(req, res, 403, 'No dashboard session. Open the window again with `teamclaude dashboard`.',
+        { 'x-teamclaude-reason': 'session' });
+      return false;
+    }
+    if (!safeEqual(req.headers[DASHBOARD_CSRF_HEADER], session.csrf)) {
+      rejectWithBody(req, res, 403, 'Missing or wrong dashboard CSRF token.');
+      return false;
+    }
+    const type = String(req.headers['content-type'] || '').split(';', 1)[0].trim().toLowerCase();
+    if (type !== 'application/json') {
+      rejectWithBody(req, res, 415, 'Dashboard actions are JSON.');
+      return false;
+    }
+    return true;
+  }
+
+  function sendUnavailable(res, err) {
+    if (res.destroyed || res.headersSent) return;
+    sendJson(res, 503, {
+      error: { type: 'overloaded_error', message: err?.message || 'Proxy worker unavailable' },
+    }, { 'retry-after': '1' });
+  }
+
   function handleAction(req, res) {
     if (req.method !== 'POST') {
       rejectWithBody(req, res, 405, 'Dashboard actions are POST requests.', { allow: 'POST' });
@@ -402,25 +465,7 @@ export function createDashboard({
       rejectWithBody(req, res, 404, 'Account controls are not available.');
       return;
     }
-    if (!sameOriginWrite(req)) {
-      rejectWithBody(req, res, 403, 'Dashboard actions must come from the dashboard page itself.');
-      return;
-    }
-    const session = sessionOf(req);
-    if (!session) {
-      rejectWithBody(req, res, 403, 'No dashboard session. Open the window again with `teamclaude dashboard`.',
-        { 'x-teamclaude-reason': 'session' });
-      return;
-    }
-    if (!safeEqual(req.headers[DASHBOARD_CSRF_HEADER], session.csrf)) {
-      rejectWithBody(req, res, 403, 'Missing or wrong dashboard CSRF token.');
-      return;
-    }
-    const type = String(req.headers['content-type'] || '').split(';', 1)[0].trim().toLowerCase();
-    if (type !== 'application/json') {
-      rejectWithBody(req, res, 415, 'Dashboard actions are JSON.');
-      return;
-    }
+    if (!writeAllowed(req, res)) return;
     readSmallBody(req, MAX_ACTION_BODY_BYTES).then(raw => {
       let parsed;
       try {
@@ -448,9 +493,67 @@ export function createDashboard({
         rejectWithBody(req, res, 413, 'Dashboard action body is too large.');
         return;
       }
-      sendJson(res, 503, {
-        error: { type: 'overloaded_error', message: err?.message || 'Proxy worker unavailable' },
-      }, { 'retry-after': '1' });
+      sendUnavailable(res, err);
+    });
+  }
+
+  function sendAutostartFailure(res, err) {
+    if (res.destroyed || res.headersSent) return;
+    sendJson(res, 500, { error: { type: 'api_error', reason: 'autostart', message: err?.message || 'Task Scheduler failed' } });
+  }
+
+  /**
+   * GET: the logon-task state, for a named page only (it reveals local paths
+   * nowhere, but turning it on is a write, so the switch belongs to the same
+   * pages that may act). POST { enabled, dashboard? }: the write guards above.
+   */
+  function handleAutostart(req, res) {
+    if (!autostart) {
+      rejectWithBody(req, res, 404, 'Autostart is not available on this platform.');
+      return;
+    }
+    if (req.method === 'GET') {
+      if (crossSite(req)) {
+        rejectWithBody(req, res, 403, 'Cross-site dashboard reads are refused.');
+        return;
+      }
+      if (!sessionOf(req)) {
+        rejectWithBody(req, res, 403, 'No dashboard session. Open the window again with `teamclaude dashboard`.',
+          { 'x-teamclaude-reason': 'session' });
+        return;
+      }
+      autostart.read().then(state => {
+        if (!res.destroyed) sendJson(res, 200, state);
+      }, err => sendAutostartFailure(res, err));
+      return;
+    }
+    if (req.method !== 'POST') {
+      rejectWithBody(req, res, 405, 'Autostart is read with GET and changed with POST.', { allow: 'GET, POST' });
+      return;
+    }
+    if (!writeAllowed(req, res)) return;
+    readSmallBody(req, MAX_ACTION_BODY_BYTES).then(raw => {
+      let parsed;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        parsed = null;
+      }
+      if (typeof parsed?.enabled !== 'boolean'
+          || (parsed.dashboard !== undefined && typeof parsed.dashboard !== 'boolean')) {
+        sendJson(res, 400, { error: { type: 'invalid_request_error', message: 'Expected { enabled: boolean, dashboard?: boolean }.' } });
+        return null;
+      }
+      return autostart.set({ enabled: parsed.enabled, dashboard: parsed.dashboard === true }).then(state => {
+        if (!res.destroyed) sendJson(res, 200, state);
+      }, err => sendAutostartFailure(res, err));
+    }).catch(err => {
+      if (res.destroyed || res.headersSent) return;
+      if (err?.tooLarge) {
+        rejectWithBody(req, res, 413, 'Dashboard action body is too large.');
+        return;
+      }
+      sendUnavailable(res, err);
     });
   }
 
@@ -500,6 +603,11 @@ export function createDashboard({
       return true;
     }
 
+    if (path === DASHBOARD_AUTOSTART_PATH) {
+      handleAutostart(req, res);
+      return true;
+    }
+
     if (req.method !== 'GET' && req.method !== 'HEAD') {
       rejectWithBody(req, res, 405, 'The dashboard is read-only.', { allow: 'GET, HEAD' });
       return true;
@@ -543,6 +651,7 @@ export function createDashboard({
         const dashboard = { identity, port };
         // Only a named page can act, and it proves that with this token.
         if (session && controlAccount) dashboard.csrf = session.csrf;
+        if (session && autostart) dashboard.autostart = true;
         const body = { ...status, dashboard };
         // The lifecycle id fences deployment/reload control; the page never needs it.
         delete body.lifecycleId;

@@ -2,7 +2,19 @@
 
 import { fork, spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, readFileSync, readdirSync, realpathSync, unlinkSync } from 'node:fs';
+import {
+  appendFileSync,
+  closeSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+} from 'node:fs';
 import http from 'node:http';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -77,6 +89,14 @@ import {
 import { installClaudeWrapper, uninstallClaudeWrapper } from './claude-wrapper.js';
 import { createDashboard, DASHBOARD_PATH, DASHBOARD_SESSION_PATH } from './dashboard.js';
 import { resolveTuiLanguage } from './tui-i18n.js';
+import {
+  AUTOSTART_LAUNCH_WAIT_MS,
+  AUTOSTART_LOG_MAX_BYTES,
+  autostartLogPath,
+  autostartSupported,
+  createAutostart,
+} from './autostart.js';
+import { buildShortcutSpec, runShortcutScript, SHORTCUT_FOLDERS } from './shortcut.js';
 
 const SUPERVISED_WORKER_ENV = 'TEAMCLAUDE_SUPERVISED_WORKER';
 const SUPERVISOR_PID_ENV = 'TEAMCLAUDE_SUPERVISOR_PID';
@@ -229,6 +249,12 @@ switch (command) {
     break;
   case 'dashboard':
     await dashboardCommand();
+    break;
+  case 'autostart':
+    await autostartCommand();
+    break;
+  case 'shortcut':
+    await shortcutCommand();
     break;
   case 'accounts':
     await accountsCommand();
@@ -568,6 +594,9 @@ async function superviseServerCommand() {
     language: resolveTuiLanguage(config),
     fetchStatus: fetchDashboardStatus,
     controlAccount: requestAccountControl,
+    // The supervisor runs as the logged-in user, so it can (un)register that
+    // user's logon task itself; the worker is not involved.
+    autostart: autostartSupported() ? autostartForThisRuntime() : null,
   });
 
   const listener = http.createServer((req, res) => {
@@ -1129,6 +1158,10 @@ async function superviseServerCommand() {
     };
     const child = fork(process.argv[1], ['server'], {
       env: childEnv,
+      // A supervisor started in the background (autostart, `run`) has no
+      // console, so Windows would give the worker a new visible one. Only the
+      // TUI needs the worker on the terminal, and it runs only on a TTY.
+      windowsHide: !(process.stdout.isTTY && process.stdin.isTTY),
       stdio: ['inherit', 'inherit', 'inherit', 'ipc'],
     });
     worker = child;
@@ -1918,12 +1951,25 @@ function isExpectedServerIdentity(identity, { worker = false, supervisorPid = nu
   return identity.ppid > 0;
 }
 
+/**
+ * The same config file, however it was spelled: `C:/x/cfg.json` from one
+ * shell and `C:\x\cfg.json` from a logon task name one file, and Windows paths
+ * are case-insensitive. A plain string compare refused to stop a server the
+ * autostart launcher had started with the other spelling.
+ */
+function sameConfigPath(recorded, current) {
+  if (typeof recorded !== 'string' || typeof current !== 'string') return false;
+  const a = resolve(recorded);
+  const b = resolve(current);
+  return process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+
 function verifyLifecycleState(state, ownerPid, port) {
   if (!state?.lifecycle || state.lifecycle.version !== 1
       || typeof state.lifecycle.id !== 'string' || state.lifecycle.id.length < 16) {
     return { ok: false, reason: 'unverified-lifecycle' };
   }
-  if (state.pid !== ownerPid || state.port !== port || state.config !== getConfigPath()) {
+  if (state.pid !== ownerPid || state.port !== port || !sameConfigPath(state.config, getConfigPath())) {
     return { ok: false, reason: 'unverified-lifecycle' };
   }
   const supervisor = readProcessIdentity(state.pid);
@@ -2110,7 +2156,7 @@ async function findRunningServer(
   return null;
 }
 
-async function ensureProxyRunning(config, maxWaitMs = 15_000) {
+async function ensureProxyRunning(config, maxWaitMs = 15_000, { logFd = null } = {}) {
   const running = await findRunningServer(config);
   if (running) return running;
 
@@ -2124,7 +2170,7 @@ async function ensureProxyRunning(config, maxWaitMs = 15_000) {
     // A detached child gets its own console window on Windows unless hidden.
     windowsHide: true,
     env: daemonEnv,
-    stdio: 'ignore',
+    stdio: logFd == null ? 'ignore' : ['ignore', logFd, logFd],
   });
   daemon.once('error', err => { launchError = err; });
   daemon.unref();
@@ -3561,39 +3607,44 @@ async function dashboardCommand() {
     process.exitCode = 1;
     return;
   }
-  const state = await readServerState();
-  let code;
+  let urls;
   try {
-    const res = await fetch(`http://127.0.0.1:${running.port}${DASHBOARD_SESSION_PATH}`, {
-      method: 'POST',
-      headers: {
-        'x-api-key': config.proxy.apiKey,
-        [LIFECYCLE_ID_HEADER]: state?.lifecycle?.id ?? '',
-        'content-length': '0',
-      },
-      signal: AbortSignal.timeout(configuredStatusProbeTimeoutMs(5_000)),
-    });
-    if (res.status === 404) {
-      throw new Error('the running server has no dashboard yet; restart it with: teamcodex restart');
-    }
-    if (res.status !== 200) {
-      const body = await res.text().catch(() => '');
-      throw new Error(`dashboard session request returned ${res.status} ${body}`.trim());
-    }
-    ({ code } = await res.json());
+    urls = await mintDashboardUrl(config, running);
   } catch (err) {
     console.error(`Could not open the dashboard: ${err.message}`);
     process.exitCode = 1;
     return;
   }
-  const pageUrl = `http://127.0.0.1:${running.port}${DASHBOARD_PATH}`;
-  const url = `${pageUrl}?code=${encodeURIComponent(code)}`;
   if (args.includes('--print')) {
-    console.log(url);
+    console.log(urls.url);
     return;
   }
-  openDashboardWindow(url);
-  console.log(`Dashboard: ${pageUrl}`);
+  openDashboardWindow(urls.url);
+  console.log(`Dashboard: ${urls.pageUrl}`);
+}
+
+/** A one-time dashboard URL for `running` (throws with a printable reason). */
+async function mintDashboardUrl(config, running) {
+  const state = await readServerState();
+  const res = await fetch(`http://127.0.0.1:${running.port}${DASHBOARD_SESSION_PATH}`, {
+    method: 'POST',
+    headers: {
+      'x-api-key': config.proxy.apiKey,
+      [LIFECYCLE_ID_HEADER]: state?.lifecycle?.id ?? '',
+      'content-length': '0',
+    },
+    signal: AbortSignal.timeout(configuredStatusProbeTimeoutMs(5_000)),
+  });
+  if (res.status === 404) {
+    throw new Error('the running server has no dashboard yet; restart it with: teamcodex restart');
+  }
+  if (res.status !== 200) {
+    const body = await res.text().catch(() => '');
+    throw new Error(`dashboard session request returned ${res.status} ${body}`.trim());
+  }
+  const { code } = await res.json();
+  const pageUrl = `http://127.0.0.1:${running.port}${DASHBOARD_PATH}`;
+  return { pageUrl, url: `${pageUrl}?code=${encodeURIComponent(code)}` };
 }
 
 /** Prefer an Edge app window (no address bar) on Windows; else the default browser. */
@@ -3615,6 +3666,166 @@ Open ${url} within 60 seconds.`));
     launch('open', [url]);
   } else {
     launch('xdg-open', [url]);
+  }
+}
+
+// ── autostart (Windows logon task) ──────────────────────────
+
+function autostartForThisRuntime() {
+  return createAutostart({
+    nodePath: process.execPath,
+    entryPath: RUNTIME_ENTRY_PATH,
+    provider: process.env.TEAMCLAUDE_PROVIDER === 'codex' ? 'codex' : 'anthropic',
+    configPath: resolve(getConfigPath()),
+  });
+}
+
+function autostartCli() {
+  return cliProvider === 'codex' ? 'teamcodex codex autostart' : 'teamclaude autostart';
+}
+
+function printAutostartStatus(state, logPath) {
+  if (!state.registered) {
+    console.log('Autostart: off');
+    console.log(`  Turn on:  ${autostartCli()} enable [--dashboard]`);
+    return;
+  }
+  console.log(`Autostart: ${state.enabled ? 'on' : 'off (task disabled in Task Scheduler)'}`);
+  console.log(`  Task:      ${state.taskName} (Task Scheduler, at logon)`);
+  console.log(`  Dashboard: ${state.dashboard ? 'opens at logon' : 'not opened at logon'}`);
+  console.log(`  Log:       ${logPath}`);
+  if (state.stale) {
+    console.log('  Warning:   the task starts a different Node, entry or config than this command.');
+    console.log(`             Run "${autostartCli()} enable" again to point it here.`);
+  }
+}
+
+async function autostartCommand() {
+  // Every subcommand honours --config (the logon task passes it to `launch`;
+  // `enable|disable|status --config X` must name the same task).
+  const configArg = argValue('--config');
+  if (configArg) process.env.TEAMCLAUDE_CONFIG = resolve(configArg);
+  const sub = args[1] && !args[1].startsWith('--') ? args[1] : 'status';
+  if (sub === 'launch') {
+    await autostartLaunchCommand();
+    return;
+  }
+  if (!autostartSupported()) {
+    console.error('Autostart is only available on Windows here (macOS: use the menu-bar app).');
+    process.exitCode = 1;
+    return;
+  }
+  const autostart = autostartForThisRuntime();
+  try {
+    if (sub === 'status') {
+      printAutostartStatus(await autostart.read(), autostart.logPath);
+    } else if (sub === 'enable') {
+      const state = await autostart.set({ enabled: true, dashboard: args.includes('--dashboard') });
+      console.log(`Autostart enabled: "${state.taskName}" starts the proxy when you log in to Windows.`);
+      printAutostartStatus(state, autostart.logPath);
+    } else if (sub === 'disable') {
+      const before = await autostart.read();
+      await autostart.set({ enabled: false });
+      console.log(before.registered
+        ? `Autostart disabled: removed "${before.taskName}". A running proxy keeps running.`
+        : 'Autostart was already off.');
+    } else {
+      console.error(`Usage: ${autostartCli()} [status|enable [--dashboard]|disable]`);
+      process.exitCode = 1;
+    }
+  } catch (err) {
+    console.error(`Autostart ${sub} failed: ${err.message}`);
+    process.exitCode = 1;
+  }
+}
+
+/**
+ * What the logon task runs (hidden). Starts the proxy unless one already
+ * answers, with its output appended to `<config>.log`, then optionally opens
+ * the dashboard and exits. Everything is logged: nobody sees this console.
+ */
+async function autostartLaunchCommand() {
+  const logPath = autostartLogPath(resolve(getConfigPath()));
+  mkdirSync(dirname(logPath), { recursive: true });
+  let logFd = null;
+  const openLog = () => {
+    if (logFd == null) logFd = openSync(logPath, 'a');
+    return logFd;
+  };
+  const note = line => {
+    try { appendFileSync(openLog(), `[${new Date().toISOString()}] [autostart] ${line}\n`); } catch { /* best effort */ }
+  };
+  try {
+    const config = await loadOrCreateConfig();
+    let running = await findRunningServer(config);
+    if (running) {
+      note(`launch (pid ${process.pid}): proxy already running on port ${running.port}`
+        + ` (pid ${running.pid ?? 'unknown'}); not starting another`);
+    } else {
+      // Rotate only here: a running proxy still has the current log open.
+      try {
+        if (statSync(logPath).size > AUTOSTART_LOG_MAX_BYTES) renameSync(logPath, `${logPath}.1`);
+      } catch { /* no log yet */ }
+      note(`launch (pid ${process.pid}, node ${process.version}): starting the proxy`);
+      running = await ensureProxyRunning(config, AUTOSTART_LAUNCH_WAIT_MS, { logFd: openLog() });
+      note(`proxy started on port ${running.port} (pid ${running.pid ?? 'unknown'})`);
+    }
+    if (args.includes('--dashboard')) {
+      const urls = await mintDashboardUrl(config, running);
+      openDashboardWindow(urls.url);
+      note(`dashboard opened: ${urls.pageUrl}`);
+    }
+  } catch (err) {
+    note(`failed: ${err.message}`);
+    process.exitCode = 1;
+  } finally {
+    if (logFd != null) closeSync(logFd);
+  }
+}
+
+// ── shortcut (Windows .lnk) ─────────────────────────────────
+
+/**
+ * Create or remove a shortcut that opens the dashboard, starting the proxy
+ * first when needed (src/shortcut.js). Without a location it only prints
+ * what the shortcut would contain.
+ */
+async function shortcutCommand() {
+  const cli = cliProvider === 'codex' ? 'teamcodex codex shortcut' : 'teamclaude shortcut';
+  if (process.platform !== 'win32') {
+    console.error('Shortcuts are only supported on Windows.');
+    process.exitCode = 1;
+    return;
+  }
+  const spec = buildShortcutSpec({
+    nodePath: process.execPath,
+    entryPath: RUNTIME_ENTRY_PATH,
+    provider: process.env.TEAMCLAUDE_PROVIDER === 'codex' ? 'codex' : 'anthropic',
+    configPath: resolve(getConfigPath()),
+  });
+  const locations = [];
+  if (args.includes('--desktop')) locations.push({ special: SHORTCUT_FOLDERS.desktop });
+  if (args.includes('--start-menu')) locations.push({ special: SHORTCUT_FOLDERS['start-menu'] });
+  const dir = argValue('--dir');
+  if (dir) locations.push({ dir });
+  if (locations.length === 0) {
+    console.log(`Shortcut:  ${spec.fileName}`);
+    console.log(`Target:    ${spec.target}`);
+    console.log(`Arguments: ${spec.arguments}`);
+    console.log(`Icon:      ${spec.iconLocation}`);
+    console.log(`\nUsage: ${cli} [--desktop] [--start-menu] [--dir <folder>] [--remove]`);
+    return;
+  }
+  const op = args.includes('--remove') ? 'remove' : 'create';
+  for (const location of locations) {
+    try {
+      const result = await runShortcutScript(op, spec, location);
+      if (op === 'create') console.log(`Created ${result.path}`);
+      else console.log(result.removed ? `Removed ${result.path}` : `No shortcut at ${result.path}`);
+    } catch (err) {
+      console.error(`Shortcut ${op} failed: ${err.message}`);
+      process.exitCode = 1;
+    }
   }
 }
 
@@ -3738,6 +3949,8 @@ Commands:
   env                 Print an equivalent Codex launch command
   status              Show proxy & account status
   dashboard [--print] Open the web dashboard (--print: print the URL)
+  autostart [status|enable [--dashboard]|disable]
+                      Start the Codex proxy at Windows logon (Task Scheduler)
   accounts            List configured Codex accounts
   reauth <name>       Re-authenticate one existing OAuth account
   subscription cancel Track a cancelled subscription without disabling it
@@ -3779,6 +3992,10 @@ Commands:
   status              Show proxy & account status (live)
   dashboard [--print] Open the web dashboard in an app window
                       (--print: print the one-time URL instead)
+  autostart [status|enable [--dashboard]|disable]
+                      Start the proxy when you log in to Windows (per-user
+                      Task Scheduler task, no console window, log next to the
+                      config; --dashboard also opens the dashboard window)
   accounts            List configured accounts
   reauth <name>       Re-authenticate one existing OAuth account
   remove <name>       Remove an account

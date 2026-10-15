@@ -112,6 +112,21 @@ const EN = {
     disconnected: 'Lost connection to the proxy',
     reconnected: 'Reconnected to the proxy',
   },
+  autostart: {
+    heading: 'Startup',
+    title: 'Start when I log in to Windows',
+    onSub: name => `Task Scheduler task "${name}" starts the proxy without a window. Its log is next to the config file.`,
+    offSub: 'The proxy runs only when you start it yourself.',
+    dashboard: 'Also open this dashboard window',
+    loading: 'Checking Task Scheduler…',
+    disabledInScheduler: 'The task exists but is disabled in Task Scheduler. Turning this on enables it again.',
+    stale: 'The task starts a different Node, program or config than this proxy. Turn it off and on again to update it.',
+    failed: msg => `Task Scheduler: ${msg}`,
+    turnedOn: 'Start at login turned on',
+    turnedOff: 'Start at login turned off',
+    dashboardOn: 'The dashboard will open at login',
+    dashboardOff: 'The dashboard will not open at login',
+  },
 };
 
 const KO = {
@@ -217,6 +232,21 @@ const KO = {
     removed: n => `계정 제거: ${n}`,
     disconnected: '프록시 연결 끊김',
     reconnected: '프록시 다시 연결됨',
+  },
+  autostart: {
+    heading: '시작 설정',
+    title: 'Windows에 로그인하면 자동으로 시작',
+    onSub: name => `작업 스케줄러의 "${name}" 작업이 창 없이 프록시를 띄웁니다. 로그는 설정 파일 옆에 남습니다.`,
+    offSub: '직접 실행할 때만 프록시가 켜집니다.',
+    dashboard: '대시보드 창도 같이 열기',
+    loading: '작업 스케줄러 확인 중…',
+    disabledInScheduler: '작업은 있지만 작업 스케줄러에서 꺼져 있습니다. 여기서 켜면 다시 켜집니다.',
+    stale: '작업이 지금 프록시와 다른 Node·프로그램·설정을 띄웁니다. 껐다가 다시 켜면 갱신됩니다.',
+    failed: msg => `작업 스케줄러 오류: ${msg}`,
+    turnedOn: '로그인 때 자동 시작을 켰습니다',
+    turnedOff: '로그인 때 자동 시작을 껐습니다',
+    dashboardOn: '로그인 때 대시보드 창도 엽니다',
+    dashboardOff: '로그인 때 대시보드 창은 열지 않습니다',
   },
 };
 
@@ -656,4 +686,35 @@ export function renderHostHtml(vm, text) {
   }
   if (vm.port != null) parts.push(`<span>${escapeHtml(text.port)} ${escapeHtml(vm.port)}</span>`);
   return parts.join('<span class="sep">·</span>');
+}
+
+/**
+ * The startup settings card. `state` is the GET /teamclaude/dashboard/autostart
+ * answer (null while loading); `busy` disables both switches while a change is
+ * in flight; `error` is the last failure message to show under them.
+ */
+export function renderAutostartHtml(state, text, { busy = false, error = null } = {}) {
+  const t = text.autostart;
+  if (!state) {
+    return `<div class="setting"><div class="setting-text"><span class="setting-sub">${escapeHtml(error ? t.failed(error) : t.loading)}</span></div></div>`;
+  }
+  if (!state.supported) return '';
+  const on = state.registered && state.enabled;
+  const notes = [];
+  if (state.registered && !state.enabled) notes.push(`<span class="setting-sub warn">${escapeHtml(t.disabledInScheduler)}</span>`);
+  if (state.stale) notes.push(`<span class="setting-sub warn">${escapeHtml(t.stale)}</span>`);
+  if (error) notes.push(`<span class="setting-sub err">${escapeHtml(t.failed(error))}</span>`);
+  const sw = (key, checked, label, disabled) => `<input type="checkbox" role="switch" class="switch" data-autostart="${key}"`
+    + ` aria-label="${escapeHtml(label)}"${checked ? ' checked' : ''}${disabled || busy ? ' disabled' : ''}>`;
+  return '<div class="setting">'
+    + sw('enabled', on, t.title, false)
+    + '<div class="setting-text">'
+    + `<span class="setting-title">${escapeHtml(t.title)}</span>`
+    + `<span class="setting-sub">${escapeHtml(on ? t.onSub(state.taskName) : t.offSub)}</span>`
+    + notes.join('')
+    + '</div></div>'
+    + '<div class="setting child">'
+    + sw('dashboard', on && state.dashboard, t.dashboard, !on)
+    + `<div class="setting-text"><span class="setting-title">${escapeHtml(t.dashboard)}</span></div>`
+    + '</div>';
 }

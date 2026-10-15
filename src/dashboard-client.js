@@ -13,6 +13,7 @@ import {
   formatAgo,
   renderAccountsHtml,
   renderActivityHtml,
+  renderAutostartHtml,
   renderHostHtml,
   renderSummaryHtml,
   escapeHtml,
@@ -38,6 +39,8 @@ const els = {
   activity: $('activity'),
   confirm: $('confirm'),
   confirmTitle: $('confirm-title'),
+  settings: $('settings'),
+  autostart: $('autostart'),
 };
 
 let lastStatus = null;
@@ -47,6 +50,9 @@ let connected = null; // null = never tried yet
 let timer = null;
 let busy = false;
 const events = [];
+// Startup settings (Windows logon task). Read once per page: the state only
+// changes through this switch or by hand in Task Scheduler.
+const autostart = { state: null, loading: false, busy: false, error: null };
 
 function pushEvents(list) {
   const at = Date.now();
@@ -88,7 +94,72 @@ function render() {
     renderNotice(vm);
   }
   els.activity.innerHTML = renderActivityHtml(events, text);
+  renderAutostart();
   renderConn();
+}
+
+function renderAutostart() {
+  const available = Boolean(lastStatus?.dashboard?.autostart) && autostart.state?.supported !== false;
+  els.settings.hidden = !available;
+  if (!available) return;
+  // Keep keyboard focus on the switch the user just toggled across re-renders.
+  const focused = document.activeElement?.dataset?.autostart;
+  els.autostart.innerHTML = renderAutostartHtml(autostart.state, text, autostart);
+  if (focused) els.autostart.querySelector(`[data-autostart="${focused}"]`)?.focus();
+}
+
+async function loadAutostart() {
+  if (autostart.loading || autostart.state || !lastStatus?.dashboard?.autostart) return;
+  autostart.loading = true;
+  try {
+    const res = await fetch('/teamclaude/dashboard/autostart', {
+      cache: 'no-store',
+      credentials: 'same-origin',
+      headers: { accept: 'application/json' },
+    });
+    if (!res.ok) throw new Error(await failureMessage(res));
+    autostart.state = await res.json();
+    autostart.error = null;
+  } catch (err) {
+    autostart.error = err?.message || text.actionErrors.network;
+  } finally {
+    autostart.loading = false;
+  }
+  renderAutostart();
+}
+
+async function changeAutostart(input) {
+  const csrf = lastStatus?.dashboard?.csrf;
+  const prev = autostart.state;
+  if (!csrf || !prev || autostart.busy) return;
+  const enabled = input.dataset.autostart === 'enabled' ? input.checked : Boolean(prev.registered && prev.enabled);
+  const dashboard = input.dataset.autostart === 'dashboard' ? input.checked : Boolean(prev.dashboard);
+  autostart.busy = true;
+  renderAutostart();
+  try {
+    const res = await fetch('/teamclaude/dashboard/autostart', {
+      method: 'POST',
+      cache: 'no-store',
+      credentials: 'same-origin',
+      headers: { 'content-type': 'application/json', 'x-teamclaude-csrf': csrf },
+      body: JSON.stringify({ enabled, dashboard: enabled && dashboard }),
+    });
+    if (!res.ok) throw new Error(await failureMessage(res));
+    const next = await res.json();
+    const wasOn = Boolean(prev.registered && prev.enabled);
+    const isOn = Boolean(next.registered && next.enabled);
+    if (wasOn !== isOn) pushEvents([{ tone: isOn ? 'ok' : 'info', text: isOn ? text.autostart.turnedOn : text.autostart.turnedOff }]);
+    else if (isOn && Boolean(prev.dashboard) !== Boolean(next.dashboard)) {
+      pushEvents([{ tone: 'info', text: next.dashboard ? text.autostart.dashboardOn : text.autostart.dashboardOff }]);
+    }
+    autostart.state = next;
+    autostart.error = null;
+  } catch (err) {
+    autostart.error = err?.message || text.actionErrors.network;
+  } finally {
+    autostart.busy = false;
+  }
+  render();
 }
 
 async function poll() {
@@ -107,6 +178,7 @@ async function poll() {
     lastVm = vm;
     lastOkAt = Date.now();
     connected = true;
+    loadAutostart();
   } catch {
     if (connected === true) pushEvents([{ tone: 'crit', text: text.events.disconnected }]);
     connected = false;
@@ -176,6 +248,11 @@ async function runAction(button) {
   await poll();
   schedule();
 }
+
+els.autostart.addEventListener('change', e => {
+  const input = e.target.closest('input[data-autostart]');
+  if (input && !input.disabled) changeAutostart(input);
+});
 
 els.accounts.addEventListener('click', e => {
   const button = e.target.closest('button[data-act]');
