@@ -1691,6 +1691,16 @@ async function proxyWorkerCommand() {
       console.error(`[TeamCodex] Reset credit ledger snapshot failed: ${err.message}`);
     }
   };
+  // The official usage poll (src/oauth-usage.js) just changed quota: persist
+  // it now rather than up to 60 s later, so a restart does not bring back the
+  // frozen numbers the poll replaced.
+  hooks.onUsagePolled = () => {
+    try {
+      saveQuotaSnapshot();
+    } catch (err) {
+      console.error(`[TeamClaude] Usage poll snapshot failed: ${err.message}`);
+    }
+  };
   const server = createProxyServer(accountManager, config, hooks);
   let liveSyncChain = Promise.resolve();
   const reloadAccountsFromDisk = () => {
@@ -1726,6 +1736,7 @@ async function proxyWorkerCommand() {
     const run = liveSyncChain.then(() => runAccountControl({
       accountManager,
       config,
+      refreshUsage: () => server.refreshOauthUsage?.() ?? null,
       persist: mutation => atomicConfigUpdate(diskConfig => {
         applyTuiAccountMutation(diskConfig, config, accountManager, mutation);
       }),

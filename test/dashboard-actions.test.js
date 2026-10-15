@@ -132,8 +132,18 @@ test('the write path refuses every request missing one of its proofs', async () 
   try {
     const s = await session(srv);
     const other = await session(srv);
+    // The fleet-wide refresh-usage write is gated exactly like an account action.
+    const fleet = { action: 'refresh-usage' };
     const cases = [
       ['no cookie', 403, { cookie: null, csrf: s.csrf }],
+      ['refresh-usage: no cookie', 403, { cookie: null, csrf: s.csrf, payload: fleet }],
+      ['refresh-usage: no CSRF token', 403, { cookie: s.cookie, payload: fleet }],
+      ['refresh-usage: other session token', 403, { cookie: s.cookie, csrf: other.csrf, payload: fleet }],
+      ['refresh-usage: cross-site', 403, { ...s, payload: fleet, headers: { 'sec-fetch-site': 'cross-site' } }],
+      ['refresh-usage: no Origin', 403, { ...s, payload: fleet, headers: { origin: undefined } }],
+      ['refresh-usage: other Host', 403, { ...s, payload: fleet, headers: { host: 'evil.example:80' } }],
+      ['refresh-usage: GET', 405, { ...s, payload: fleet, method: 'GET' }],
+      ['refresh-usage: form content type', 415, { ...s, payload: fleet, headers: { 'content-type': 'application/x-www-form-urlencoded' } }],
       ['unknown cookie', 403, { cookie: 'tc_dash_1=forged', csrf: s.csrf }],
       ['no CSRF token', 403, { cookie: s.cookie }],
       ['wrong CSRF token', 403, { ...s, headers: { [DASHBOARD_CSRF_HEADER]: 'x'.repeat(43) } }],
@@ -155,6 +165,26 @@ test('the write path refuses every request missing one of its proofs', async () 
       assert.equal(res.status, expected, `${label}: ${res.body}`);
     }
     assert.equal(srv.actions.length, 0, 'nothing refused ever reached the worker');
+  } finally {
+    await srv.close();
+  }
+});
+
+test('refresh-usage needs no target account and is relayed bare; other actions still need one', async () => {
+  const srv = await start();
+  try {
+    const s = await session(srv);
+    const ok = await action(srv, s, { payload: { action: 'refresh-usage' } });
+    assert.equal(ok.status, 200, ok.body);
+    assert.deepEqual(srv.actions, [{ action: 'refresh-usage' }], 'no account fields are forwarded');
+
+    const stray = await action(srv, s, { payload: { action: 'refresh-usage', accountUuid: 'uuid-a', name: 'a@example.com' } });
+    assert.equal(stray.status, 200);
+    assert.deepEqual(srv.actions[1], { action: 'refresh-usage' }, 'a stray target is dropped, not honoured');
+
+    const noTarget = await action(srv, s, { payload: { action: 'switch' } });
+    assert.equal(noTarget.status, 400);
+    assert.equal(srv.actions.length, 2);
   } finally {
     await srv.close();
   }

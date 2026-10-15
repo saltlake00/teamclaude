@@ -57,8 +57,18 @@ function mirrorConfig(config, account, fields) {
  * @param {{ action: string, accountUuid?: string|null, name?: string }} request
  * @returns {Promise<{ statusCode: number, body: object }>}
  */
-export async function runAccountControl({ accountManager, config, persist }, request) {
+export async function runAccountControl({ accountManager, config, persist, refreshUsage }, request) {
   const action = request?.action;
+  // Fleet-wide: no target account. Runs the official usage poll once, now
+  // (src/oauth-usage.js); the worker answers { targets, updated }.
+  if (action === 'refresh-usage') {
+    const outcome = refreshUsage ? await refreshUsage() : null;
+    if (!outcome) {
+      return refused(404, 'not_found_error', 'unsupported',
+        'This proxy has no official usage endpoint to poll.');
+    }
+    return result(200, { ok: true, action, targets: outcome.targets, updated: outcome.updated });
+  }
   if (!ACCOUNT_CONTROL_ACTIONS.includes(action)) {
     return refused(400, 'invalid_request_error', 'unknown-action', `Unknown account action "${action}".`);
   }

@@ -49,6 +49,7 @@ let lastOkAt = null;
 let connected = null; // null = never tried yet
 let timer = null;
 let busy = false;
+let usageBusy = false;
 const events = [];
 // Startup settings (Windows logon task). Read once per page: the state only
 // changes through this switch or by hand in Task Scheduler.
@@ -88,7 +89,7 @@ function render() {
     // Rebuild against the current clock so countdowns stay live between polls.
     const vm = buildViewModel(lastStatus, { now: Date.now(), text });
     els.host.innerHTML = renderHostHtml(vm, text);
-    els.summary.innerHTML = renderSummaryHtml(vm, text);
+    els.summary.innerHTML = renderSummaryHtml(vm, text, { busy: usageBusy });
     els.accounts.innerHTML = renderAccountsHtml(vm, text, { busy });
     els.accountCount.textContent = String(vm.accounts.length);
     renderNotice(vm);
@@ -248,6 +249,44 @@ async function runAction(button) {
   await poll();
   schedule();
 }
+
+// Fleet-wide "refresh usage": the worker polls Anthropic's official usage
+// endpoint for every eligible account and answers { targets, updated }.
+async function runFleetAction(button) {
+  const action = button.dataset.fleet;
+  const csrf = lastStatus?.dashboard?.csrf;
+  if (!action || !csrf || usageBusy || busy) return;
+  usageBusy = true;
+  render();
+  try {
+    const res = await fetch('/teamclaude/dashboard/action', {
+      method: 'POST',
+      cache: 'no-store',
+      credentials: 'same-origin',
+      headers: { 'content-type': 'application/json', 'x-teamclaude-csrf': csrf },
+      body: JSON.stringify({ action }),
+    });
+    if (!res.ok) {
+      pushEvents([{ tone: 'crit', text: text.usage.failed(await failureMessage(res)) }]);
+    } else {
+      const answer = await res.json().catch(() => ({}));
+      pushEvents(answer.targets > 0
+        ? [{ tone: 'ok', text: text.usage.done(answer.updated ?? 0, answer.targets) }]
+        : [{ tone: 'info', text: text.usage.skipped }]);
+    }
+  } catch {
+    pushEvents([{ tone: 'crit', text: text.usage.failed(text.actionErrors.network) }]);
+  } finally {
+    usageBusy = false;
+  }
+  await poll();
+  schedule();
+}
+
+els.summary.addEventListener('click', e => {
+  const button = e.target.closest('button[data-fleet]');
+  if (button && !button.disabled) runFleetAction(button);
+});
 
 els.autostart.addEventListener('change', e => {
   const input = e.target.closest('input[data-autostart]');

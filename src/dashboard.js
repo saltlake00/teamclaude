@@ -46,6 +46,8 @@ export const DASHBOARD_ACTION_PATH = `${DASHBOARD_PATH}/action`;
 export const DASHBOARD_AUTOSTART_PATH = `${DASHBOARD_PATH}/autostart`;
 export const DASHBOARD_CSRF_HEADER = 'x-teamclaude-csrf';
 export const DASHBOARD_ACTIONS = Object.freeze(['enable', 'disable', 'up', 'down', 'auto', 'switch']);
+// Actions on the whole fleet: no target account in the request.
+export const DASHBOARD_FLEET_ACTIONS = Object.freeze(['refresh-usage']);
 const MAX_ACTION_BODY_BYTES = 1024;
 export const DASHBOARD_CODE_TTL_MS = 60_000;
 export const DASHBOARD_SESSION_IDLE_MS = 24 * 60 * 60 * 1000;
@@ -166,6 +168,7 @@ main { max-width: 1040px; margin: 0 auto; padding: 20px 24px 32px; }
 .notice code { font-family: "Cascadia Code", Consolas, ui-monospace, monospace; font-size: 12.5px; background: var(--card); padding: 1px 6px; border-radius: 5px; }
 .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--shadow); }
 .summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-bottom: 20px; }
+.summary-actions { grid-column: 1 / -1; display: flex; justify-content: flex-end; }
 .stat { padding: 14px 16px; }
 .stat-label { color: var(--muted); font-size: 12.5px; }
 .stat-value { font-size: 26px; font-weight: 600; letter-spacing: -0.02em; margin: 2px 0; font-variant-numeric: tabular-nums; }
@@ -476,11 +479,12 @@ export function createDashboard({
       const action = parsed?.action;
       const accountUuid = typeof parsed?.accountUuid === 'string' && parsed.accountUuid ? parsed.accountUuid : null;
       const name = typeof parsed?.name === 'string' && parsed.name ? parsed.name : null;
-      if (!DASHBOARD_ACTIONS.includes(action) || (!accountUuid && !name)) {
+      const fleet = DASHBOARD_FLEET_ACTIONS.includes(action);
+      if (!fleet && (!DASHBOARD_ACTIONS.includes(action) || (!accountUuid && !name))) {
         sendJson(res, 400, { error: { type: 'invalid_request_error', message: 'Expected { action, accountUuid | name }.' } });
         return null;
       }
-      return controlAccount({ action, accountUuid, name }).then(answer => {
+      return controlAccount(fleet ? { action } : { action, accountUuid, name }).then(answer => {
         if (res.destroyed) return;
         const code = Number.isInteger(answer?.statusCode) && answer.statusCode >= 200 && answer.statusCode <= 599
           ? answer.statusCode

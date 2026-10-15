@@ -6,6 +6,7 @@ import {
   diffSnapshots,
   renderAccountsHtml,
   renderControlsHtml,
+  renderSummaryHtml,
 } from '../src/dashboard-view.js';
 
 const NOW = Date.parse('2026-10-14T12:00:00Z');
@@ -119,4 +120,25 @@ test('an order change shows up in the activity list', () => {
 test('English and Korean control texts have the same keys', () => {
   assert.deepEqual(Object.keys(en.controls).sort(), Object.keys(ko.controls).sort());
   assert.deepEqual(Object.keys(en.actionErrors).sort(), Object.keys(ko.actionErrors).sort());
+});
+
+test('the refresh-usage button sits in the summary only for a page that may act', () => {
+  const acting = buildViewModel(status([account('a')]), { now: NOW, text: ko });
+  const html = renderSummaryHtml(acting, ko);
+  assert.match(html, /<button type="button" class="btn" data-fleet="refresh-usage"/);
+  assert.match(html, />사용량 새로고침<\/button>/);
+  assert.match(renderSummaryHtml(acting, en), />Refresh usage<\/button>/);
+
+  const busy = renderSummaryHtml(acting, ko, { busy: true });
+  assert.match(busy, /data-fleet="refresh-usage"[^>]* disabled>새로고침 중…/);
+
+  const readOnly = buildViewModel(status([account('a')], { identity: true, port: 3499 }), { now: NOW, text: ko });
+  assert.doesNotMatch(renderSummaryHtml(readOnly, ko), /data-fleet/);
+  const redacted = buildViewModel(status([account('a')], { identity: false, port: 3499 }), { now: NOW, text: ko });
+  assert.doesNotMatch(renderSummaryHtml(redacted, ko), /data-fleet/);
+});
+
+test('English and Korean usage-refresh texts have the same keys', () => {
+  assert.deepEqual(Object.keys(en.usage).sort(), Object.keys(ko.usage).sort());
+  assert.match(ko.usage.done(2, 3), /3개 중 2개/);
 });

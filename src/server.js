@@ -14,6 +14,7 @@ import {
   inflateSync,
 } from 'node:zlib';
 import { isTokenExpiringSoon, normalizeExpiresAt } from './oauth.js';
+import { createOauthUsagePoller, resolveUsagePollIntervalMs } from './oauth-usage.js';
 import { modelQuotaLabel } from './account-manager.js';
 import { createHostTracker } from './system-metrics.js';
 import { SseFramer, sseErrorEvent, isEventStream } from './sse.js';
@@ -1747,6 +1748,19 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     }, tickMs);
     subscriptionRecheckTimer.unref();
   }
+  // Official usage poll (GET /api/oauth/usage) for OAuth accounts: keeps the
+  // numbers honest for usage spent outside this proxy. Independent of
+  // activeWarmup (it needs no probe template and spends no inference tokens).
+  // See src/oauth-usage.js; `config.usagePollIntervalMs` (default 5 min, 0 = off).
+  const usagePoller = provider === 'anthropic'
+    ? createOauthUsagePoller({
+        accountManager,
+        upstream,
+        intervalMs: resolveUsagePollIntervalMs(config),
+        onUpdated: () => hooks.onUsagePolled?.(),
+      })
+    : null;
+  usagePoller?.start();
   let codexUsageTimer = null;
   if (codexUsageRefresh) {
     setImmediate(() => { refreshCodexQuotaAll(); });
@@ -2368,6 +2382,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     if (warmupTimer) clearInterval(warmupTimer);
     if (subscriptionRecheckTimer) clearInterval(subscriptionRecheckTimer);
     if (codexUsageTimer) clearInterval(codexUsageTimer);
+    usagePoller?.stop();
   };
   const closeServer = server.close.bind(server);
   server.close = (cb) => { shutdownWarmup(); return closeServer(cb); };
@@ -2377,6 +2392,11 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   // re-measure. Kept off the HTTP surface — it spends real upstream requests,
   // so only a deliberate local action should trigger it.
   server.refreshQuotaAll = refreshQuotaAll;
+
+  // Dashboard "refresh usage" button: the same official poll, right now. Skips
+  // only the staleness test; returns { targets, updated }, or null when this
+  // provider has no official usage endpoint (codex has its own wham/usage).
+  server.refreshOauthUsage = () => (usagePoller ? usagePoller.pollAll({ force: true }) : Promise.resolve(null));
 
   // Probe-template persistence (wired into the quota snapshot by index.js).
   // The template is the only known-accepted request shape — without persisting

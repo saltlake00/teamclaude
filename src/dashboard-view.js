@@ -53,6 +53,14 @@ const EN = {
     confirmOk: 'Disable',
     cancel: 'Cancel',
   },
+  usage: {
+    refresh: 'Refresh usage',
+    refreshTitle: 'Ask Anthropic for the current 5-hour and weekly usage of each account (spends no tokens)',
+    refreshing: 'Refreshing…',
+    done: (updated, targets) => `Usage refreshed for ${updated} of ${targets} account(s)`,
+    skipped: 'No account could be polled right now (in use, disabled, API key, or token about to expire)',
+    failed: msg => `Usage refresh failed — ${msg}`,
+  },
   actionFailed: (n, msg) => `${n}: action failed — ${msg}`,
   actionErrors: {
     session: 'the dashboard session ended — reopen it with `teamclaude dashboard`',
@@ -174,6 +182,14 @@ const KO = {
     confirmBody: '회전에서 빠집니다. 이미 진행 중인 요청은 끝까지 처리되고, 언제든 다시 켤 수 있습니다.',
     confirmOk: '끄기',
     cancel: '취소',
+  },
+  usage: {
+    refresh: '사용량 새로고침',
+    refreshTitle: '계정마다 현재 5시간·주간 사용량을 Anthropic에 직접 물어봅니다 (토큰을 쓰지 않습니다)',
+    refreshing: '새로고침 중…',
+    done: (updated, targets) => `계정 ${targets}개 중 ${updated}개의 사용량을 새로 읽었습니다`,
+    skipped: '지금 조회할 수 있는 계정이 없습니다 (사용 중·꺼짐·API 키 계정·토큰 만료 직전)',
+    failed: msg => `사용량 새로고침 실패 — ${msg}`,
   },
   actionFailed: (n, msg) => `${n}: 조작 실패 — ${msg}`,
   actionErrors: {
@@ -571,7 +587,7 @@ function group(n, text) {
   return Math.round(n).toLocaleString(text.locale);
 }
 
-export function renderSummaryHtml(vm, text) {
+export function renderSummaryHtml(vm, text, { busy = false } = {}) {
   const s = vm.summary;
   const usableTone = s.total > 0 && s.usable === 0 ? 'crit' : s.usable < s.total ? 'warn' : 'ok';
   const reset = s.nextReset;
@@ -585,6 +601,12 @@ export function renderSummaryHtml(vm, text) {
     `<div class="card stat"><div class="stat-label">${escapeHtml(text.summary.nextReset)}</div>`
       + `<div class="stat-value">${reset ? escapeHtml(reset.in) : '—'}</div>`
       + `<div class="stat-sub">${escapeHtml(reset ? reset.label : text.summary.nextResetNone)}</div></div>`,
+    // Fleet-wide write: same gate as the row buttons (named session + CSRF).
+    vm.controls
+      ? '<div class="summary-actions">'
+        + `<button type="button" class="btn" data-fleet="refresh-usage"${attr('title', text.usage.refreshTitle)}${busy ? ' disabled' : ''}>`
+        + `${escapeHtml(busy ? text.usage.refreshing : text.usage.refresh)}</button></div>`
+      : '',
   ].join('');
 }
 
