@@ -2558,9 +2558,19 @@ async function envCommand() {
   const port = running?.port || config.proxy.port;
   console.log(`export ANTHROPIC_BASE_URL=http://localhost:${port}`);
   console.log(`export ANTHROPIC_API_KEY=${config.proxy.apiKey}`);
+  console.log('export ENABLE_TOOL_SEARCH=true');
 }
 
 // ── run ─────────────────────────────────────────────────────
+
+// Claude Code disables MCP tool search when ANTHROPIC_BASE_URL is not the
+// first-party host, which roughly triples the context of an MCP-heavy session.
+// The proxy forwards tool_reference blocks, so opt back in unless the caller
+// already chose a value.
+function applyToolSearchDefault(env) {
+  if (env.ENABLE_TOOL_SEARCH === undefined) env.ENABLE_TOOL_SEARCH = 'true';
+  return env;
+}
 
 function stripContextSuffix(model) {
   return typeof model === 'string' ? model.replace(/\[[^\]]*\]$/, '') : model;
@@ -2980,6 +2990,7 @@ async function runCommand(clientArgsOverride = null) {
   delete childEnv[proxyAuthEnv];
   delete childEnv[oauthEnv];
   childEnv.ANTHROPIC_BASE_URL = `http://localhost:${runtimeConfig.proxy.port}`;
+  applyToolSearchDefault(childEnv);
   if (preserveProxyAuth) childEnv[proxyAuthEnv] = config.proxy.apiKey;
   delete childEnv.DISABLE_GROWTHBOOK;
   await syncLaunchModel(runtimeConfig, clientArgs, childEnv);
@@ -3040,10 +3051,10 @@ async function runCommand(clientArgsOverride = null) {
         const recovered = await waitForClaudeProxyRecovery(runtimeConfig);
         runtimeConfig.proxy.port = recovered.port;
         return {
-          childEnv: {
+          childEnv: applyToolSearchDefault({
             ...recoveryEnv,
             ANTHROPIC_BASE_URL: `http://localhost:${recovered.port}`,
-          },
+          }),
         };
       },
       spawnClaude: (recoveryArgs, recoveryEnv) => spawn(...spawnTarget(claudeBin, recoveryArgs), {

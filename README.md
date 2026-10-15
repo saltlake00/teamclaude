@@ -526,6 +526,10 @@ teamclaude run
 removes inherited `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` values so Claude
 Code keeps its Max/Pro OAuth subscription instead of silently preferring API
 credits. A `CLAUDE_CODE_OAUTH_TOKEN`, when intentionally supplied, is preserved.
+It also sets `ENABLE_TOOL_SEARCH=true` unless you already exported a value:
+Claude Code turns MCP tool search off when `ANTHROPIC_BASE_URL` points at a
+non-first-party host, which roughly triples the context of an MCP-heavy session.
+The proxy forwards `tool_reference` blocks, so the setting is safe to keep on.
 If the proxy is not running, `teamclaude run` starts it in the background when
 local accounts are configured and waits for the listener before launching
 Claude Code. A tunnel-only machine with no local accounts waits for its external
@@ -633,6 +637,8 @@ Or manually set the environment:
 eval $(teamclaude env)
 claude
 ```
+
+`teamclaude env` also exports `ENABLE_TOOL_SEARCH=true` for the same reason.
 
 ### Troubleshoot `ConnectionRefused`
 

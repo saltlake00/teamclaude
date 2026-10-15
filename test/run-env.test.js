@@ -186,6 +186,65 @@ console.log(JSON.stringify({
   }
 });
 
+async function runToolSearchChild(parentToolSearch) {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-run-tool-search-'));
+  let server;
+  try {
+    server = await startStatusServer(dir, { accounts: [] });
+    const fakeClaude = fakeCliPath(dir, 'claude');
+    const configPath = join(dir, 'config.json');
+    await writeFile(fakeClaude, `#!/usr/bin/env node
+console.log(JSON.stringify({ toolSearch: process.env.ENABLE_TOOL_SEARCH ?? null }));
+`);
+    await chmod(fakeClaude, 0o755);
+    await writeFile(configPath, JSON.stringify({ proxy: { port: server.port, apiKey: 'proxy-key' } }));
+    const env = {
+      ...process.env,
+      PATH: pathWith(dir),
+      ...fakeClaudeEnv(fakeClaude),
+      TEAMCLAUDE_PROVIDER: 'anthropic',
+      TEAMCLAUDE_CONFIG: configPath,
+    };
+    delete env.ENABLE_TOOL_SEARCH;
+    if (parentToolSearch !== undefined) env.ENABLE_TOOL_SEARCH = parentToolSearch;
+    const result = spawnSync(process.execPath, [entry, 'run'], { encoding: 'utf8', env });
+    assert.equal(result.status, 0, result.stderr);
+    return JSON.parse(result.stdout.trim());
+  } finally {
+    if (server) await stopStatusServer(server);
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+test('run enables MCP tool search by default for the proxied Claude Code', async () => {
+  const child = await runToolSearchChild(undefined);
+  assert.equal(child.toolSearch, 'true');
+});
+
+test('run keeps an ENABLE_TOOL_SEARCH value the caller already set', async () => {
+  const child = await runToolSearchChild('false');
+  assert.equal(child.toolSearch, 'false');
+});
+
+test('env exports ENABLE_TOOL_SEARCH so manual sessions keep MCP tool search', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-env-tool-search-'));
+  try {
+    const configPath = join(dir, 'config.json');
+    await writeFile(configPath, JSON.stringify({
+      provider: 'anthropic',
+      proxy: { port: 3456, apiKey: 'proxy-key' },
+    }));
+    const result = spawnSync(process.execPath, [entry, 'env'], {
+      encoding: 'utf8',
+      env: { ...process.env, TEAMCLAUDE_PROVIDER: 'anthropic', TEAMCLAUDE_CONFIG: configPath },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /^export ENABLE_TOOL_SEARCH=true$/m);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('run defaults an unconfigured managed Claude session to Sonnet 5', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'teamclaude-run-safe-model-'));
   let server;
