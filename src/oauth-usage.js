@@ -28,6 +28,18 @@ export const DEFAULT_USAGE_POLL_INTERVAL_MS = 5 * 60 * 1000;
 // The supervisor waits 10 s for a dashboard action answer; stay under it.
 export const USAGE_POLL_TIMEOUT_MS = 8_000;
 
+/**
+ * How old an account's numbers must be for a timer tick to poll it.
+ * `_usagePolledAt` is stamped when the answer arrives, up to the request
+ * timeout after the tick, so comparing against the full interval made the next
+ * tick fall short by that latency and skip: the real cadence was twice the
+ * setting. The slack covers the latency (capped at half an interval, so a
+ * header refresh in the second half of an interval still saves a poll).
+ */
+export function usageStaleAfterMs(intervalMs) {
+  return intervalMs - Math.min(USAGE_POLL_TIMEOUT_MS + 1000, intervalMs / 2);
+}
+
 /** `config.usagePollIntervalMs`: default 5 min, 0 = off, junk = default. */
 export function resolveUsagePollIntervalMs(config) {
   const value = config?.usagePollIntervalMs;
@@ -94,6 +106,7 @@ export function createOauthUsagePoller({
   let timer = null;
   const abort = new AbortController();
   const endpoint = `${String(upstream).replace(/\/$/, '')}${OAUTH_USAGE_PATH}`;
+  const staleAfterMs = usageStaleAfterMs(intervalMs);
 
   /** Last time this account's numbers were refreshed, by header or by poll. */
   function lastUpdateAt(account) {
@@ -106,7 +119,7 @@ export function createOauthUsagePoller({
     if (account.type !== 'oauth' || !account.credential) return false;
     if (account.inflight !== 0 || account._usagePolling) return false;
     if (isTokenExpiringSoon(account.expiresAt)) return false;
-    if (!force && now() - lastUpdateAt(account) < intervalMs) return false;
+    if (!force && now() - lastUpdateAt(account) < staleAfterMs) return false;
     return true;
   }
 

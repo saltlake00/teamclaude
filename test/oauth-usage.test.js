@@ -249,6 +249,46 @@ test('interval 0 starts no timer; a positive interval polls on each tick', async
   }
 });
 
+// The poll stamps `_usagePolledAt` when the answer arrives, a little after
+// the tick. Without slack the next tick sees "interval minus latency" and
+// skips, so the real cadence was twice the setting (60 s → 120 s).
+test('every tick polls even when the answer arrives late; a header update still skips one tick', async () => {
+  mock.timers.enable({ apis: ['setInterval'] });
+  try {
+    const intervalMs = 60_000;
+    const latencyMs = 300;
+    const am = makeManager([{ name: 'a' }]);
+    const base = Date.now();
+    let clock = base;
+    const { impl, calls } = fakeFetch();
+    const slowFetch = async (url, init) => {
+      clock += latencyMs;
+      return impl(url, init);
+    };
+    const p = poller(am, slowFetch, { intervalMs, now: () => clock });
+    const tickTo = async n => {
+      clock = base + n * intervalMs;
+      mock.timers.tick(intervalMs);
+      for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve));
+    };
+    p.start();
+
+    for (let n = 1; n <= 5; n++) await tickTo(n);
+    assert.equal(calls.length, 5, 'one poll per tick, not one per two ticks');
+
+    // Proxied traffic refreshed the numbers half an interval ago: that tick
+    // has nothing to learn, so it stays skipped.
+    am.accounts[0].usage.lastUsed = new Date(base + 5.5 * intervalMs).toISOString();
+    await tickTo(6);
+    assert.equal(calls.length, 5);
+    await tickTo(7);
+    assert.equal(calls.length, 6);
+    p.stop();
+  } finally {
+    mock.timers.reset();
+  }
+});
+
 test('usagePollIntervalMs: default 5 min, 0 = off, junk = default', () => {
   assert.equal(resolveUsagePollIntervalMs({}), 5 * 60_000);
   assert.equal(resolveUsagePollIntervalMs({ usagePollIntervalMs: 0 }), 0);
