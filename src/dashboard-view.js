@@ -407,13 +407,14 @@ function barView(label, ratio, resetAt, now, text) {
   };
 }
 
-/** Session/weekly for OAuth accounts, tokens/requests for API-key accounts (TUI rule: keyed on TYPE). */
+/** Weekly/session for OAuth accounts, tokens/requests for API-key accounts (TUI rule: keyed on TYPE). */
 export function barsOf(a, now, text) {
   const q = a.quota || {};
   if (a.type === 'oauth') {
+    // Weekly first (left column): it is the scarcer budget (user decision 2026-10-19).
     return [
-      barView(text.bar.session, q.unified5h, q.unified5hReset ?? null, now, text),
-      barView(text.bar.weekly, q.unified7d, q.unified7dReset ?? null, now, text),
+      { ...barView(text.bar.weekly, q.unified7d, q.unified7dReset ?? null, now, text), key: 'weekly' },
+      { ...barView(text.bar.session, q.unified5h, q.unified5hReset ?? null, now, text), key: 'session' },
     ];
   }
   const tokens = (q.tokensLimit != null && q.tokensRemaining != null) ? 1 - q.tokensRemaining / q.tokensLimit : null;
@@ -482,7 +483,7 @@ export function buildViewModel(status, { now = Date.now(), text = EN } = {}) {
   let next = null;
   for (const row of rows) {
     if (!row.enabled || row.type !== 'oauth') continue;
-    const at = row.bars[0].resetAt;
+    const at = row.bars.find(b => b.key === 'session')?.resetAt ?? null;
     if (at != null && (next == null || at < next.at)) next = { at, label: row.label };
   }
 

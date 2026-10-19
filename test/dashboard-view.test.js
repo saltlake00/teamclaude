@@ -119,12 +119,12 @@ test('view model: bars, reset countdown, summary and current account', () => {
 
   const a = vm.accounts.find(r => r.label === 'a@example.com');
   assert.equal(a.isCurrent, true);
-  assert.equal(a.bars[0].label, '세션');
-  assert.equal(a.bars[0].pct, 42);
-  assert.equal(a.bars[0].level, 'ok');
-  assert.equal(a.bars[0].resetIn, '2시간 13분');
-  assert.equal(a.bars[1].label, '주간');
-  assert.equal(a.bars[1].level, 'crit');
+  assert.equal(a.bars[1].label, '세션');
+  assert.equal(a.bars[1].pct, 42);
+  assert.equal(a.bars[1].level, 'ok');
+  assert.equal(a.bars[1].resetIn, '2시간 13분');
+  assert.equal(a.bars[0].label, '주간');
+  assert.equal(a.bars[0].level, 'crit');
   assert.equal(a.bars.length, 2, 'Fable bar is dropped in stage 1');
   assert.equal(a.stats.lastUsedAgo, '3분 전');
 
