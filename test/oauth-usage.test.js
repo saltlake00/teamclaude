@@ -145,6 +145,31 @@ test('failure is logged once per streak and recovery once', async () => {
   assert.match(logs[0], /recovered/);
 });
 
+test('a request that ignores the abort still ends at the timeout and frees the account', async () => {
+  // Measured 2026-10-21: one poll never settled after its abort, `_usagePolling`
+  // stayed true on all four accounts and every later pass (and the dashboard
+  // button) found 0 targets for hours, with no log line.
+  const stuck = [
+    async () => new Promise(() => {}),
+    async () => ({ ok: true, status: 200, json: () => new Promise(() => {}) }),
+  ];
+  for (const impl of stuck) {
+    const am = makeManager([{ name: 'a' }]);
+    const before = structuredClone(am.accounts[0].quota);
+    const errors = [];
+    const p = poller(am, impl, { timeoutMs: 50, logError: m => errors.push(m) });
+
+    const outcome = await p.pollAll({ force: true });
+
+    assert.deepEqual(outcome, { targets: 1, updated: 0 });
+    assert.equal(am.accounts[0]._usagePolling, false, 'the account can be polled again');
+    assert.deepEqual(am.accounts[0].quota, before);
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /timed out/);
+    assert.equal(p.eligible(am.accounts[0], true), true);
+  }
+});
+
 test('a window without a usable utilization AND reset time is left as it was', () => {
   assert.deepEqual(parseOauthUsage({ five_hour: null, seven_day: { utilization: 5 } }), { fiveHour: null, sevenDay: null });
   const quota = { unified5h: 0.3, unified5hReset: 111, unified7d: 0.4, unified7dReset: 222 };

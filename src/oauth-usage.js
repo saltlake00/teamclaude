@@ -101,6 +101,7 @@ export function createOauthUsagePoller({
   onUpdated = null,
   log = msg => console.log(msg),
   logError = msg => console.error(msg),
+  timeoutMs = USAGE_POLL_TIMEOUT_MS,
 }) {
   let closed = false;
   let timer = null;
@@ -127,19 +128,33 @@ export function createOauthUsagePoller({
     const ac = new AbortController();
     const onClose = () => ac.abort();
     abort.signal.addEventListener('abort', onClose, { once: true });
-    const timeout = setTimeout(() => ac.abort(), USAGE_POLL_TIMEOUT_MS);
-    try {
-      const res = await fetchImpl(endpoint, {
-        headers: { accept: 'application/json', authorization: `Bearer ${account.credential}` },
-        signal: ac.signal,
-      });
-      if (!res.ok) {
-        await res.body?.cancel?.();
-        return { ok: false, reason: `HTTP ${res.status}` };
+    // The abort alone is not enough: measured 2026-10-21, one request never
+    // settled after it, so `_usagePolling` stayed set and every later pass
+    // skipped the account for hours. The deadline settles the poll itself.
+    let timeout;
+    const deadline = new Promise(resolve => {
+      timeout = setTimeout(() => {
+        ac.abort();
+        resolve({ ok: false, reason: `timed out after ${timeoutMs} ms` });
+      }, timeoutMs);
+    });
+    const request = (async () => {
+      try {
+        const res = await fetchImpl(endpoint, {
+          headers: { accept: 'application/json', authorization: `Bearer ${account.credential}` },
+          signal: ac.signal,
+        });
+        if (!res.ok) {
+          await res.body?.cancel?.();
+          return { ok: false, reason: `HTTP ${res.status}` };
+        }
+        return { ok: true, payload: await res.json() };
+      } catch (err) {
+        return { ok: false, reason: err?.message || 'network error' };
       }
-      return { ok: true, payload: await res.json() };
-    } catch (err) {
-      return { ok: false, reason: err?.message || 'network error' };
+    })();
+    try {
+      return await Promise.race([request, deadline]);
     } finally {
       clearTimeout(timeout);
       abort.signal.removeEventListener('abort', onClose);
