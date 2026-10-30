@@ -285,6 +285,39 @@ test('refreshQuotaAll re-probes already-measured accounts with fresh values', as
   }
 });
 
+// Dashboard "requests" must mean client traffic: the warm-up fan-out's own
+// probes are counted apart (totalProbes) instead of inflating totalRequests.
+test('warm-up probes count as totalProbes, not totalRequests', async () => {
+  const upstream = http.createServer(async (req, res) => {
+    for await (const c of req) void c;
+    res.writeHead(200, RL_HEADERS());
+    res.end('{"ok":true}');
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(3), 0.98, 0, 3);
+  const proxy = createProxyServer(am, { upstream: `http://127.0.0.1:${upstreamPort}`, warmupIntervalMs: 0 });
+  const proxyPort = await listen(proxy);
+  try {
+    await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-x', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    assert.equal(await waitFor(() => am.accounts.every(a => measured(am, a.name))), true,
+      'the fan-out measured the rest of the fleet');
+    const sum = key => am.accounts.reduce((n, a) => n + (a.usage[key] || 0), 0);
+    assert.equal(sum('totalRequests'), 1, 'only the client request is a request');
+    assert.equal(sum('totalProbes'), 2, 'each idle account got one probe');
+    for (const a of am.accounts.filter(x => x.usage.totalProbes)) {
+      assert.equal(a.usage.lastUsed, null, 'a probe does not mark the account as used');
+      assert.ok(a.usage.lastProbeAt, 'a probe records its own time');
+    }
+  } finally {
+    await new Promise(r => proxy.close(r));
+    await new Promise(r => upstream.close(r));
+  }
+});
+
 // A disabled account is out of ROTATION but still monitored — R's forced
 // refresh must probe it for display (a probe routes no client traffic), else
 // its dashboard row (Fable window included) stays blank forever.

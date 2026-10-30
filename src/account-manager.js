@@ -239,6 +239,10 @@ export class AccountManager {
         // Failed upstream attempts on this account (noteRequestError).
         totalErrors: 0,
         lastUsed: null,
+        // The proxy's own warm-up / re-measure probes (updateQuota probe:true),
+        // kept out of totalRequests so that count means client traffic only.
+        totalProbes: 0,
+        lastProbeAt: null,
       },
       rateLimitedUntil: null,
       avoidUntil: null,       // soft steer-away deadline after an upstream failure (in-memory only)
@@ -1674,7 +1678,7 @@ export class AccountManager {
   /**
    * Update an account's quota tracking from upstream response headers.
    */
-  updateQuota(accountIndex, headers) {
+  updateQuota(accountIndex, headers, { probe = false } = {}) {
     const account = this._resolve(accountIndex);
     if (!account) return;
 
@@ -1767,8 +1771,13 @@ export class AccountManager {
     if (tokensReset) account.quota.resetsAt = tokensReset;
     else if (requestsReset) account.quota.resetsAt = requestsReset;
 
-    account.usage.totalRequests++;
-    account.usage.lastUsed = new Date().toISOString();
+    if (probe) {
+      account.usage.totalProbes = (Number(account.usage.totalProbes) || 0) + 1;
+      account.usage.lastProbeAt = new Date().toISOString();
+    } else {
+      account.usage.totalRequests++;
+      account.usage.lastUsed = new Date().toISOString();
+    }
 
     // Log when approaching quota. A credit-backed account keeps serving past
     // its included limit, so "will switch" would be false (and per-request noise).
@@ -2455,7 +2464,7 @@ export class AccountManager {
       enabled: acctData.enabled !== false,
       priority: Number.isFinite(acctData.priority) ? Math.floor(acctData.priority) : null,
       quota: emptyQuota(),
-      usage: { totalInputTokens: 0, totalOutputTokens: 0, totalRequests: 0, totalErrors: 0, lastUsed: null },
+      usage: { totalInputTokens: 0, totalOutputTokens: 0, totalRequests: 0, totalErrors: 0, lastUsed: null, totalProbes: 0, lastProbeAt: null },
       rateLimitedUntil: null,
       avoidUntil: null,       // soft steer-away deadline after an upstream failure (in-memory only)
       unsupportedModels: new Map(),

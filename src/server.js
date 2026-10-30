@@ -1502,7 +1502,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         && rl['anthropic-ratelimit-unified-status'] === 'rejected';
       if ((res.ok || accountExhausted429) && Object.keys(rl).length
           && accountManager.accounts[account.index] === account) {
-        accountManager.updateQuota(account, rl);
+        accountManager.updateQuota(account, rl, { probe: true });
         // Convergence accounting: a probe that leaves the account fully
         // measured resets the fruitless-probe counter; one that leaves it
         // half-measured (a header family missing) counts toward the cap.

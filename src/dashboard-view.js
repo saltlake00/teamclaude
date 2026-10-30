@@ -31,6 +31,7 @@ const EN = {
   resetsIn: s => `resets in ${s}`,
   stats: {
     requests: n => `${n} req`,
+    probes: n => `${n} probes`,
     tokensIn: s => `in ${s}`,
     tokensOut: s => `out ${s}`,
     inflight: (i, m) => `${i}/${m} in flight`,
@@ -161,6 +162,7 @@ const KO = {
   resetsIn: s => `${s} 후 리셋`,
   stats: {
     requests: n => `요청 ${n}`,
+    probes: n => `탐침 ${n}`,
     tokensIn: s => `입력 ${s}`,
     tokensOut: s => `출력 ${s}`,
     inflight: (i, m) => `동시 ${i}/${m}`,
@@ -467,6 +469,7 @@ export function buildViewModel(status, { now = Date.now(), text = EN } = {}) {
       bars: barsOf(a, now, text),
       stats: {
         requests: Number(usage.totalRequests) || 0,
+        probes: Number(usage.totalProbes) || 0,
         errors: Number(usage.totalErrors) || 0,
         tokensIn: Number(usage.totalInputTokens) || 0,
         tokensOut: Number(usage.totalOutputTokens) || 0,
@@ -665,6 +668,7 @@ export function renderAccountsHtml(vm, text, opts = {}) {
     const st = r.stats;
     const stats = [
       text.stats.requests(group(st.requests, text)),
+      text.stats.probes(group(st.probes, text)),
       text.stats.tokensIn(formatCompact(st.tokensIn)),
       text.stats.tokensOut(formatCompact(st.tokensOut)),
       text.stats.inflight(st.inflight, st.maxConcurrent),

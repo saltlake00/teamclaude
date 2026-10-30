@@ -111,8 +111,13 @@ export function createOauthUsagePoller({
 
   /** Last time this account's numbers were refreshed, by header or by poll. */
   function lastUpdateAt(account) {
-    const header = Date.parse(account.usage?.lastUsed);
-    return Math.max(account._usagePolledAt ?? 0, Number.isFinite(header) ? header : 0);
+    const header = Math.max(
+      ...[account.usage?.lastUsed, account.usage?.lastProbeAt]
+        .map(s => Date.parse(s))
+        .filter(Number.isFinite),
+      0,
+    );
+    return Math.max(account._usagePolledAt ?? 0, header);
   }
 
   function eligible(account, force) {
